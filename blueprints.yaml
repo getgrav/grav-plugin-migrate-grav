@@ -1,0 +1,62 @@
+name: Migrate to Grav 2.0
+type: plugin
+slug: migrate-to-2
+version: 0.1.0
+description: "Stages a Grav 2.0 install alongside an existing Grav 1.7 or 1.8 site and hands off to a standalone migration wizard."
+icon: rocket
+author:
+  name: Team Grav
+  email: devs@getgrav.org
+  url: https://getgrav.org
+homepage: https://github.com/getgrav/grav-plugin-migrate-to-2
+keywords: migrate, upgrade, 2.0, migration
+bugs: https://github.com/getgrav/grav-plugin-migrate-to-2/issues
+docs: https://github.com/getgrav/grav-plugin-migrate-to-2/blob/main/README.md
+license: MIT
+dependencies:
+  - { name: grav, version: '>=1.7.50' }
+compatibility:
+  grav: ['1.7', '1.8']
+
+form:
+  validation: strict
+  fields:
+    enabled:
+      type: toggle
+      label: PLUGIN_ADMIN.PLUGIN_STATUS
+      highlight: 1
+      default: 1
+      options:
+        1: PLUGIN_ADMIN.ENABLED
+        0: PLUGIN_ADMIN.DISABLED
+      validate:
+        type: bool
+
+    source_url:
+      type: text
+      label: 2.0 release URL
+      default: 'https://getgrav.org/download/core/grav-update/latest'
+      help: URL of the Grav 2.0 release zip. Override only for testing.
+
+    source_local_zip:
+      type: text
+      label: Local 2.0 zip (dev only)
+      default: ''
+      help: Absolute path to a local grav-2.0.zip. When set, overrides source_url.
+
+    stage_dir:
+      type: text
+      label: Stage subdirectory
+      default: 'grav-2'
+      help: Subdirectory inside the webroot where the new Grav 2.0 install will be staged.
+
+    require_super_admin:
+      type: toggle
+      label: Require super admin to trigger
+      highlight: 1
+      default: 1
+      options:
+        1: PLUGIN_ADMIN.ENABLED
+        0: PLUGIN_ADMIN.DISABLED
+      validate:
+        type: bool

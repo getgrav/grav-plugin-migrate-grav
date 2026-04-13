@@ -1,0 +1,5 @@
+enabled: true
+source_url: 'https://getgrav.org/download/core/grav-update/latest'
+source_local_zip: ''
+stage_dir: 'grav-2'
+require_super_admin: true
