@@ -1,20 +1,22 @@
 <?php
-namespace Grav\Plugin\MigrateToTwo;
+namespace Grav\Plugin\MigrateGrav;
 
 use RuntimeException;
-use ZipArchive;
 
 /**
  * Stages the Grav 2.0 release alongside the existing site and drops the
  * standalone wizard at webroot. Performs no Grav-side bootstrap of 2.0;
  * the wizard runs in a fresh PHP process started by the user.
+ *
+ * The wizard is owned by THIS plugin (wizard/migrate.php) and copied to
+ * webroot — not extracted from the Grav 2.0 zip. That way we can iterate
+ * on the migration flow without re-releasing Grav.
  */
 class Kickoff
 {
     private const MIGRATE_FILE = 'migrate.php';
     private const FLAG_FILE = '.migrating';
     private const ZIP_NAME = 'grav-2.0-staged.zip';
-    private const WIZARD_PATH_IN_ZIP = 'system/migrate/migrate.php';
 
     /** @var string */
     private $webroot;
@@ -39,7 +41,7 @@ class Kickoff
         $this->assertNotAlreadyStaged();
 
         $zipPath = $this->obtainZip();
-        $this->extractWizard($zipPath);
+        $this->placeWizard();
         $this->placeStagedZip($zipPath);
 
         $token = bin2hex(random_bytes(16));
@@ -48,6 +50,7 @@ class Kickoff
         $payload = [
             'token' => $token,
             'created' => time(),
+            'step' => 'staged',
             'source' => [
                 'grav_version' => $context['grav_version'] ?? null,
                 'root' => $this->webroot,
@@ -147,39 +150,23 @@ class Kickoff
         }
     }
 
-    private function extractWizard(string $zipPath): void
+    /**
+     * Copy the plugin's canonical wizard (wizard/migrate.php) to webroot.
+     *
+     * The wizard intentionally lives in this plugin rather than in the Grav
+     * 2.0 release zip, so the migration flow can be iterated without Grav
+     * core releases. Each kickoff overwrites any previous wizard copy.
+     */
+    private function placeWizard(): void
     {
-        $zip = new ZipArchive();
-        $opened = $zip->open($zipPath);
-        if ($opened !== true) {
-            throw new RuntimeException("Could not open zip ({$zipPath}): code {$opened}");
-        }
-
-        $wizard = $zip->getFromName(self::WIZARD_PATH_IN_ZIP);
-
-        // Some release zips wrap content in a top-level directory (e.g. grav-admin/...).
-        // Try to detect that prefix if direct lookup failed.
-        if ($wizard === false) {
-            for ($i = 0, $n = $zip->numFiles; $i < $n; $i++) {
-                $name = $zip->getNameIndex($i);
-                if ($name && substr($name, -strlen('/' . self::WIZARD_PATH_IN_ZIP)) === '/' . self::WIZARD_PATH_IN_ZIP) {
-                    $wizard = $zip->getFromName($name);
-                    break;
-                }
-            }
-        }
-        $zip->close();
-
-        if ($wizard === false || $wizard === '') {
-            throw new RuntimeException(
-                'Wizard file not found in release zip at ' . self::WIZARD_PATH_IN_ZIP .
-                '. This release may not contain the migration payload.'
-            );
+        $src = __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'wizard' . DIRECTORY_SEPARATOR . self::MIGRATE_FILE;
+        if (!is_file($src)) {
+            throw new RuntimeException("Plugin wizard source missing: {$src}");
         }
 
         $dest = $this->webroot . DIRECTORY_SEPARATOR . self::MIGRATE_FILE;
-        if (file_put_contents($dest, $wizard) === false) {
-            throw new RuntimeException("Failed to write wizard to {$dest}");
+        if (!@copy($src, $dest)) {
+            throw new RuntimeException("Failed to copy wizard to {$dest}");
         }
         @chmod($dest, 0644);
     }
@@ -203,5 +190,114 @@ class Kickoff
             throw new RuntimeException("Failed to write flag file: {$flag}");
         }
         @chmod($flag, 0600);
+    }
+
+    /**
+     * Reset migration state: delete .migrating, migrate.php, the staged zip,
+     * and the stage directory. Returns a summary of what was removed.
+     *
+     * Safe to call even when nothing is staged.
+     */
+    public function reset(): array
+    {
+        $removed = [];
+        $errors  = [];
+
+        $stageDir  = trim((string)($this->config['stage_dir'] ?? 'grav-2'), '/');
+        $candidates = [
+            self::FLAG_FILE,
+            self::MIGRATE_FILE,
+            'tmp/' . self::ZIP_NAME,
+        ];
+
+        // Restore .htaccess if the wizard patched it for the Test step.
+        $this->restoreHtaccess();
+
+        foreach ($candidates as $rel) {
+            $path = $this->webroot . DIRECTORY_SEPARATOR . $rel;
+            if (is_file($path)) {
+                if (@unlink($path)) {
+                    $removed[] = $rel;
+                } else {
+                    $errors[] = "Could not remove {$rel}";
+                }
+            }
+        }
+
+        if ($stageDir !== '') {
+            $stagePath = $this->webroot . DIRECTORY_SEPARATOR . $stageDir;
+            if (is_dir($stagePath)) {
+                if ($this->removeDirectory($stagePath)) {
+                    $removed[] = $stageDir . '/';
+                } else {
+                    $errors[] = "Could not fully remove {$stageDir}/";
+                }
+            }
+        }
+
+        return ['removed' => $removed, 'errors' => $errors];
+    }
+
+    /**
+     * Parse the .migrating flag file, or null if none is present/corrupt.
+     */
+    public function readFlag(): ?array
+    {
+        $flag = $this->webroot . DIRECTORY_SEPARATOR . self::FLAG_FILE;
+        if (!is_file($flag)) {
+            return null;
+        }
+        $raw = @file_get_contents($flag);
+        if ($raw === false) {
+            return null;
+        }
+        $data = json_decode($raw, true);
+        return is_array($data) ? $data : null;
+    }
+
+    /**
+     * If the wizard's Test step patched .htaccess (with a backup), restore it.
+     * Idempotent: no-op when no backup exists and no marker is present.
+     */
+    private function restoreHtaccess(): void
+    {
+        $ht = $this->webroot . DIRECTORY_SEPARATOR . '.htaccess';
+        $bk = $ht . '.migrate-grav-backup';
+        if (is_file($bk)) {
+            @copy($bk, $ht);
+            @unlink($bk);
+            return;
+        }
+        if (is_file($ht)) {
+            $cur = (string) @file_get_contents($ht);
+            if (str_contains($cur, '# migrate-grav stage exclusion')) {
+                $stripped = preg_replace(
+                    '/^[ \t]*# migrate-grav stage exclusion.*\n[ \t]*(?:RewriteCond|RewriteBase)[^\n]*\n/m',
+                    '',
+                    $cur
+                );
+                if (is_string($stripped)) @file_put_contents($ht, $stripped);
+            }
+        }
+    }
+
+    private function removeDirectory(string $path): bool
+    {
+        if (!is_dir($path)) {
+            return true;
+        }
+        $rii = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($path, \RecursiveDirectoryIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::CHILD_FIRST
+        );
+        $ok = true;
+        foreach ($rii as $file) {
+            if ($file->isDir()) {
+                $ok = @rmdir($file->getPathname()) && $ok;
+            } else {
+                $ok = @unlink($file->getPathname()) && $ok;
+            }
+        }
+        return @rmdir($path) && $ok;
     }
 }

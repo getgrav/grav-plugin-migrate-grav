@@ -1,0 +1,222 @@
+{% extends 'partials/base.html.twig' %}
+
+{# Inlined to avoid a Twig namespace lookup; sized via .mg-rocket / .fa-rocket
+   compatible CSS so it drops in wherever the FA rocket icon was. #}
+{% set rocket_svg %}<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="mg-rocket"><path d="M9.752 6.193c.599.6 1.73.437 2.528-.362s.96-1.932.362-2.531c-.599-.6-1.73-.438-2.528.361-.798.8-.96 1.933-.362 2.532"/><path d="M15.811 3.312c-.363 1.534-1.334 3.626-3.64 6.218l-.24 2.408a2.56 2.56 0 0 1-.732 1.526L8.817 15.85a.51.51 0 0 1-.867-.434l.27-1.899c.04-.28-.013-.593-.131-.956a9 9 0 0 0-.249-.657l-.082-.202c-.815-.197-1.578-.662-2.191-1.277-.614-.615-1.079-1.379-1.275-2.195l-.203-.083a10 10 0 0 0-.655-.248c-.363-.119-.675-.172-.955-.132l-1.896.27A.51.51 0 0 1 .15 7.17l2.382-2.386c.41-.41.947-.67 1.524-.734h.006l2.4-.238C9.005 1.55 11.087.582 12.623.208c.89-.217 1.59-.232 2.08-.188.244.023.435.06.57.093q.1.026.16.045c.184.06.279.13.351.295l.029.073a3.5 3.5 0 0 1 .157.721c.055.485.051 1.178-.159 2.065m-4.828 7.475.04-.04-.107 1.081a1.54 1.54 0 0 1-.44.913l-1.298 1.3.054-.38c.072-.506-.034-.993-.172-1.418a9 9 0 0 0-.164-.45c.738-.065 1.462-.38 2.087-1.006M5.205 5c-.625.626-.94 1.351-1.004 2.09a9 9 0 0 0-.45-.164c-.424-.138-.91-.244-1.416-.172l-.38.054 1.3-1.3c.245-.246.566-.401.91-.44l1.08-.107zm9.406-3.961c-.38-.034-.967-.027-1.746.163-1.558.38-3.917 1.496-6.937 4.521-.62.62-.799 1.34-.687 2.051.107.676.483 1.362 1.048 1.928.564.565 1.25.941 1.924 1.049.71.112 1.429-.067 2.048-.688 3.079-3.083 4.192-5.444 4.556-6.987.183-.771.18-1.345.138-1.713a3 3 0 0 0-.045-.283 3 3 0 0 0-.3-.041Z"/><path d="M7.009 12.139a7.6 7.6 0 0 1-1.804-1.352A7.6 7.6 0 0 1 3.794 8.86c-1.102.992-1.965 5.054-1.839 5.18.125.126 3.936-.896 5.054-1.902Z"/></svg>{% endset %}
+
+{% block titlebar %}
+    <div class="button-bar">
+        <a class="btn" href="https://github.com/getgrav/grav-plugin-migrate-grav" target="_blank" rel="noopener">
+            <i class="fa fa-question-circle"></i> Help
+        </a>
+    </div>
+    <h1>{{ rocket_svg|raw }} Migrate to Grav 2.0</h1>
+{% endblock %}
+
+{% block content %}
+    <style>
+        .mg-page { padding: 24px 28px; max-width: 920px; margin: 0 auto; }
+        .mg-rocket { width: 1em; height: 1em; vertical-align: -0.125em; }
+        h1 .mg-rocket { width: 0.95em; height: 0.95em; margin-right: 6px; }
+        .mg-hero-icon .mg-rocket { width: 42px; height: 42px; color: #fff; }
+        .mg-hero {
+            position: relative;
+            overflow: hidden;
+            margin: 0 0 28px;
+            padding: 28px 32px;
+            border-radius: 8px;
+            background: linear-gradient(135deg, #5b3ea8 0%, #7b2ff7 55%, #ff4d8f 100%);
+            color: #fff;
+            box-shadow: 0 6px 24px -8px rgba(91, 62, 168, 0.55), 0 2px 4px rgba(0, 0, 0, 0.08);
+        }
+        .mg-hero::before {
+            content: "";
+            position: absolute;
+            top: -80px; right: -80px;
+            width: 280px; height: 280px;
+            background: radial-gradient(circle, rgba(255,255,255,0.18) 0%, rgba(255,255,255,0) 70%);
+            pointer-events: none;
+        }
+        .mg-hero-inner { position: relative; display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
+        .mg-hero-icon {
+            flex: 0 0 auto;
+            width: 80px; height: 80px;
+            border-radius: 14px;
+            background: rgba(255,255,255,0.14);
+            border: 1px solid rgba(255,255,255,0.22);
+            display: flex; align-items: center; justify-content: center;
+            font-size: 36px;
+        }
+        .mg-hero-text { flex: 1 1 320px; min-width: 0; }
+        .mg-hero-text h2 { margin: 0 0 6px; color: #fff; font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
+        .mg-hero-text p  { margin: 0; color: rgba(255,255,255,0.92); font-size: 14px; line-height: 1.55; max-width: 560px; }
+
+        .mg-card {
+            background: #fff;
+            border: 1px solid #e6e8ef;
+            border-radius: 6px;
+            padding: 20px 24px;
+            margin: 0 0 20px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+        }
+        .mg-card h3 { margin: 0 0 12px; font-size: 15px; font-weight: 600; color: #333; letter-spacing: 0.2px; }
+        .mg-card p  { margin: 0 0 10px; font-size: 14px; line-height: 1.6; color: #555; }
+        .mg-card p:last-child { margin-bottom: 0; }
+
+        .mg-callout {
+            display: flex; gap: 12px; align-items: flex-start;
+            padding: 14px 18px;
+            margin: 0 0 20px;
+            background: #fffaf0;
+            border-left: 4px solid #f7a600;
+            border-radius: 4px;
+            font-size: 13.5px;
+            line-height: 1.55;
+            color: #5a4a1f;
+        }
+        .mg-callout .fa { color: #f7a600; font-size: 16px; margin-top: 2px; flex: 0 0 auto; }
+        .mg-callout-active { background: #eef4ff; border-left-color: #3b82f6; color: #1e3a70; }
+        .mg-callout-active .fa { color: #3b82f6; }
+
+        .mg-action {
+            display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+            padding: 18px 24px;
+            margin: 0 0 24px;
+            background: linear-gradient(to right, #f7f7fb, #fff);
+            border: 1px solid #e6e8ef;
+            border-radius: 6px;
+        }
+        .mg-action-active { background: linear-gradient(to right, #eef4ff, #fff); border-color: #d5e1f6; }
+        .mg-action .mg-action-label {
+            flex: 1 1 260px;
+            font-size: 14px;
+            color: #555;
+        }
+        .mg-action .mg-action-label strong { color: #333; }
+        .mg-action-buttons { display: flex; gap: 8px; flex-wrap: wrap; flex: 0 0 auto; }
+
+        .mg-btn {
+            display: inline-flex; align-items: center; gap: 8px;
+            padding: 10px 18px; margin: 0;
+            font-weight: 600; font-size: 13px;
+            border-radius: 4px; border: none; cursor: pointer;
+            text-decoration: none;
+            transition: background 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+            line-height: 1;
+        }
+        .mg-btn-primary { background: #5b3ea8; color: #fff !important; box-shadow: 0 2px 6px rgba(91, 62, 168, 0.25); }
+        .mg-btn-primary:hover { background: #4a328b; color: #fff !important; transform: translateY(-1px); box-shadow: 0 4px 10px rgba(91, 62, 168, 0.35); }
+        .mg-btn-danger { background: #fff; color: #c62828 !important; border: 1px solid #e5c2c2; }
+        .mg-btn-danger:hover { background: #fff1f1; color: #b72020 !important; }
+
+        .mg-steps { counter-reset: step; padding: 0; margin: 0; list-style: none; }
+        .mg-steps li {
+            position: relative;
+            padding: 8px 0 8px 44px;
+            font-size: 14px;
+            line-height: 1.5;
+            color: #444;
+            counter-increment: step;
+        }
+        .mg-steps li::before {
+            content: counter(step);
+            position: absolute;
+            left: 0; top: 8px;
+            width: 28px; height: 28px;
+            border-radius: 50%;
+            background: #eef0f8;
+            color: #5b3ea8;
+            font-weight: 700;
+            font-size: 13px;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .mg-steps code { background: #f4f4f8; padding: 1px 6px; border-radius: 3px; font-size: 12.5px; color: #333; }
+
+        .mg-cli {
+            background: #1f1f2b;
+            color: #e9e9f0;
+            padding: 14px 18px;
+            border-radius: 5px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 13px;
+            display: flex; align-items: center; gap: 10px;
+        }
+        .mg-cli .mg-prompt { color: #8ad0ff; user-select: none; }
+    </style>
+
+    <div class="mg-page">
+        <div class="mg-hero">
+            <div class="mg-hero-inner">
+                <div class="mg-hero-icon">{{ rocket_svg|raw }}</div>
+                <div class="mg-hero-text">
+                    <h2>Ready to move to Grav 2.0</h2>
+                    <p>Stage a fresh Grav 2.0 install alongside this site and hand off to a standalone migration wizard. Your current site stays untouched until you explicitly promote the new install.</p>
+                </div>
+            </div>
+        </div>
+
+        {% if migrate_grav_state %}
+            <div class="mg-callout mg-callout-active">
+                <i class="fa fa-refresh fa-spin"></i>
+                <div>
+                    <strong>A migration is already staged.</strong> Resume it in a fresh PHP process, or reset to start over. The staged files live at <code>/{{ migrate_grav_state.stage_dir }}/</code> and <code>/{{ migrate_grav_state.staged_zip }}</code>.
+                </div>
+            </div>
+
+            <div class="mg-action mg-action-active">
+                <div class="mg-action-label">
+                    <strong>Staged {{ migrate_grav_state.created|date('Y-m-d H:i') }}</strong> from Grav <code>{{ migrate_grav_state.source.grav_version }}</code> by <code>{{ migrate_grav_state.source.trigger }}</code>.
+                </div>
+                <div class="mg-action-buttons">
+                    <a class="mg-btn mg-btn-primary" href="{{ base_url_simple }}{{ migrate_grav_state.wizard_url }}" target="_blank" rel="noopener">
+                        <i class="fa fa-arrow-right"></i> Continue migration
+                    </a>
+                    <form method="post" action="{{ base_url_relative }}/task:migrateGravReset" style="margin:0" onsubmit="return confirm('Reset the in-progress migration? This deletes .migrating, migrate.php, the staged zip, and the staged Grav 2.0 directory. Your original site is untouched.');">
+                        <input type="hidden" name="admin-nonce" value="{{ admin.getNonce('admin-form') }}" />
+                        <button type="submit" class="mg-btn mg-btn-danger">
+                            <i class="fa fa-trash"></i> Reset
+                        </button>
+                    </form>
+                </div>
+            </div>
+        {% else %}
+            <div class="mg-callout">
+                <i class="fa fa-info-circle"></i>
+                <div>
+                    <strong>Nothing is changed in your current site</strong> until you complete and explicitly promote the new install. You can abandon the migration at any time by clicking Reset on this page.
+                </div>
+            </div>
+
+            <div class="mg-action">
+                <div class="mg-action-label">
+                    <strong>Stage Grav 2.0 in <code>/{{ config.plugins['migrate-grav'].stage_dir }}/</code></strong> and open the migration wizard in a fresh PHP process.
+                </div>
+                <form method="post" action="{{ base_url_relative }}/task:migrateGravInit" style="margin:0">
+                    <input type="hidden" name="admin-nonce" value="{{ admin.getNonce('admin-form') }}" />
+                    <button type="submit" class="mg-btn mg-btn-primary">
+                        <i class="fa fa-play"></i> Stage &amp; start wizard
+                    </button>
+                </form>
+            </div>
+        {% endif %}
+
+        <div class="mg-card">
+            <h3>What this does</h3>
+            <ol class="mg-steps">
+                <li>Downloads the latest Grav 2.0 release.</li>
+                <li>Drops a standalone <code>migrate.php</code> file at your webroot.</li>
+                <li>Saves the 2.0 release zip to <code>tmp/</code> for the wizard to extract.</li>
+                <li>Writes a single-use token to <code>.migrating</code>.</li>
+                <li>Redirects you to <code>/migrate.php</code> — your browser leaves Grav 1.x entirely from this point on.</li>
+            </ol>
+        </div>
+
+        <div class="mg-card">
+            <h3>Prefer the CLI?</h3>
+            <p>Run the same kickoff without the admin UI:</p>
+            <div class="mg-cli">
+                <span class="mg-prompt">$</span> bin/plugin migrate-grav init
+            </div>
+        </div>
+    </div>
+{% endblock %}

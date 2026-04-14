@@ -3,7 +3,7 @@ namespace Grav\Plugin\Console;
 
 use Grav\Common\Grav;
 use Grav\Console\ConsoleCommand;
-use Grav\Plugin\MigrateToTwoPlugin;
+use Grav\Plugin\MigrateGrav\Kickoff;
 use RuntimeException;
 use Symfony\Component\Console\Input\InputOption;
 
@@ -12,7 +12,7 @@ use Symfony\Component\Console\Input\InputOption;
  * execute the wizard itself — the user starts a fresh PHP process so no
  * 1.7/1.8 code remains loaded once migration begins.
  *
- * Usage: bin/plugin migrate-to-2 init [--source-url=URL] [--source-zip=PATH]
+ * Usage: bin/plugin migrate-grav init [--source-url=URL] [--source-zip=PATH]
  */
 class InitCommand extends ConsoleCommand
 {
@@ -39,25 +39,32 @@ class InitCommand extends ConsoleCommand
     {
         $grav = Grav::instance();
 
-        /** @var MigrateToTwoPlugin $plugin */
-        $plugin = $grav['plugins']->get('migrate-to-2');
-        if (!$plugin instanceof MigrateToTwoPlugin) {
-            $this->output->writeln('<red>Plugin migrate-to-2 not loaded.</red>');
+        $config = (array) $grav['config']->get('plugins.migrate-grav', []);
+        if (!($config['enabled'] ?? false)) {
+            $this->output->writeln('<red>Plugin migrate-grav is not enabled.</red>');
             return 1;
         }
 
-        // Apply CLI overrides into the plugin config for this run.
         $sourceUrl = $this->input->getOption('source-url');
         $sourceZip = $this->input->getOption('source-zip');
         if ($sourceUrl) {
-            $grav['config']->set('plugins.migrate-to-2.source_url', $sourceUrl);
+            $config['source_url'] = $sourceUrl;
         }
         if ($sourceZip) {
-            $grav['config']->set('plugins.migrate-to-2.source_local_zip', $sourceZip);
+            $config['source_local_zip'] = $sourceZip;
         }
 
+        require_once dirname(__DIR__) . '/classes/Kickoff.php';
+
+        $webroot = defined('GRAV_WEBROOT') ? GRAV_WEBROOT : GRAV_ROOT;
+        $kickoff = new Kickoff($webroot, $config);
+
         try {
-            $payload = $plugin->runKickoff('cli');
+            $payload = $kickoff->run([
+                'grav_version' => GRAV_VERSION,
+                'admin_user'   => null,
+                'trigger'      => 'cli',
+            ]);
         } catch (RuntimeException $e) {
             $this->output->writeln('<red>Kickoff failed:</red> ' . $e->getMessage());
             return 1;
@@ -71,13 +78,12 @@ class InitCommand extends ConsoleCommand
         $this->output->writeln('  Staged zip:   ' . $payload['staged_zip']);
         $this->output->writeln('  Wizard URL:   ' . $payload['wizard_url']);
         $this->output->writeln('');
-        $this->output->writeln('<yellow>Next step — start the wizard in a fresh PHP process:</yellow>');
+        $this->output->writeln('<yellow>Next step — open the wizard in your browser:</yellow>');
         $this->output->writeln('');
-        $this->output->writeln('  In a browser: visit ' . $payload['wizard_url']);
-        $this->output->writeln('  On the CLI:   php migrate.php --token=' . $payload['token']);
+        $this->output->writeln('  ' . $payload['wizard_url']);
         $this->output->writeln('');
-        $this->output->writeln('<cyan>Important:</cyan> do NOT continue inside this Grav 1.x process —');
-        $this->output->writeln('the wizard must run standalone to avoid file locks and library conflicts.');
+        $this->output->writeln('<cyan>Important:</cyan> do NOT continue inside this Grav 1.x process — the');
+        $this->output->writeln('wizard runs standalone to avoid file locks and library conflicts.');
 
         return 0;
     }

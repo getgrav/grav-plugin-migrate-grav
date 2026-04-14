@@ -6,7 +6,7 @@ use Grav\Console\ConsoleCommand;
 /**
  * Reports the current state of any in-progress migration.
  *
- * Usage: bin/plugin migrate-to-2 status
+ * Usage: bin/plugin migrate-grav status
  */
 class StatusCommand extends ConsoleCommand
 {
