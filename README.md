@@ -23,7 +23,7 @@ process that has no relationship to your running 1.x install.
 ## Installation
 
 ```bash
-bin/gpm install migrate-to-2
+bin/gpm install migrate-grav
 ```
 
 ## Usage
@@ -37,7 +37,7 @@ outside of Grav 1.x.
 ### From the CLI
 
 ```bash
-bin/plugin migrate-to-2 init
+bin/plugin migrate-grav init
 ```
 
 Then follow the printed instructions to start the wizard in a fresh PHP
@@ -46,12 +46,12 @@ process (either `php migrate.php` or by visiting the URL).
 ### Status
 
 ```bash
-bin/plugin migrate-to-2 status
+bin/plugin migrate-grav status
 ```
 
 ## Configuration
 
-`user/config/plugins/migrate-to-2.yaml`:
+`user/config/plugins/migrate-grav.yaml`:
 
 ```yaml
 enabled: true
