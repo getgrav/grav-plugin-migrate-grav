@@ -1,7 +1,8 @@
 name: Migrate Grav
 type: plugin
 slug: migrate-grav
-version: 0.1.0
+version: 1.0.0-beta.1
+testing: true
 description: "Stages a new major Grav release alongside an existing site and hands off to a standalone migration wizard."
 icon: rocket
 author:

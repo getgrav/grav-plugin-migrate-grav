@@ -1,5 +1,5 @@
-# v0.1.0
-## 2026-04-13
+# v1.0.0-beta.1
+## 04-15-2026
 
 1. [](#new)
    * Initial scaffold: kickoff plugin for staging Grav 2.0 alongside an existing 1.7/1.8 site.
