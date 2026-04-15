@@ -28,8 +28,11 @@ const MG_IMPORT_OPTIONAL = ['plugins', 'themes'];
 const MG_COMPAT_URL      = 'https://getgrav.org/gpm/compatibility/v1/_all';
 const MG_COMPAT_TARGET   = '2.0';
 const MG_COMPAT_TTL      = 900;
-const MG_GPM_PLUGINS_URL = 'https://getgrav.org/downloads/plugins.json';
-const MG_GPM_THEMES_URL  = 'https://getgrav.org/downloads/themes.json';
+// Use the testing channel — during 2.0 migration we WANT betas (admin2, api,
+// and other 2.0-compatible releases that haven't gone stable yet). Testing
+// is a superset of stable, so this catches everything.
+const MG_GPM_PLUGINS_URL = 'https://getgrav.org/downloads/plugins.json?testing=1';
+const MG_GPM_THEMES_URL  = 'https://getgrav.org/downloads/themes.json?testing=1';
 const MG_HTACCESS_MARKER = '# migrate-grav stage exclusion';
 
 // Inline rocket SVG (bootstrap-icons rocket-takeoff). Used in the hero so the
@@ -103,7 +106,8 @@ if ($method === 'POST') {
             redirect_self($token, ['flash' => 'test_done', 'msg' => 'Ready to promote.']);
 
         case 'promote':
-            redirect_self($token, ['flash' => 'error', 'msg' => 'Promote is not implemented yet.']);
+            stream_promote_page($webroot, $flagForAuth, $token);
+            exit(0);
 
         default:
             http_response_code(400);
@@ -377,6 +381,7 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
     $skipped    = [];
     $disabled   = [];
     $upgraded   = [];
+    $superseded = mg_collect_superseded($scan); // ['plugins/admin' => 'admin2', ...]
 
     foreach (['plugins', 'themes'] as $kind) {
         $src = $srcUser . '/' . $kind;
@@ -404,7 +409,7 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
             }
         }
 
-        $result = mg_import_compat_dir($src, $dst, $webroot, $stageDir, $kind, $scan, $policy, $copied, $progress, array_keys($upgraded));
+        $result = mg_import_compat_dir($src, $dst, $webroot, $stageDir, $kind, $scan, $policy, $copied, $progress, array_keys($upgraded), $superseded);
         foreach ($result['skipped']  as $s) $skipped[]  = "{$kind}/{$s}";
         foreach ($result['disabled'] as $d) $disabled[] = "{$kind}/{$d}";
     }
@@ -601,6 +606,207 @@ function mg_ensure_yaml_available(): void
     }
 }
 
+// ─── Step 6: Promote ────────────────────────────────────────────────────────
+
+/**
+ * Promote the staged Grav 2.0 install to the webroot:
+ *   1. Create {webroot}/backup-pre-2.0-{YYYYMMDD-HHMMSS}/
+ *   2. Move every top-level entry at the webroot EXCEPT the stage dir and
+ *      the new backup dir into the backup (this includes migrate.php itself,
+ *      .migrating, .htaccess, system/, vendor/, user/, tmp/, logs/, etc.)
+ *   3. Move every top-level entry from the stage dir up to the webroot.
+ *   4. Remove the empty stage dir.
+ *
+ * All operations are `rename()` calls on the same filesystem (fast + near-atomic).
+ * After success the running PHP process is already finished reading migrate.php,
+ * so even though the file has moved the response still renders; the user is
+ * redirected to the new webroot.
+ */
+function do_promote(string $webroot, array $flag, ?callable $progress = null): array
+{
+    $stageDir  = trim((string)($flag['stage_dir'] ?? 'grav-2'), '/');
+    $stagePath = $webroot . '/' . $stageDir;
+
+    if ($stageDir === '' || !is_dir($stagePath)) {
+        return ['ok' => false, 'msg' => "Stage dir missing or invalid: {$stagePath}"];
+    }
+
+    // Version comes from the CURRENT install's defines.php (the one we're
+    // about to back up — not the staged one).
+    $currentVersion = mg_read_defines_version($webroot . '/system/defines.php')
+        ?? ($flag['source']['grav_version'] ?? 'unknown');
+    // Match Grav's backup discovery regex (#(.*)--(\d*).zip#) so the resulting
+    // file shows up in the admin's Backups list: <name>--<digits>.zip with a
+    // double-dash separator and an unbroken numeric timestamp.
+    $timestamp  = date('YmdHis');
+    $zipName    = 'migration-backup-' . $currentVersion . '--' . $timestamp . '.zip';
+
+    // Write the zip INSIDE the stage dir's backup/ so that after promote
+    // (which moves stage contents up) it naturally lands at
+    // {newWebroot}/backup/migration-backup-*.zip — no cross-device move.
+    $zipDir  = $stagePath . '/backup';
+    ensure_dir($zipDir);
+    $zipPath = $zipDir . '/' . $zipName;
+    if (is_file($zipPath)) @unlink($zipPath);
+
+    // ─── Phase 1: zip the 1.x install ──────────────────────────────────────
+    $zip = new ZipArchive();
+    $rc = $zip->open($zipPath, ZipArchive::CREATE | ZipArchive::OVERWRITE);
+    if ($rc !== true) {
+        return ['ok' => false, 'msg' => "Could not create backup zip (ZipArchive code {$rc}): {$zipPath}"];
+    }
+    $added = 0;
+    $err = mg_zip_webroot($zip, $webroot, $stageDir, $added, $progress);
+    $zip->close();
+    if ($err !== null) {
+        @unlink($zipPath);
+        return ['ok' => false, 'msg' => "Backup failed: {$err}"];
+    }
+    if (!is_file($zipPath) || filesize($zipPath) < 1024) {
+        return ['ok' => false, 'msg' => 'Backup zip looks invalid after close'];
+    }
+
+    // ─── Phase 2: delete everything at webroot except the stage dir ────────
+    $deleted = [];
+    foreach (scandir($webroot) ?: [] as $entry) {
+        if ($entry === '.' || $entry === '..') continue;
+        if ($entry === $stageDir) continue;
+
+        if ($progress) $progress(['phase' => 'copy', 'entry' => 'clear', 'file' => $entry, 'copied' => $added]);
+        $path = $webroot . '/' . $entry;
+        if (is_link($path) || is_file($path)) {
+            if (!@unlink($path)) return ['ok' => false, 'msg' => "Could not delete {$entry}"];
+        } elseif (is_dir($path)) {
+            if (!mg_rm_tree($path)) return ['ok' => false, 'msg' => "Could not delete directory {$entry}"];
+        }
+        $deleted[] = $entry;
+    }
+
+    // ─── Phase 3: promote stage contents up ────────────────────────────────
+    $promoted = [];
+    foreach (scandir($stagePath) ?: [] as $entry) {
+        if ($entry === '.' || $entry === '..') continue;
+
+        if ($progress) $progress(['phase' => 'copy', 'entry' => 'promote', 'file' => $entry, 'copied' => count($promoted)]);
+        if (!@rename($stagePath . '/' . $entry, $webroot . '/' . $entry)) {
+            return ['ok' => false, 'msg' => "Failed to promote {$entry}"];
+        }
+        $promoted[] = $entry;
+    }
+    @rmdir($stagePath);
+
+    // Breadcrumb for the new install.
+    $summary = [
+        'migrated_at'  => date('c'),
+        'backup_zip'   => 'backup/' . $zipName,
+        'from_version' => $currentVersion,
+        'promoted'     => $promoted,
+    ];
+    @file_put_contents(
+        $webroot . '/.migration-complete',
+        json_encode($summary, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)
+    );
+
+    if ($progress) $progress(['phase' => 'done-entry', 'entry' => 'promote', 'copied' => count($promoted)]);
+
+    return [
+        'ok'     => true,
+        'msg'    => "Backed up {$added} files to backup/{$zipName}; promoted " . count($promoted) . ' entries to webroot.',
+        'backup' => $zipName,
+    ];
+}
+
+/**
+ * Read the GRAV_VERSION string out of a Grav install's system/defines.php.
+ * Returns null if the file is missing or the pattern doesn't match.
+ */
+function mg_read_defines_version(string $path): ?string
+{
+    if (!is_file($path)) return null;
+    $raw = @file_get_contents($path);
+    if ($raw === false) return null;
+    if (preg_match("/define\\(\\s*['\"]GRAV_VERSION['\"]\\s*,\\s*['\"]([^'\"]+)['\"]/", $raw, $m)) {
+        return $m[1];
+    }
+    return null;
+}
+
+/**
+ * Add everything at the webroot to the zip EXCEPT the stage dir. Skips
+ * symlinks (avoids chasing dev-env links into unrelated repos). Streams
+ * progress per ~200 files for the UI.
+ */
+function mg_zip_webroot(ZipArchive $zip, string $webroot, string $skipTop, int &$added, ?callable $progress): ?string
+{
+    try {
+        $it = new RecursiveIteratorIterator(
+            new RecursiveCallbackFilterIterator(
+                new RecursiveDirectoryIterator($webroot, RecursiveDirectoryIterator::SKIP_DOTS),
+                static function ($item, $key, $iterator) use ($webroot, $skipTop) {
+                    $path = $item->getPathname();
+                    // Skip the stage dir at the top level.
+                    if (strpos($path, $webroot . DIRECTORY_SEPARATOR . $skipTop . DIRECTORY_SEPARATOR) === 0
+                        || $path === $webroot . DIRECTORY_SEPARATOR . $skipTop) {
+                        return false;
+                    }
+                    return true;
+                }
+            ),
+            RecursiveIteratorIterator::SELF_FIRST
+        );
+    } catch (\Throwable $e) {
+        return "Could not iterate webroot: " . $e->getMessage();
+    }
+
+    // Follow symlinks when archiving — this is a FULL backup, and in dev
+    // environments plugins/themes are often symlinked to sibling repos.
+    // Skipping them here would leave them out of the restore zip while the
+    // delete phase still removes the link from the webroot (= data loss).
+    // ZipArchive::addFile() and PHP's is_dir() both follow symlinks by
+    // default, so we just archive whatever the link resolves to.
+    foreach ($it as $file) {
+        $path = $file->getPathname();
+        $rel  = ltrim(substr($path, strlen($webroot)), '/\\');
+        if ($rel === '') continue;
+
+        if ($file->isDir()) {
+            $zip->addEmptyDir($rel);
+        } else {
+            if (!$zip->addFile($path, $rel)) {
+                return "Could not add to zip: {$rel}";
+            }
+            $added++;
+            if ($progress && $added % 200 === 0) {
+                $progress(['phase' => 'copy', 'entry' => 'backup', 'file' => $rel, 'copied' => $added]);
+            }
+        }
+    }
+    return null;
+}
+
+function mg_rm_tree(string $path): bool
+{
+    if (is_link($path) || is_file($path)) {
+        return @unlink($path);
+    }
+    if (!is_dir($path)) {
+        return true;
+    }
+    $rii = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($path, RecursiveDirectoryIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::CHILD_FIRST
+    );
+    $ok = true;
+    foreach ($rii as $f) {
+        if ($f->isDir() && !$f->isLink()) {
+            $ok = @rmdir($f->getPathname()) && $ok;
+        } else {
+            $ok = @unlink($f->getPathname()) && $ok;
+        }
+    }
+    return @rmdir($path) && $ok;
+}
+
 // ─── Step 5: Test (server-aware sub-path enabler) ──────────────────────────
 // MG_HTACCESS_MARKER lives at the top of the file — top-level `const`
 // statements run in source order, not hoisted, and these helpers are
@@ -767,6 +973,36 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
     return ['ok' => true, 'msg' => "Copied {$copied} files across " . count($entries) . " entries."];
 }
 
+/**
+ * Walk the scan and return ["plugins/admin" => "admin2", ...] for every
+ * source plugin/theme whose `replaced_by` target is something we'll actually
+ * be able to install (either listed in GPM or has a github_repo in the
+ * curated registry). The main copy step uses this to skip the OLD plugin
+ * entirely instead of copying-then-disabling it.
+ */
+function mg_collect_superseded(array $scan): array
+{
+    $out = [];
+    $gpmPlugins = $scan['gpm']['plugins'] ?? [];
+    $gpmThemes  = $scan['gpm']['themes']  ?? [];
+
+    foreach (['plugins', 'themes'] as $kind) {
+        foreach (($scan[$kind] ?? []) as $slug => $v) {
+            $repl = $v['replaced_by'] ?? null;
+            if (!$repl) continue;
+
+            $inGpm = isset($gpmPlugins[$repl]) || isset($gpmThemes[$repl]);
+            $entry = mg_lookup_registry_entry($repl);
+            $hasRepo = is_array($entry) && !empty($entry['github_repo']);
+
+            if ($inGpm || $hasRepo) {
+                $out["{$kind}/{$slug}"] = $repl;
+            }
+        }
+    }
+    return $out;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Auto-install replacements from GitHub
 // ─────────────────────────────────────────────────────────────────────────────
@@ -809,17 +1045,35 @@ function mg_install_replacements(string $webroot, string $stageDir, array $scan,
         }
     }
 
+    $gpmPlugins = $scan['gpm']['plugins'] ?? null;
+
     foreach (array_keys($candidates) as $replSlug) {
         $replEntry = $scan['plugins'][$replSlug] ?? mg_lookup_registry_entry($replSlug);
-        if (!is_array($replEntry) || empty($replEntry['github_repo'])) {
-            $failed[] = [$replSlug, 'no github_repo in registry'];
-            if ($progress) $progress(['phase' => 'skip', 'entry' => "replacement/{$replSlug}", 'reason' => 'no github_repo']);
-            continue;
-        }
 
         if ($progress) $progress(['phase' => 'start', 'entry' => "replacement/{$replSlug}"]);
 
-        $res = mg_fetch_and_install_github($webroot, $stageDir, $replSlug, $replEntry['github_repo']);
+        $res = null;
+
+        // Prefer GPM when the slug is published there — same path the auto-update
+        // flow uses, and the same path real GPM uses (catalog → GitHub zip URL).
+        if (is_array($gpmPlugins) && isset($gpmPlugins[$replSlug]['download'])) {
+            $gpmEntry = $gpmPlugins[$replSlug];
+            $res = mg_install_zip_url($webroot, $stageDir, 'plugins', $replSlug, (string) $gpmEntry['download']);
+            if ($res['ok']) {
+                $res['version'] = (string) ($gpmEntry['version'] ?? '?');
+                $res['source']  = 'gpm';
+            }
+        }
+
+        // Fall back to direct GitHub fetch via curated github_repo when not in GPM.
+        if (!$res || !$res['ok']) {
+            if (is_array($replEntry) && !empty($replEntry['github_repo'])) {
+                $res = mg_fetch_and_install_github($webroot, $stageDir, $replSlug, $replEntry['github_repo']);
+            } elseif (!$res) {
+                $res = ['ok' => false, 'msg' => 'not in GPM and no github_repo in registry'];
+            }
+        }
+
         if ($res['ok']) {
             $installed[$replSlug] = ['version' => $res['version'] ?? '?', 'source' => $res['source'] ?? '?'];
             if ($progress) $progress(['phase' => 'done-entry', 'entry' => "replacement/{$replSlug}"]);
@@ -1016,12 +1270,13 @@ function mg_github_resolve_download(string $repo): array
  * Copy a plugins/ or themes/ directory, classifying each child by 2.0
  * compatibility and applying the user's policy for incompatibles.
  */
-function mg_import_compat_dir(string $srcDir, string $dstDir, string $webroot, string $stageDir, string $kind, array $scan, string $policy, int &$copied, ?callable $progress, array $alreadyUpgraded = []): array
+function mg_import_compat_dir(string $srcDir, string $dstDir, string $webroot, string $stageDir, string $kind, array $scan, string $policy, int &$copied, ?callable $progress, array $alreadyUpgraded = [], array $superseded = []): array
 {
     $skipped = [];
     $disabled = [];
     $verdicts = $scan[$kind] ?? [];
     $upgradedSet = array_flip($alreadyUpgraded); // "kind/slug" entries
+    // $superseded: ["kind/slug" => "replacement_slug"]
 
     ensure_dir($dstDir);
 
@@ -1034,6 +1289,22 @@ function mg_import_compat_dir(string $srcDir, string $dstDir, string $webroot, s
 
         // Already replaced by an auto-update — leave the staged version alone.
         if (isset($upgradedSet[$label])) continue;
+
+        // Replaced by a different slug (admin → admin2). Skip the old plugin
+        // entirely — and if the stage dir happens to contain it (e.g. from
+        // the 2.0 zip shipping a placeholder, or a previous iteration),
+        // remove that too so the promoted install doesn't carry it over.
+        if (isset($superseded[$label])) {
+            $replSlug = $superseded[$label];
+            if (is_dir($dst)) {
+                remove_dir($dst);
+            } elseif (is_file($dst)) {
+                @unlink($dst);
+            }
+            $skipped[] = $slug . " (superseded by {$replSlug})";
+            if ($progress) $progress(['phase' => 'skip', 'entry' => $label, 'reason' => "superseded by {$replSlug}", 'copied' => $copied]);
+            continue;
+        }
 
         if (is_link($src) && is_dir($src)) {
             $skipped[] = $slug . ' (symlinked)';
@@ -1120,14 +1391,15 @@ function mg_compat_scan_cached(string $webroot, array &$flag): array
     $scan = [
         'at'      => time(),
         'source'  => $curated !== null ? 'remote' : 'offline',
+        'gpm'     => $gpm,  // Cached so install paths can prefer GPM URLs over github_repo fallback.
         'plugins' => mg_scan_category($webroot . '/user/plugins', 'plugins', $curated, $gpm['plugins']),
         'themes'  => mg_scan_category($webroot . '/user/themes',  'themes',  $curated, $gpm['themes']),
     ];
 
-    // Resolve GitHub latest-release info for every pending replacement
-    // (replaced_by target + its transitive `requires:`) so the UI can show a
-    // real version number instead of a generic "from GitHub" placeholder.
-    $scan['github_versions'] = mg_resolve_pending_versions($scan, $curated);
+    // Resolve install source/version info for every pending replacement
+    // (replaced_by target + its transitive `requires:`) so the UI shows
+    // matching info to what the install path will actually do.
+    $scan['github_versions'] = mg_resolve_pending_versions($scan, $curated, $gpm);
 
     $flag['compat_scan'] = $scan;
     save_flag($webroot . '/.migrating', $flag);
@@ -1140,7 +1412,7 @@ function mg_compat_scan_cached(string $webroot, array &$flag): array
  * source] map. Cached inside the compat scan so we only hit GitHub once per
  * 15-minute TTL.
  */
-function mg_resolve_pending_versions(array $scan, ?array $curated): array
+function mg_resolve_pending_versions(array $scan, ?array $curated, array $gpm = []): array
 {
     if ($curated === null) return [];
 
@@ -1167,6 +1439,16 @@ function mg_resolve_pending_versions(array $scan, ?array $curated): array
 
     $out = [];
     foreach (array_keys($queue) as $slug) {
+        // Prefer GPM (matches what mg_install_replacements actually does).
+        $gpmEntry = $gpm['plugins'][$slug] ?? $gpm['themes'][$slug] ?? null;
+        if (is_array($gpmEntry) && !empty($gpmEntry['version'])) {
+            $out[$slug] = [
+                'version' => (string) $gpmEntry['version'],
+                'source'  => 'gpm',
+            ];
+            continue;
+        }
+        // Fall back to GitHub via curated github_repo.
         $entry = $curated['plugins'][$slug] ?? $curated['themes'][$slug] ?? null;
         if (!is_array($entry) || empty($entry['github_repo'])) continue;
         $info = mg_github_resolve_download($entry['github_repo']);
@@ -1534,6 +1816,28 @@ function stream_content_page(string $webroot, array $flag, string $token): void
     mg_stream_finish($result, $token, 'content_done');
 }
 
+function stream_promote_page(string $webroot, array $flag, string $token): void
+{
+    mg_stream_setup('Promoting Grav 2.0 to live…', 'Moving the existing install into a timestamped backup and swapping the staged Grav 2.0 into the webroot. Keep this tab open until it completes.');
+
+    $result = do_promote($webroot, $flag, mg_stream_progress_cb());
+
+    if ($result['ok']) {
+        // After promote, .migrating / migrate.php are inside the backup dir —
+        // the wizard's state is effectively gone, so redirect to the new
+        // live webroot instead of trying to re-render a wizard page.
+        $base = base_path_from_script();
+        echo '<div class="mg-callout mg-callout-ok"><i class="mg-i-info"></i><div><strong>Migration complete.</strong> ' . htmlspecialchars($result['msg']) . ' &mdash; redirecting to the new install…</div></div>';
+        echo '<script>window.location.replace(' . json_encode($base) . ');</script>';
+        echo '<noscript><p><a href="' . htmlspecialchars($base) . '">Open the new Grav 2.0 install</a></p></noscript>';
+    } else {
+        echo '<div class="mg-callout mg-callout-error"><i class="mg-i-warn"></i><div><strong>Promote failed.</strong> ' . htmlspecialchars($result['msg']) . '</div></div>';
+    }
+
+    echo '</div>';
+    page_footer();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Reset
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1884,13 +2188,23 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
             break;
 
         case 'test_done':
+            $webroot = dirname($stageDirAbs);
+            $currentVersion = mg_read_defines_version($webroot . '/system/defines.php') ?? ($flag['source']['grav_version'] ?? 'unknown');
+            $backupPreview = 'migration-backup-' . $currentVersion . '--' . date('YmdHis') . '.zip';
             echo '<div class="mg-card mg-card-active"><h3>Step 6: Promote to live</h3>';
-            echo '<p>Tested and ready. Final step: swap <code>/' . htmlspecialchars($stageDir) . '/</code> into place as the live install.</p>';
-            echo '<form method="post">';
+            echo '<p>Final step. This:</p>';
+            echo '<ol class="mg-promote-steps">';
+            echo '<li>Zips the existing 1.x install into <code>backup/' . htmlspecialchars($backupPreview) . '</code></li>';
+            echo '<li>Deletes the 1.x files from the webroot</li>';
+            echo '<li>Moves the staged Grav 2.0 from <code>/' . htmlspecialchars($stageDir) . '/</code> up into the webroot root</li>';
+            echo '<li>Removes the empty <code>/' . htmlspecialchars($stageDir) . '/</code> dir</li>';
+            echo '<li>Writes a breadcrumb at <code>.migration-complete</code> with the backup path</li>';
+            echo '</ol>';
+            echo '<div class="mg-callout mg-callout-warn"><i class="mg-i-warn"></i><div><strong>Point of no return.</strong> Your live URL will start serving Grav 2.0 immediately after this step. To revert, you\'d extract the backup zip back into place. Make sure Step 5 testing went well first.</div></div>';
+            echo '<form method="post" onsubmit="return confirm(\'Promote Grav 2.0 to live? Existing install will be zipped up to backup/ and then removed from the webroot. Revert requires manually extracting the backup zip.\');">';
             echo '<input type="hidden" name="action" value="promote">';
             echo '<input type="hidden" name="token"  value="' . htmlspecialchars($token) . '">';
-            echo '<button type="submit" class="mg-btn mg-btn-primary" disabled>Promote to live →</button>';
-            echo ' <span class="mg-btn-note">Not yet implemented.</span>';
+            echo '<button type="submit" class="mg-btn mg-btn-primary">Promote to live →</button>';
             echo '</form>';
             echo '</div>';
             break;
@@ -1942,11 +2256,15 @@ function mg_render_pt_details(array $pt): void
         echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-new">updated</span> ' . implode(', ', $lines) . '</div></div>';
     }
     if (!empty($pt['replacements']['installed'])) {
-        echo '<div class="mg-result-section"><strong>Auto-installed from GitHub</strong>';
+        echo '<div class="mg-result-section"><strong>Auto-installed</strong>';
         $lines = [];
         foreach ($pt['replacements']['installed'] as $slug => $info) {
             if (is_string($info)) { $lines[] = '<code>' . htmlspecialchars($slug) . '</code>'; continue; }
-            $tag = $info['source'] === 'release' ? 'v' . $info['version'] : $info['version'] . ' (default)';
+            $src = $info['source'] ?? '?';
+            $tag = $src === 'release' ? ('v' . $info['version'] . ' (github release)')
+                 : ($src === 'default-branch' ? ($info['version'] . ' (github default branch)')
+                 : ($src === 'gpm' ? ('v' . $info['version'] . ' (gpm)')
+                 : ('v' . $info['version'])));
             $lines[] = '<code>' . htmlspecialchars($slug) . '</code> <span class="mg-result-meta">(' . htmlspecialchars($tag) . ')</span>';
         }
         echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-new">installed</span> ' . implode(', ', $lines) . '</div></div>';
@@ -2042,9 +2360,23 @@ function render_compat_breakdown(array $scan): void
         $versions = $scan['github_versions'] ?? [];
         foreach ($pending as $slug => $info) {
             $ver = $versions[$slug] ?? null;
-            $verLabel = $ver
-                ? ($ver['source'] === 'release' ? 'v' . $ver['version'] : $ver['version'] . ' (default)')
-                : 'latest';
+            if ($ver) {
+                $verLabel = match ($ver['source']) {
+                    'release'        => 'v' . $ver['version'],
+                    'gpm'            => 'v' . $ver['version'],
+                    'default-branch' => $ver['version'] . ' (default)',
+                    default          => 'v' . $ver['version'],
+                };
+                $sourceTag = strtoupper($ver['source'] === 'release' ? 'github' : ($ver['source'] === 'default-branch' ? 'github' : $ver['source']));
+                $repoTag = $ver['source'] === 'gpm'
+                    ? 'getgrav.org/downloads (gpm)'
+                    : (string) ($info['entry']['github_repo'] ?? '');
+            } else {
+                $verLabel = 'latest';
+                $sourceTag = 'GITHUB';
+                $repoTag = (string) ($info['entry']['github_repo'] ?? '');
+            }
+
             $reasonText = ($info['kind'] ?? 'replaces') === 'requires'
                 ? 'Will be installed (required by <code>' . htmlspecialchars($info['target']) . '</code>)'
                 : 'Will be installed to replace <code>' . htmlspecialchars($info['target']) . '</code>';
@@ -2052,8 +2384,8 @@ function render_compat_breakdown(array $scan): void
             echo '<span class="mg-compat-icon">+</span>';
             echo '<span class="mg-compat-slug">' . htmlspecialchars($slug) . '</span>';
             echo ' <span class="mg-compat-version">' . htmlspecialchars($verLabel) . '</span>';
-            echo '<span class="mg-compat-reason">' . $reasonText . ' <span class="mg-compat-autoinstall">auto-install</span> <span class="mg-compat-repo"><code>' . htmlspecialchars($info['entry']['github_repo']) . '</code></span></span>';
-            echo '<span class="mg-compat-source">GITHUB</span>';
+            echo '<span class="mg-compat-reason">' . $reasonText . ' <span class="mg-compat-autoinstall">auto-install</span> <span class="mg-compat-repo"><code>' . htmlspecialchars($repoTag) . '</code></span></span>';
+            echo '<span class="mg-compat-source">' . htmlspecialchars($sourceTag) . '</span>';
             echo '</li>';
         }
 
@@ -2220,6 +2552,10 @@ function page_css(): string
     .mg-flash-details { display: block; margin-top: 10px; }
     .mg-flash-details summary { font-size: 12.5px; color: inherit; opacity: 0.85; }
     .mg-flash-details .mg-details-body { background: rgba(255,255,255,0.55); border-color: rgba(0,0,0,0.06); }
+
+    .mg-promote-steps { padding-left: 22px; margin: 6px 0 14px; font-size: 13.5px; color: #444; line-height: 1.65; }
+    .mg-promote-steps li { padding: 2px 0; }
+    .mg-promote-steps code { background: #f4f4f8; padding: 1px 6px; border-radius: 3px; font-size: 12.5px; }
 
     .mg-spin { display: inline-block; line-height: 1; transform-origin: 50% 50%;
         animation: mg-spin 1.1s linear infinite; }
