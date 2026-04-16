@@ -734,12 +734,19 @@ function do_promote(string $webroot, array $flag, ?callable $progress = null): a
     }
     @rmdir($stagePath);
 
+    // ─── Phase 4: post-promote safety patches ──────────────────────────────
+    // Ensure the new .htaccess forwards the HTTP Authorization header under
+    // FPM/FastCGI. No-op if already present (2.0-beta.1+) or no anchor found.
+    if ($progress) $progress(['phase' => 'copy', 'entry' => 'promote', 'file' => '.htaccess (Authorization passthrough)', 'copied' => count($promoted)]);
+    $authzPatch = mg_ensure_htaccess_authz_passthrough($webroot);
+
     // Breadcrumb for the new install.
     $summary = [
         'migrated_at'  => date('c'),
         'backup_zip'   => 'backup/' . $zipName,
         'from_version' => $currentVersion,
         'promoted'     => $promoted,
+        'htaccess_authz_patch' => $authzPatch,
     ];
     @file_put_contents(
         $webroot . '/.migration-complete',
@@ -936,6 +943,56 @@ function mg_patch_staged_htaccess(string $webroot, string $stageDir, string $sta
     }
     @file_put_contents($htpath, $patched);
     return ['ok' => true, 'msg' => "Set RewriteBase {$rewriteBase} in staged .htaccess."];
+}
+
+/**
+ * Ensure the promoted .htaccess passes the HTTP Authorization header through
+ * to PHP under FastCGI / PHP-FPM. Idempotent: if the rule is already present
+ * (current Grav 2.0 cores ship with it), does nothing. If the .htaccess is
+ * missing or has no `RewriteEngine On` anchor, skips cleanly — never fatal.
+ *
+ * This is a safety net for migrations off older 2.0-beta stages (pre-beta.1)
+ * or customized .htaccess files that predate the upstream fix. Without it,
+ * plugins that use `Authorization: Bearer` (e.g. Grav API) 401 on FPM hosts.
+ */
+function mg_ensure_htaccess_authz_passthrough(string $webroot): array
+{
+    $htpath = $webroot . '/.htaccess';
+    if (!is_file($htpath)) {
+        return ['ok' => true, 'skipped' => true, 'msg' => 'No .htaccess at webroot — skipped Authorization passthrough check.'];
+    }
+    $current = @file_get_contents($htpath);
+    if ($current === false) {
+        return ['ok' => false, 'msg' => 'Could not read .htaccess to check Authorization passthrough.'];
+    }
+    // Detect by the unique directive signature, not a comment marker — this
+    // matches both Grav core's shipped rule and any user-authored equivalent.
+    if (str_contains($current, 'HTTP_AUTHORIZATION:%{HTTP:Authorization}')) {
+        return ['ok' => true, 'skipped' => true, 'msg' => '.htaccess already passes Authorization through.'];
+    }
+    $block = "\n## Begin - Authorization Header (added by migrate-grav)\n"
+           . "# Ensures Bearer / Basic auth survives under PHP-FPM / FastCGI.\n"
+           . "# Harmless under mod_php. Safe to remove if not needed.\n"
+           . "RewriteCond %{HTTP:Authorization} .\n"
+           . "RewriteRule ^ - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]\n"
+           . "## End - Authorization Header\n";
+    // Insert right after the first `RewriteEngine On` line so it runs before
+    // any rewrites that might short-circuit the request.
+    $count = 0;
+    $patched = preg_replace(
+        '/^([ \t]*RewriteEngine\s+On[ \t]*)$/m',
+        '$1' . $block,
+        $current,
+        1,
+        $count
+    );
+    if (!$count || !is_string($patched)) {
+        return ['ok' => true, 'skipped' => true, 'msg' => 'No RewriteEngine On anchor in .htaccess — skipped Authorization passthrough patch.'];
+    }
+    if (@file_put_contents($htpath, $patched) === false) {
+        return ['ok' => false, 'msg' => 'Could not write .htaccess to add Authorization passthrough.'];
+    }
+    return ['ok' => true, 'patched' => true, 'msg' => 'Added HTTP Authorization passthrough to .htaccess.'];
 }
 
 function mg_unpatch_htaccess(string $webroot): void
