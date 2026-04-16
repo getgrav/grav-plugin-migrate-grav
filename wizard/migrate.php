@@ -243,6 +243,7 @@ function do_extract(string $webroot, array $flag, ?callable $progress = null): a
         }
         fclose($stream);
         fclose($out);
+        mg_apply_zip_mode($zip, $i, $target, $relative);
         $count++;
 
         // Throttled progress callback — every 50 files or final tick.
@@ -350,6 +351,44 @@ function detect_common_prefix(ZipArchive $zip): string
         }
     }
     return $prefix ?? '';
+}
+
+/**
+ * Apply the correct unix file mode to a just-extracted zip entry.
+ *
+ * PHP's raw `fwrite()` extract path used here does not carry over the mode
+ * stored in the zip's central directory (external attributes), so files
+ * land at whatever umask dictates — usually 0644. For the Grav distribution
+ * that silently strips the +x bit from bin/grav, bin/gpm, bin/plugin, and
+ * bin/composer.phar, leaving operators with broken CLI tools post-migration.
+ *
+ * Strategy:
+ *   1. Prefer the mode stored in the zip (OPSYS_UNIX). Real release builds
+ *      ship with 0755 on bin/* so this is usually sufficient.
+ *   2. Fallback: test-built zips and some hand-rolled builds don't pack
+ *      unix modes. For those, force 0755 on anything sitting directly
+ *      under bin/ since that dir contains only executables in the Grav
+ *      distribution (grav, gpm, plugin, composer.phar, ...).
+ */
+function mg_apply_zip_mode(ZipArchive $zip, int $index, string $target, string $relative): void
+{
+    $applied = false;
+    $opsys = null;
+    $attr  = null;
+    if (@$zip->getExternalAttributesIndex($index, $opsys, $attr)) {
+        if ($opsys === ZipArchive::OPSYS_UNIX && $attr !== null) {
+            $mode = ($attr >> 16) & 0xFFFF;
+            // Only trust zips that actually stored a permission bitset.
+            if (($mode & 0o777) !== 0) {
+                @chmod($target, $mode & 0o777);
+                $applied = true;
+            }
+        }
+    }
+
+    if (!$applied && (str_starts_with($relative, 'bin/') && substr_count($relative, '/') === 1)) {
+        @chmod($target, 0755);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
