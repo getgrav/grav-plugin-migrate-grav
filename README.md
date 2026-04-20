@@ -55,7 +55,7 @@ bin/plugin migrate-grav status
 
 ```yaml
 enabled: true
-source_url: 'https://getgrav.org/download/core/grav-update/latest'
+source_url: 'https://getgrav.org/download/core/grav/2.0.0-beta.1?testing'
 source_local_zip: ''        # absolute path to a local 2.0 zip (dev only)
 stage_dir: 'grav-2'
 require_super_admin: true

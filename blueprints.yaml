@@ -1,7 +1,7 @@
 name: Migrate Grav
 type: plugin
 slug: migrate-grav
-version: 1.0.0-beta.2
+version: 1.0.0-beta.3
 testing: true
 description: "Stages a new major Grav release alongside an existing site and hands off to a standalone migration wizard."
 icon: rocket
@@ -36,8 +36,8 @@ form:
     source_url:
       type: text
       label: 2.0 release URL
-      default: 'https://getgrav.org/download/core/grav-update/latest'
-      help: URL of the Grav 2.0 release zip. Override only for testing.
+      default: 'https://getgrav.org/download/core/grav/2.0.0-beta.1?testing'
+      help: URL of the Grav 2.0 core zip (no admin). The wizard fetches admin2, api, and any 2.0-compatible plugin updates from GPM separately. Override only for testing.
 
     source_local_zip:
       type: text

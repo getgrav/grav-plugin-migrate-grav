@@ -1,3 +1,9 @@
+# v1.0.0-beta.3
+## 04-20-2026
+
+1. [](#bugfix)
+    * Use beta release URL of Grav 2.0
+
 # v1.0.0-beta.2
 ## 04-16-2026
 
