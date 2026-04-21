@@ -263,6 +263,21 @@ function do_extract(string $webroot, array $flag, ?callable $progress = null): a
         if (!is_dir($p)) @mkdir($p, 0755, true);
     }
 
+    // Normalize the staged layout so later steps don't depend on which package
+    // variant was used. grav-update ships only system/vendor/bin — no user/,
+    // no root .htaccess. grav / grav-admin ship both. Create the user/
+    // skeleton and materialize .htaccess from webserver-configs/ if missing
+    // so plugins-themes/content/test steps work regardless of source package.
+    foreach (['user', 'user/plugins', 'user/themes', 'user/accounts', 'user/config', 'user/data', 'user/pages'] as $userDir) {
+        $p = $destPath . '/' . $userDir;
+        if (!is_dir($p)) @mkdir($p, 0755, true);
+    }
+    $htRoot = $destPath . '/.htaccess';
+    $htTmpl = $destPath . '/webserver-configs/htaccess.txt';
+    if (!is_file($htRoot) && is_file($htTmpl)) {
+        @copy($htTmpl, $htRoot);
+    }
+
     $flag['step']       = 'extracted';
     $flag['extracted']  = ['at' => time(), 'files' => $count, 'prefix_stripped' => $prefix];
     save_flag($webroot . '/.migrating', $flag);
@@ -409,32 +424,48 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
     $srcUser  = $webroot . '/user';
     $dstUser  = $webroot . '/' . $stageDir . '/user';
 
-    if (!is_dir($srcUser) || !is_dir($dstUser)) {
-        return ['ok' => false, 'msg' => 'Source or staged user/ missing — did extract run?'];
+    if (!is_dir($srcUser)) {
+        return ['ok' => false, 'msg' => "Source user/ missing at {$srcUser}"];
     }
+    ensure_dir($dstUser);
 
     $policy     = ($options['policy'] ?? 'disable') === 'skip' ? 'skip' : 'disable';
     $autoUpdate = !isset($options['skip_update']);
     $scan       = mg_compat_scan_cached($webroot, $flag);
-    $copied     = 0;
-    $skipped    = [];
-    $disabled   = [];
-    $upgraded   = [];
     $superseded = mg_collect_superseded($scan); // ['plugins/admin' => 'admin2', ...]
 
-    foreach (['plugins', 'themes'] as $kind) {
-        $src = $srcUser . '/' . $kind;
-        $dst = $dstUser . '/' . $kind;
-        if (!is_dir($src)) continue;
+    // ─── Phase 1: bulk-copy source user/ → staged user/ ──────────────────────
+    // Everything (plugins, themes, accounts, pages, data, config, env,
+    // languages, any custom folders, any top-level files) comes across
+    // verbatim. Dotfiles/dotdirs at user/ root (.git, .DS_Store, editor
+    // backups) and symlinked top-level entries are skipped — they're
+    // filesystem/dev-env cruft, not site content. Downstream phases mutate
+    // the staged tree in place (policy, auto-updates, replacements).
+    $copied = 0;
+    $copySkipped = [];
+    $copiedEntries = [];
+    mg_bulk_copy_user($srcUser, $dstUser, $copied, $progress, $copySkipped, $copiedEntries);
 
-        // Pre-pass: download + extract any auto-update candidates STRAIGHT
-        // INTO the staged dir. mg_import_compat_dir then sees the staged
-        // version already in place and treats it as "compatible / enabled"
-        // (its scan was based on source, but the destination is what counts).
-        if ($autoUpdate) {
+    // ─── Phase 2: apply plugin compat policy ─────────────────────────────────
+    // Skip/disable incompatibles, remove superseded slugs (admin → admin2).
+    // Themes are always kept — Twig 3 compat handles most at runtime.
+    $policyResult = mg_apply_plugin_policy($webroot, $stageDir, $scan, $policy, $superseded, $progress);
+    $disabled = array_map(static fn($s) => "plugins/{$s}", $policyResult['disabled']);
+    $skipped  = array_map(static fn($s) => "plugins/{$s}", $policyResult['skipped']);
+
+    // ─── Phase 3: overwrite auto-updatable plugins/themes with GPM 2.0 ───────
+    // Compat plugins/themes with a newer GPM version get their staged dir
+    // replaced with the fresh download. Skip-policy incompatibles have
+    // already been removed in Phase 2, so they're never re-installed here.
+    $upgraded = [];
+    if ($autoUpdate) {
+        foreach (['plugins', 'themes'] as $kind) {
             foreach (($scan[$kind] ?? []) as $slug => $verdict) {
                 $update = $verdict['update'] ?? null;
                 if (!$update || empty($update['download']) || empty($update['to'])) continue;
+
+                $dst = $dstUser . '/' . $kind . '/' . $slug;
+                if (!is_dir($dst)) continue; // removed by policy (or never copied)
 
                 if ($progress) $progress(['phase' => 'start', 'entry' => "update/{$kind}/{$slug}"]);
 
@@ -447,12 +478,9 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
                 }
             }
         }
-
-        $result = mg_import_compat_dir($src, $dst, $webroot, $stageDir, $kind, $scan, $policy, $copied, $progress, array_keys($upgraded), $superseded);
-        foreach ($result['skipped']  as $s) $skipped[]  = "{$kind}/{$s}";
-        foreach ($result['disabled'] as $d) $disabled[] = "{$kind}/{$d}";
     }
 
+    // ─── Phase 4: install replacements (admin2, api, etc.) ───────────────────
     $replacements = mg_install_replacements($webroot, $stageDir, $scan, $disabled, $skipped, $progress);
 
     // Derive the "actually copied" slug list per kind from the scan, minus
@@ -475,19 +503,21 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
 
     $flag['step']           = 'plugins_done';
     $flag['plugins_themes'] = [
-        'at'           => time(),
-        'files'        => $copied,
-        'copied'       => $copiedByKind,
-        'skipped'      => $skipped,
-        'disabled'     => $disabled,
-        'policy'       => $policy,
-        'auto_update'  => $autoUpdate,
-        'upgraded'     => $upgraded,
-        'replacements' => $replacements,
+        'at'             => time(),
+        'files'          => $copied,
+        'copied'         => $copiedByKind,
+        'copied_entries' => $copiedEntries,
+        'copy_skipped'   => $copySkipped,
+        'skipped'        => $skipped,
+        'disabled'       => $disabled,
+        'policy'         => $policy,
+        'auto_update'    => $autoUpdate,
+        'upgraded'       => $upgraded,
+        'replacements'   => $replacements,
     ];
     save_flag($webroot . '/.migrating', $flag);
 
-    $msg = "Copied {$copied} plugin/theme files";
+    $msg = "Copied {$copied} files across user/ (" . count($copiedEntries) . ' top-level entries)';
     if ($upgraded) $msg .= "; updated " . count($upgraded);
     if ($disabled) $msg .= "; disabled " . count($disabled);
     if ($skipped)  $msg .= "; skipped " . count($skipped);
@@ -499,47 +529,41 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
 
 function do_accounts(string $webroot, array $flag, array $options, ?callable $progress = null): array
 {
+    // Accounts were already copied verbatim into staged user/accounts/ by
+    // Step 2's bulk user/ copy. This step just applies the optional
+    // admin.* → api.* perm mirror transform on the staged yamls in place.
     $stageDir = trim((string)($flag['stage_dir'] ?? 'grav-2'), '/');
-    $src = $webroot . '/user/accounts';
     $dst = $webroot . '/' . $stageDir . '/user/accounts';
 
-    if (!is_dir($src)) {
+    if (!is_dir($dst)) {
         $flag['step'] = 'accounts_done';
         $flag['accounts'] = ['at' => time(), 'count' => 0, 'migrated_perms' => 0, 'skipped_perms' => true];
         save_flag($webroot . '/.migrating', $flag);
-        return ['ok' => true, 'msg' => 'No user/accounts/ dir on source — nothing to migrate.'];
+        return ['ok' => true, 'msg' => 'No user/accounts/ in staged install — nothing to transform.'];
     }
 
-    ensure_dir($dst);
     $migratePerms = !empty($options['migrate_perms']);
     $count = 0;
     $mirrored = 0;
     $details = [];
 
-    foreach (scandir($src) ?: [] as $entry) {
+    foreach (scandir($dst) ?: [] as $entry) {
         if ($entry === '.' || $entry === '..') continue;
-        // Skip dotfiles (.gitkeep, .DS_Store, etc.) — they're filesystem
-        // detritus, not user accounts. The staged install ships its own.
         if ($entry[0] === '.') continue;
 
-        $srcPath = $src . '/' . $entry;
-        $dstPath = $dst . '/' . $entry;
+        $path = $dst . '/' . $entry;
+        if (!is_file($path)) continue;
+        if (!preg_match('/\.yaml$/i', $entry)) continue;
 
         if ($progress) $progress(['phase' => 'start', 'entry' => "accounts/{$entry}"]);
 
-        if (is_dir($srcPath)) {
-            // Groups sub-dir etc. — copy as-is.
-            copy_tree($srcPath, $dstPath, static function () use (&$count) { $count++; });
-        } elseif (is_file($srcPath)) {
-            if ($migratePerms && preg_match('/\.yaml$/i', $entry)) {
-                $added = mg_migrate_account_perms($srcPath, $dstPath);
-                $mirrored += $added;
-                $details[$entry] = $added;
-            } else {
-                @copy($srcPath, $dstPath);
-            }
-            $count++;
+        if ($migratePerms) {
+            // Rewrite in place: read, mirror admin.* → api.*, overwrite.
+            $added = mg_migrate_account_perms($path, $path);
+            $mirrored += $added;
+            $details[$entry] = $added;
         }
+        $count++;
 
         if ($progress) $progress(['phase' => 'done-entry', 'entry' => "accounts/{$entry}", 'added' => $details[$entry] ?? 0]);
     }
@@ -554,7 +578,7 @@ function do_accounts(string $webroot, array $flag, array $options, ?callable $pr
     ];
     save_flag($webroot . '/.migrating', $flag);
 
-    $msg = "Copied {$count} account file(s)";
+    $msg = "Processed {$count} account file(s)";
     if ($migratePerms) $msg .= "; mirrored {$mirrored} admin.* → api.* permission(s)";
     else               $msg .= "; permission mirroring skipped";
     return ['ok' => true, 'msg' => $msg . '.'];
@@ -963,53 +987,29 @@ function mg_unpatch_htaccess(string $webroot): void
 
 function do_content(string $webroot, array $flag, ?callable $progress = null): array
 {
+    // Content (pages, data, config, env, languages, custom folders, any
+    // top-level user/* files) was already bulk-copied into the staged
+    // install during Step 2. This step just summarises what landed in the
+    // staged user/ and marks the flow complete.
     $stageDir = trim((string)($flag['stage_dir'] ?? 'grav-2'), '/');
-    $srcUser  = $webroot . '/user';
     $dstUser  = $webroot . '/' . $stageDir . '/user';
 
-    if (!is_dir($srcUser) || !is_dir($dstUser)) {
-        return ['ok' => false, 'msg' => 'Source or staged user/ missing — did extract run?'];
-    }
-
-    // Step 4 copies everything under user/ that wasn't handled by earlier steps.
     $handled = ['plugins', 'themes', 'accounts'];
-    $copied  = 0;
     $entries = [];
-
-    foreach (scandir($srcUser) ?: [] as $entry) {
-        if ($entry === '.' || $entry === '..') continue;
-        if (in_array($entry, $handled, true)) continue;
-
-        $src = $srcUser . '/' . $entry;
-        $dst = $dstUser . '/' . $entry;
-
-        if (is_link($src) && is_dir($src)) continue;
-
-        if ($progress) $progress(['phase' => 'start', 'entry' => $entry]);
-
-        if (is_dir($src)) {
-            copy_tree($src, $dst, static function (string $rel) use (&$copied, $entry, $progress) {
-                $copied++;
-                if ($progress && $copied % 200 === 0) {
-                    $progress(['phase' => 'copy', 'entry' => $entry, 'file' => $rel, 'copied' => $copied]);
-                }
-            });
-            $entries[] = $entry;
-        } elseif (is_file($src)) {
-            ensure_dir(dirname($dst));
-            @copy($src, $dst);
-            $copied++;
+    if (is_dir($dstUser)) {
+        foreach (scandir($dstUser) ?: [] as $entry) {
+            if ($entry === '.' || $entry === '..') continue;
+            if ($entry[0] === '.') continue;
+            if (in_array($entry, $handled, true)) continue;
             $entries[] = $entry;
         }
-
-        if ($progress) $progress(['phase' => 'done-entry', 'entry' => $entry, 'copied' => $copied]);
     }
 
     $flag['step']    = 'content_done';
-    $flag['content'] = ['at' => time(), 'files' => $copied, 'entries' => $entries];
+    $flag['content'] = ['at' => time(), 'entries' => $entries];
     save_flag($webroot . '/.migrating', $flag);
 
-    return ['ok' => true, 'msg' => "Copied {$copied} files across " . count($entries) . " entries."];
+    return ['ok' => true, 'msg' => 'Content already migrated in Step 2 — ' . count($entries) . ' top-level entries under staged user/.'];
 }
 
 /**
@@ -1306,84 +1306,106 @@ function mg_github_resolve_download(string $repo): array
 }
 
 /**
- * Copy a plugins/ or themes/ directory, classifying each child by 2.0
- * compatibility and applying the user's policy for incompatibles.
+ * Copy the entire source user/ tree into the staged install verbatim.
+ * Top-level dotfiles/dotdirs (.git, .DS_Store, editor backups) and
+ * top-level symlinks are skipped as filesystem/dev-env cruft. copy_tree
+ * handles symlinked directories encountered mid-tree. Downstream phases
+ * mutate the staged tree in place (plugin policy, auto-updates, account
+ * perm mirror). Appends skipped entries to $copySkipped with a reason
+ * tag, and appends successfully-copied top-level names to $copiedEntries.
  */
-function mg_import_compat_dir(string $srcDir, string $dstDir, string $webroot, string $stageDir, string $kind, array $scan, string $policy, int &$copied, ?callable $progress, array $alreadyUpgraded = [], array $superseded = []): array
+function mg_bulk_copy_user(string $srcUser, string $dstUser, int &$copied, ?callable $progress, array &$copySkipped, array &$copiedEntries): void
 {
-    $skipped = [];
-    $disabled = [];
-    $verdicts = $scan[$kind] ?? [];
-    $upgradedSet = array_flip($alreadyUpgraded); // "kind/slug" entries
-    // $superseded: ["kind/slug" => "replacement_slug"]
+    ensure_dir($dstUser);
 
-    ensure_dir($dstDir);
+    foreach (scandir($srcUser) ?: [] as $entry) {
+        if ($entry === '.' || $entry === '..') continue;
 
-    foreach (scandir($srcDir) ?: [] as $slug) {
-        if ($slug === '.' || $slug === '..') continue;
-
-        $src = $srcDir . '/' . $slug;
-        $dst = $dstDir . '/' . $slug;
-        $label = "{$kind}/{$slug}";
-
-        // Already replaced by an auto-update — leave the staged version alone.
-        if (isset($upgradedSet[$label])) continue;
-
-        // Replaced by a different slug (admin → admin2). Skip the old plugin
-        // entirely — and if the stage dir happens to contain it (e.g. from
-        // the 2.0 zip shipping a placeholder, or a previous iteration),
-        // remove that too so the promoted install doesn't carry it over.
-        if (isset($superseded[$label])) {
-            $replSlug = $superseded[$label];
-            if (is_dir($dst)) {
-                remove_dir($dst);
-            } elseif (is_file($dst)) {
-                @unlink($dst);
-            }
-            $skipped[] = $slug . " (superseded by {$replSlug})";
-            if ($progress) $progress(['phase' => 'skip', 'entry' => $label, 'reason' => "superseded by {$replSlug}", 'copied' => $copied]);
+        if ($entry[0] === '.') {
+            $copySkipped[] = "{$entry} (dotfile/dotdir)";
             continue;
         }
 
-        if (is_link($src) && is_dir($src)) {
-            $skipped[] = $slug . ' (symlinked)';
-            if ($progress) $progress(['phase' => 'skip', 'entry' => $label, 'reason' => 'symlinked', 'copied' => $copied]);
+        $src = $srcUser . '/' . $entry;
+        $dst = $dstUser . '/' . $entry;
+
+        if (is_link($src)) {
+            $copySkipped[] = "{$entry} (symlink)";
+            if ($progress) $progress(['phase' => 'skip', 'entry' => "user/{$entry}", 'reason' => 'symlink', 'copied' => $copied]);
             continue;
         }
 
-        $verdict = $verdicts[$slug]['status'] ?? 'unknown';
-        $compatible = ($verdict === 'compatible');
-
-        // Policy: skip incompatibles entirely
-        if (!$compatible && $policy === 'skip') {
-            $skipped[] = $slug;
-            if ($progress) $progress(['phase' => 'skip', 'entry' => $label, 'reason' => 'incompatible (skip policy)', 'copied' => $copied]);
-            continue;
-        }
-
-        if ($progress) $progress(['phase' => 'start', 'entry' => $label, 'copied' => $copied]);
+        if ($progress) $progress(['phase' => 'start', 'entry' => "user/{$entry}", 'copied' => $copied]);
 
         if (is_dir($src)) {
-            copy_tree($src, $dst, static function (string $rel) use (&$copied, $label, $progress) {
+            copy_tree($src, $dst, static function (string $rel) use (&$copied, $entry, $progress) {
                 $copied++;
-                if ($progress && $copied % 100 === 0) {
-                    $progress(['phase' => 'copy', 'entry' => $label, 'file' => $rel, 'copied' => $copied]);
+                if ($progress && $copied % 200 === 0) {
+                    $progress(['phase' => 'copy', 'entry' => "user/{$entry}", 'file' => $rel, 'copied' => $copied]);
                 }
             });
+            $copiedEntries[] = $entry;
         } elseif (is_file($src)) {
             ensure_dir(dirname($dst));
             @copy($src, $dst);
             $copied++;
+            $copiedEntries[] = $entry;
         }
 
-        // Disable-policy: write user/config/plugins/<slug>.yaml with enabled: false
-        // (only for plugins; themes don't have an enabled toggle).
-        if (!$compatible && $policy === 'disable' && $kind === 'plugins') {
-            mg_write_plugin_disable($webroot . '/' . $stageDir, $slug);
+        if ($progress) $progress(['phase' => 'done-entry', 'entry' => "user/{$entry}", 'copied' => $copied]);
+    }
+}
+
+/**
+ * Apply the chosen compat policy to the already-copied staged user/plugins/.
+ *   - superseded (admin → admin2, etc.): remove the old slug dir; the
+ *     replacement is installed separately via mg_install_replacements.
+ *   - skip policy + incompatible: remove the slug dir entirely.
+ *   - disable policy + incompatible: write user/config/plugins/<slug>.yaml
+ *     with enabled: false so Grav loads the config but ignores the plugin.
+ * Themes are NOT touched here — they're always kept, and Grav 2.0's Twig 3
+ * compat layer handles most existing themes at runtime. Returns
+ * ['skipped' => [...], 'disabled' => [...]] (bare slug names; caller
+ * prefixes with "plugins/" for summary).
+ */
+function mg_apply_plugin_policy(string $webroot, string $stageDir, array $scan, string $policy, array $superseded, ?callable $progress): array
+{
+    $skipped   = [];
+    $disabled  = [];
+    $stageRoot = $webroot . '/' . $stageDir;
+    $pluginDir = $stageRoot . '/user/plugins';
+    if (!is_dir($pluginDir)) return ['skipped' => $skipped, 'disabled' => $disabled];
+
+    $verdicts = $scan['plugins'] ?? [];
+
+    foreach (scandir($pluginDir) ?: [] as $slug) {
+        if ($slug === '.' || $slug === '..') continue;
+        if ($slug[0] === '.') continue;
+        $slugDir = $pluginDir . '/' . $slug;
+        if (!is_dir($slugDir)) continue;
+
+        $label = "plugins/{$slug}";
+
+        if (isset($superseded[$label])) {
+            $replSlug = $superseded[$label];
+            remove_dir($slugDir);
+            $skipped[] = $slug . " (superseded by {$replSlug})";
+            if ($progress) $progress(['phase' => 'skip', 'entry' => $label, 'reason' => "superseded by {$replSlug}"]);
+            continue;
+        }
+
+        $verdict = $verdicts[$slug]['status'] ?? 'unknown';
+        if ($verdict === 'compatible') continue;
+
+        if ($policy === 'skip') {
+            remove_dir($slugDir);
+            $skipped[] = $slug;
+            if ($progress) $progress(['phase' => 'skip', 'entry' => $label, 'reason' => 'incompatible (skip policy)']);
+        } elseif ($policy === 'disable') {
+            mg_write_plugin_disable($stageRoot, $slug);
             $disabled[] = $slug;
+            if ($progress) $progress(['phase' => 'done-entry', 'entry' => $label, 'reason' => 'incompatible (disabled)']);
         }
-
-        if ($progress) $progress(['phase' => 'done-entry', 'entry' => $label, 'copied' => $copied]);
     }
 
     return ['skipped' => $skipped, 'disabled' => $disabled];
@@ -1836,21 +1858,21 @@ function mg_stream_finish(array $result, string $token, string $flashKey): void
 
 function stream_plugins_themes_page(string $webroot, array $flag, string $token, array $options): void
 {
-    mg_stream_setup('Importing plugins &amp; themes…', 'Copying plugins and themes from your live site into the staged Grav 2.0, classifying each by 2.0 compatibility, and installing replacements where configured.');
+    mg_stream_setup('Migrating user/ …', 'Bulk-copying your entire <code>user/</code> directory (pages, data, config, languages, accounts, plugins, themes, and any custom folders) from your live site into the staged Grav 2.0, then applying plugin transforms: incompatible plugins follow your chosen policy, 2.0-compatible plugins are updated to latest, and replacements (admin2, api, etc.) are installed. Themes are kept as-is — Grav 2.0\'s default Twig 3 compatibility mode aims to keep existing themes rendering.');
     $result = do_plugins_themes($webroot, $flag, $options, mg_stream_progress_cb());
     mg_stream_finish($result, $token, 'plugins_done');
 }
 
 function stream_accounts_page(string $webroot, array $flag, string $token, array $options): void
 {
-    mg_stream_setup('Importing accounts…', 'Copying user accounts' . (empty($options['migrate_perms']) ? '.' : ' and mirroring <code>admin.*</code> permissions to <code>api.*</code> so they work with Admin 2.0.'));
+    mg_stream_setup('Processing accounts…', 'Account yamls were copied during Step 2' . (empty($options['migrate_perms']) ? '; confirming accounts step and moving on.' : '. Mirroring <code>admin.*</code> permissions to <code>api.*</code> in place so the same users keep full access on Admin 2.0.'));
     $result = do_accounts($webroot, $flag, $options, mg_stream_progress_cb());
     mg_stream_finish($result, $token, 'accounts_done');
 }
 
 function stream_content_page(string $webroot, array $flag, string $token): void
 {
-    mg_stream_setup('Importing content…', 'Copying your remaining <code>user/</code> content (pages, data, config, env, languages, and any other custom folders) into the staged Grav 2.0.');
+    mg_stream_setup('Content confirmation…', 'All <code>user/</code> content (pages, data, config, languages, custom folders) was bulk-copied during Step 2. Marking content complete and advancing to testing.');
     $result = do_content($webroot, $flag, mg_stream_progress_cb());
     mg_stream_finish($result, $token, 'content_done');
 }
@@ -2003,7 +2025,7 @@ function render_wizard(array $flag, string $step, string $webroot, string $stage
                  . ' · skipped ' . count($pt['skipped'] ?? [])
                  . ' · installed ' . count($pt['replacements']['installed'] ?? []);
 
-        echo '<tr><th>Plugins &amp; themes</th><td>';
+        echo '<tr><th>Copy &amp; migrate</th><td>';
         echo '<details class="mg-details"><summary><code>' . htmlspecialchars($summary) . '</code></summary>';
         echo '<div class="mg-details-body">';
         mg_render_pt_details($pt);
@@ -2024,7 +2046,7 @@ function render_wizard(array $flag, string $step, string $webroot, string $stage
     }
     if (isset($flag['content'])) {
         $c = $flag['content'];
-        $summary = (int) ($c['files'] ?? 0) . ' files across ' . count($c['entries'] ?? []) . ' entries';
+        $summary = count($c['entries'] ?? []) . ' top-level entries in staged user/';
 
         echo '<tr><th>Content</th><td>';
         echo '<details class="mg-details"><summary><code>' . htmlspecialchars($summary) . '</code></summary>';
@@ -2053,7 +2075,7 @@ function render_stepper(string $current): void
     // Stepper shows the five actions the user performs.
     $steps = [
         ['label' => 'Extract',          'done_when' => ['extracted','plugins_done','accounts_done','content_done','test_done','promoted'], 'current_when' => 'staged'],
-        ['label' => 'Plugins & Themes', 'done_when' => ['plugins_done','accounts_done','content_done','test_done','promoted'],             'current_when' => 'extracted'],
+        ['label' => 'Copy & Migrate', 'done_when' => ['plugins_done','accounts_done','content_done','test_done','promoted'],             'current_when' => 'extracted'],
         ['label' => 'Accounts',         'done_when' => ['accounts_done','content_done','test_done','promoted'],                            'current_when' => 'plugins_done'],
         ['label' => 'Content',          'done_when' => ['content_done','test_done','promoted'],                                            'current_when' => 'accounts_done'],
         ['label' => 'Test',             'done_when' => ['test_done','promoted'],                                                           'current_when' => 'content_done'],
@@ -2099,8 +2121,9 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
             $flagRef = $flag;
             $scan    = mg_compat_scan_cached($webroot, $flagRef);
 
-            echo '<div class="mg-card mg-card-active"><h3>Step 2: Plugins &amp; Themes</h3>';
-            echo '<p>Review 2.0 compatibility for each plugin and theme. All are copied; incompatible ones follow the policy you choose below.</p>';
+            echo '<div class="mg-card mg-card-active"><h3>Step 2: Copy &amp; Migrate</h3>';
+            echo '<p>This is the heavy-lifting step: your entire <code>user/</code> directory (pages, data, config, languages, accounts, plugins, themes, and any custom folders) is copied into the staged install, then plugin transforms are applied based on your choices below. Steps 3 and 4 just run light transforms on the already-copied data.</p>';
+            echo '<p>Review 2.0 compatibility. <strong>Plugins</strong>: incompatible ones follow the policy you choose. <strong>Themes</strong>: always kept as-is — Grav 2.0 ships Twig 3 compatibility mode (enabled by default), which lets most existing themes (including custom ones) render without changes. Verify the staged site in Step 5 before promoting to live.</p>';
 
             if ($scan['source'] === 'offline') {
                 echo '<div class="mg-callout mg-callout-warn"><i class="mg-i-info"></i><div>Could not reach the curated compatibility registry. Falling back to blueprint + dependency inference only — verdicts may be less accurate.</div></div>';
@@ -2111,50 +2134,49 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
             echo '<form method="post" style="margin-top:18px">';
             echo '<input type="hidden" name="action" value="plugins_themes">';
             echo '<input type="hidden" name="token"  value="' . htmlspecialchars($token) . '">';
-            echo '<p style="margin:0 0 8px;font-size:13.5px;color:#333;font-weight:600">For incompatible plugins &amp; themes:</p>';
+            echo '<p style="margin:0 0 8px;font-size:13.5px;color:#333;font-weight:600">For incompatible plugins:</p>';
             echo '<label class="mg-check mg-check-block"><input type="radio" name="policy" value="disable" checked> Copy but <strong>disable</strong> them <span class="mg-btn-note">(keeps your config; reinstall a compatible version in-place)</span></label>';
             echo '<label class="mg-check mg-check-block"><input type="radio" name="policy" value="skip"> <strong>Skip</strong> them entirely <span class="mg-btn-note">(cleaner; reinstall from scratch via the 2.0 admin)</span></label>';
             echo '<p style="margin:14px 0 6px;font-size:13.5px;color:#333;font-weight:600">Auto-update behavior:</p>';
             echo '<label class="mg-check mg-check-block"><input type="checkbox" name="skip_update" value="1"> Skip auto-update <span class="mg-btn-note">(use the version installed on 1.x — on your head be it)</span></label>';
-            echo '<div style="margin-top:14px"><button type="submit" class="mg-btn mg-btn-primary">Copy plugins &amp; themes →</button></div>';
+            echo '<div style="margin-top:14px"><button type="submit" class="mg-btn mg-btn-primary">Copy &amp; migrate user/ →</button></div>';
             echo '</form>';
             echo '</div>';
             break;
 
         case 'plugins_done':
-            $webroot = dirname($stageDirAbs);
-            $acctDir = $webroot . '/user/accounts';
+            $acctDir = $stageDirAbs . '/user/accounts';
             $nAccounts = is_dir($acctDir) ? count(array_filter(scandir($acctDir) ?: [], static fn($e) => $e !== '.' && $e !== '..' && preg_match('/\.yaml$/i', $e))) : 0;
 
             echo '<div class="mg-card mg-card-active"><h3>Step 3: Accounts</h3>';
-            echo '<p>Copy user accounts into the staged Grav 2.0. ' . $nAccounts . ' account yaml(s) detected at <code>user/accounts/</code>.</p>';
-            echo '<p>Grav 2.0 (with Admin 2.0) uses <code>api.*</code> permission names going forward. Your existing <code>admin.*</code> permissions can be mirrored so the same users keep full access on both surfaces while you transition.</p>';
+            echo '<p>Account yamls were copied verbatim into the staged install during Step 2 (' . $nAccounts . ' yaml(s) detected in staged <code>user/accounts/</code>). This step just applies the optional permission transform.</p>';
+            echo '<p>Grav 2.0 (with Admin 2.0) uses <code>api.*</code> permission names going forward. Your existing <code>admin.*</code> permissions can be mirrored in place so the same users keep full access on both surfaces while you transition.</p>';
             echo '<form method="post" style="margin-top:14px">';
             echo '<input type="hidden" name="action" value="accounts">';
             echo '<input type="hidden" name="token"  value="' . htmlspecialchars($token) . '">';
-            echo '<label class="mg-check mg-check-block"><input type="checkbox" name="skip_perms" value="1"> Skip permission mirroring <span class="mg-btn-note">(copy accounts as-is; you\'ll set <code>api.*</code> perms manually later)</span></label>';
-            echo '<div style="margin-top:14px"><button type="submit" class="mg-btn mg-btn-primary">Copy accounts →</button></div>';
+            echo '<label class="mg-check mg-check-block"><input type="checkbox" name="skip_perms" value="1"> Skip permission mirroring <span class="mg-btn-note">(leave account yamls as-is; you\'ll set <code>api.*</code> perms manually later)</span></label>';
+            echo '<div style="margin-top:14px"><button type="submit" class="mg-btn mg-btn-primary">Apply perm mirror →</button></div>';
             echo '</form>';
             echo '</div>';
             break;
 
         case 'accounts_done':
             $webroot = dirname($stageDirAbs);
-            $srcUser = $webroot . '/user';
+            $dstUser = $stageDirAbs . '/user';
             $handled = ['plugins', 'themes', 'accounts'];
-            $remaining = is_dir($srcUser)
-                ? array_values(array_filter(scandir($srcUser) ?: [], static fn($e) => $e !== '.' && $e !== '..' && !in_array($e, $handled, true)))
+            $present = is_dir($dstUser)
+                ? array_values(array_filter(scandir($dstUser) ?: [], static fn($e) => $e !== '.' && $e !== '..' && $e[0] !== '.' && !in_array($e, $handled, true)))
                 : [];
 
             echo '<div class="mg-card mg-card-active"><h3>Step 4: Content</h3>';
-            echo '<p>Copy everything else under <code>user/</code> into the staged install. Pages, data, config, and any custom folders come across as-is.</p>';
-            echo '<p><strong>Will copy:</strong> ';
-            echo $remaining ? implode(', ', array_map(static fn($e) => '<code>user/' . htmlspecialchars($e) . '/</code>', $remaining)) : '<em>no remaining entries</em>';
+            echo '<p>All content under <code>user/</code> (pages, data, config, languages, custom folders, top-level files) was bulk-copied into the staged install during Step 2. Confirm below to continue to testing.</p>';
+            echo '<p><strong>Present in staged <code>user/</code>:</strong> ';
+            echo $present ? implode(', ', array_map(static fn($e) => '<code>user/' . htmlspecialchars($e) . '/</code>', $present)) : '<em>no additional entries beyond plugins/themes/accounts</em>';
             echo '</p>';
             echo '<form method="post" style="margin-top:14px">';
             echo '<input type="hidden" name="action" value="content">';
             echo '<input type="hidden" name="token"  value="' . htmlspecialchars($token) . '">';
-            echo '<button type="submit" class="mg-btn mg-btn-primary">Copy content →</button>';
+            echo '<button type="submit" class="mg-btn mg-btn-primary">Confirm →</button>';
             echo '</form>';
             echo '</div>';
             break;
@@ -2317,7 +2339,7 @@ function mg_render_pt_details(array $pt): void
 
 function mg_render_accounts_details(array $ac): void
 {
-    echo '<div class="mg-result-section"><strong>Accounts copied</strong>';
+    echo '<div class="mg-result-section"><strong>Account yamls processed</strong>';
     echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-ok">files</span> ' . (int) ($ac['count'] ?? 0) . '</div>';
     if (!empty($ac['details']) && is_array($ac['details'])) {
         $rows = [];
@@ -2339,8 +2361,8 @@ function mg_render_accounts_details(array $ac): void
 
 function mg_render_content_details(array $c): void
 {
-    echo '<div class="mg-result-section"><strong>Content copied</strong>';
-    echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-ok">files</span> ' . (int) ($c['files'] ?? 0) . '</div>';
+    echo '<div class="mg-result-section"><strong>Content in staged <code>user/</code></strong>';
+    echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-ok">top-level entries</span> ' . count($c['entries'] ?? []) . '</div>';
     if (!empty($c['entries'])) {
         $entries = array_map(static fn($e) => '<code>user/' . htmlspecialchars((string) $e) . '/</code>', $c['entries']);
         echo '<div class="mg-result-row" style="margin-top:6px">' . implode(', ', $entries) . '</div>';
@@ -2438,11 +2460,23 @@ function render_compat_breakdown(array $scan): void
                 $replEntry = $replBy ? mg_lookup_registry_entry($replBy) : null;
                 $autoInstall = $replBy && is_array($replEntry) && !empty($replEntry['github_repo']);
 
-                echo '<li class="mg-compat mg-compat-' . $cls . '">';
-                echo '<span class="mg-compat-icon">' . $icon . '</span>';
+                // Themes without explicit 2.0 markers are the norm (almost no
+                // theme — and certainly no custom theme — declares 2.0
+                // compatibility). They're kept as-is and rely on Grav 2.0's
+                // Twig 3 compat layer. Reframe the row so users don't see a
+                // scary ✗ next to their working theme.
+                $isKeptTheme = ($k === 'themes' && $status === 'incompatible' && !$replBy);
+                $rowIcon   = $isKeptTheme ? '⚠' : $icon;
+                $rowCls    = $isKeptTheme ? 'warn' : $cls;
+                $rowReason = $isKeptTheme
+                    ? 'Kept — Twig 3 compatibility enabled (verify before promoting)'
+                    : $reason;
+
+                echo '<li class="mg-compat mg-compat-' . $rowCls . '">';
+                echo '<span class="mg-compat-icon">' . $rowIcon . '</span>';
                 echo '<span class="mg-compat-slug">' . htmlspecialchars($slug) . '</span>';
                 if ($version !== '') echo ' <span class="mg-compat-version">' . htmlspecialchars($version) . '</span>';
-                echo '<span class="mg-compat-reason">' . htmlspecialchars($reason);
+                echo '<span class="mg-compat-reason">' . htmlspecialchars($rowReason);
                 if ($update) {
                     echo ' <span class="mg-compat-update">↑ updates to v' . htmlspecialchars($update['to']) . '</span>';
                 }
