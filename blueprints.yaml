@@ -1,7 +1,7 @@
 name: Migrate Grav
 type: plugin
 slug: migrate-grav
-version: 1.0.0-beta.4
+version: 1.0.0-beta.5
 testing: true
 description: "Stages a new major Grav release alongside an existing site and hands off to a standalone migration wizard."
 icon: rocket
@@ -15,7 +15,7 @@ bugs: https://github.com/getgrav/grav-plugin-migrate-grav/issues
 docs: https://github.com/getgrav/grav-plugin-migrate-grav/blob/main/README.md
 license: MIT
 dependencies:
-  - { name: grav, version: '>=1.7.50' }
+  - { name: grav, version: '>=1.7.49' }
 compatibility:
   grav: ['1.7', '1.8']
 
@@ -36,7 +36,7 @@ form:
     source_url:
       type: text
       label: 2.0 release URL
-      default: 'https://getgrav.org/download/core/grav-update/2.0.0-beta.1?testing'
+      default: 'https://getgrav.org/download/core/grav-update/latest?testing'
       help: URL of the Grav 2.0 update zip (system files, no baseline user/ content). Avoids polluting the migrated site with default home/typography pages. The wizard fetches admin2, api, and any 2.0-compatible plugin updates from GPM separately. Override only for testing.
 
     source_local_zip:
