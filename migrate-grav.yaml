@@ -1,5 +1,5 @@
 enabled: true
-source_url: 'https://getgrav.org/download/core/grav-update/2.0.0-beta.1?testing'
+source_url: 'https://getgrav.org/download/core/grav-update/latest?testing'
 source_local_zip: ''
 stage_dir: 'grav-2'
 require_super_admin: true

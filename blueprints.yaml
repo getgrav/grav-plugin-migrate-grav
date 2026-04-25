@@ -36,7 +36,7 @@ form:
     source_url:
       type: text
       label: 2.0 release URL
-      default: 'https://getgrav.org/download/core/grav-update/2.0.0-beta.1?testing'
+      default: 'https://getgrav.org/download/core/grav-update/latest?testing'
       help: URL of the Grav 2.0 update zip (system files, no baseline user/ content). Avoids polluting the migrated site with default home/typography pages. The wizard fetches admin2, api, and any 2.0-compatible plugin updates from GPM separately. Override only for testing.
 
     source_local_zip:
