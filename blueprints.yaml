@@ -1,7 +1,7 @@
 name: Migrate Grav
 type: plugin
 slug: migrate-grav
-version: 1.0.0-beta.4
+version: 1.0.0-beta.5
 testing: true
 description: "Stages a new major Grav release alongside an existing site and hands off to a standalone migration wizard."
 icon: rocket
@@ -15,7 +15,7 @@ bugs: https://github.com/getgrav/grav-plugin-migrate-grav/issues
 docs: https://github.com/getgrav/grav-plugin-migrate-grav/blob/main/README.md
 license: MIT
 dependencies:
-  - { name: grav, version: '>=1.7.50' }
+  - { name: grav, version: '>=1.7.49' }
 compatibility:
   grav: ['1.7', '1.8']
 

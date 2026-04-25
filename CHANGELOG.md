@@ -1,3 +1,10 @@
+# v1.0.0-beta.5
+## 04-25-2026
+
+2. [](#bugfix)
+    * Use 'latest' URL to always get the latest version of Grav 2.0 beta
+    * Allow being run in Grav 1.7.49+
+
 # v1.0.0-beta.4
 ## 04-21-2026
 
