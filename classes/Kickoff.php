@@ -115,6 +115,17 @@ class Kickoff
             throw new RuntimeException('No source_url configured for Grav 2.0 release.');
         }
 
+        // Honor the site's GPM channel: if the user runs on the testing
+        // channel (system.gpm.releases: testing) and the configured source_url
+        // is plain (no query string), append `?testing` so the kickoff pulls
+        // the same release the rest of the admin would advertise as available.
+        // If source_url already carries a query string, the user has been
+        // explicit — leave it alone.
+        $channel = (string)($this->config['gpm_channel'] ?? 'stable');
+        if ($channel === 'testing' && !str_contains($url, '?')) {
+            $url .= '?testing';
+        }
+
         $dest = $this->webroot . DIRECTORY_SEPARATOR . 'tmp' . DIRECTORY_SEPARATOR . self::ZIP_NAME;
         $this->downloadTo($url, $dest);
 

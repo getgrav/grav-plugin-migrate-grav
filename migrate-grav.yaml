@@ -1,5 +1,8 @@
 enabled: true
-source_url: 'https://getgrav.org/download/core/grav-update/latest?testing'
+# Base URL for the Grav 2.0 release zip. The kickoff appends `?testing` at
+# runtime when the site's `system.gpm.releases` is set to `testing` — match
+# whatever channel the rest of the Grav admin UI is using to find updates.
+source_url: 'https://getgrav.org/download/core/grav-update/latest'
 source_local_zip: ''
 stage_dir: 'grav-2'
 require_super_admin: true

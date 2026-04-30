@@ -91,7 +91,7 @@ class MigrateGravPlugin extends Plugin
     }
 
     /**
-     * Shared kickoff entry point used by both admin and CLI surfaces.
+     * Shared kickoff entry point used by both admin and CLI.
      */
     public function runKickoff(string $trigger, ?string $adminUser = null): array
     {
@@ -134,6 +134,10 @@ class MigrateGravPlugin extends Plugin
 
         $config  = (array) $this->config->get('plugins.migrate-grav', []);
         $webroot = defined('GRAV_WEBROOT') ? GRAV_WEBROOT : GRAV_ROOT;
+
+        // Forward the site's GPM channel so Kickoff can match the release
+        // channel the rest of the admin uses (?testing vs stable).
+        $config['gpm_channel'] = (string) $this->grav['config']->get('system.gpm.releases', 'stable');
 
         return new Kickoff($webroot, $config);
     }
