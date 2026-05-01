@@ -509,29 +509,56 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
     $disabled = array_map(static fn($s) => "plugins/{$s}", $policyResult['disabled']);
     $skipped  = array_map(static fn($s) => "plugins/{$s}", $policyResult['skipped']);
 
-    // ─── Phase 3: overwrite auto-updatable plugins/themes with GPM 2.0 ───────
-    // Compat plugins/themes with a newer GPM version get their staged dir
-    // replaced with the fresh download. Skip-policy incompatibles have
-    // already been removed in Phase 2, so they're never re-installed here.
+    // ─── Phase 3a: collect symlinked plugin/theme slugs ──────────────────────
+    // Symlinks get preserved by mg_bulk_copy_user/copy_tree so dev-env clones
+    // stay live in the staged tree. They must be excluded from gpm update —
+    // gpm replaces a package by removing its dir and extracting a fresh zip,
+    // which would silently unlink the symlink.
+    $symlinkedSlugs = ['plugins' => [], 'themes' => []];
+    foreach (['plugins', 'themes'] as $kind) {
+        $kindDir = $dstUser . '/' . $kind;
+        if (!is_dir($kindDir)) continue;
+        foreach (scandir($kindDir) ?: [] as $slug) {
+            if ($slug === '.' || $slug === '..' || $slug[0] === '.') continue;
+            if (is_link($kindDir . '/' . $slug)) $symlinkedSlugs[$kind][] = $slug;
+        }
+    }
+
+    // ─── Phase 3b: bring installed plugins up to their latest 2.0 versions ──
+    // Shell out to the staged Grav 2.0's `bin/gpm update -p -y` so we inherit
+    // its compatibility/dependency logic instead of duplicating it here.
+    // Symlinked slugs are excluded via positional allowlist. Themes still go
+    // through the per-slug zip path below (Phase B will move them too).
     $upgraded = [];
+    $gpmResult = null;
     if ($autoUpdate) {
-        foreach (['plugins', 'themes'] as $kind) {
-            foreach (($scan[$kind] ?? []) as $slug => $verdict) {
-                $update = $verdict['update'] ?? null;
-                if (!$update || empty($update['download']) || empty($update['to'])) continue;
+        $stageRoot = $webroot . '/' . $stageDir;
+        $gpmResult = mg_gpm_update($stageRoot, 'plugins', $symlinkedSlugs['plugins'], $progress);
+        if ($gpmResult['ok']) {
+            foreach ($gpmResult['updated'] as $slug => $version) {
+                $from = $scan['plugins'][$slug]['installed_version'] ?? '';
+                $upgraded["plugins/{$slug}"] = ['to' => $version, 'from' => $from];
+            }
+        }
 
-                $dst = $dstUser . '/' . $kind . '/' . $slug;
-                if (!is_dir($dst)) continue; // removed by policy (or never copied)
+        // Themes — existing per-slug path, skipping symlinked slugs.
+        $themeSymSet = array_flip($symlinkedSlugs['themes']);
+        foreach (($scan['themes'] ?? []) as $slug => $verdict) {
+            if (isset($themeSymSet[$slug])) continue;
+            $update = $verdict['update'] ?? null;
+            if (!$update || empty($update['download']) || empty($update['to'])) continue;
 
-                if ($progress) $progress(['phase' => 'start', 'entry' => "update/{$kind}/{$slug}"]);
+            $dst = $dstUser . '/themes/' . $slug;
+            if (!is_dir($dst) || is_link($dst)) continue; // removed by policy / symlinked
 
-                $res = mg_install_zip_url($webroot, $stageDir, $kind, $slug, $update['download']);
-                if ($res['ok']) {
-                    $upgraded["{$kind}/{$slug}"] = ['to' => $update['to'], 'from' => $verdict['installed_version'] ?? ''];
-                    if ($progress) $progress(['phase' => 'done-entry', 'entry' => "update/{$kind}/{$slug}"]);
-                } else {
-                    if ($progress) $progress(['phase' => 'skip', 'entry' => "update/{$kind}/{$slug}", 'reason' => $res['msg']]);
-                }
+            if ($progress) $progress(['phase' => 'start', 'entry' => "update/themes/{$slug}"]);
+
+            $res = mg_install_zip_url($webroot, $stageDir, 'themes', $slug, $update['download']);
+            if ($res['ok']) {
+                $upgraded["themes/{$slug}"] = ['to' => $update['to'], 'from' => $verdict['installed_version'] ?? ''];
+                if ($progress) $progress(['phase' => 'done-entry', 'entry' => "update/themes/{$slug}"]);
+            } else {
+                if ($progress) $progress(['phase' => 'skip', 'entry' => "update/themes/{$slug}", 'reason' => $res['msg']]);
             }
         }
     }
@@ -557,6 +584,8 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
         }
     }
 
+    $symlinkCount = count($symlinkedSlugs['plugins']) + count($symlinkedSlugs['themes']);
+
     $flag['step']           = 'plugins_done';
     $flag['plugins_themes'] = [
         'at'             => time(),
@@ -570,6 +599,12 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
         'policy'         => $policy,
         'auto_update'    => $autoUpdate,
         'upgraded'       => $upgraded,
+        'symlinked'      => $symlinkedSlugs,
+        'gpm_result'     => $gpmResult ? [
+            'ok'      => $gpmResult['ok'],
+            'msg'     => $gpmResult['msg'],
+            'updated' => $gpmResult['updated'],
+        ] : null,
         'replacements'   => $replacements,
         'force_included' => $policyResult['force_included'] ?? [],
     ];
@@ -579,9 +614,11 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
     if ($mode !== MG_MODE_STRICT) $msg .= "; mode: {$mode}";
     if (!empty($policyResult['force_included'])) $msg .= '; force-included ' . count($policyResult['force_included']);
     if ($upgraded) $msg .= "; updated " . count($upgraded);
+    if ($symlinkCount) $msg .= "; preserved {$symlinkCount} symlink(s)";
     if ($disabled) $msg .= "; disabled " . count($disabled);
     if ($skipped)  $msg .= "; skipped " . count($skipped);
     if (!empty($replacements['installed'])) $msg .= "; installed " . count($replacements['installed']) . " replacement(s)";
+    if ($gpmResult && !$gpmResult['ok']) $msg .= "; gpm: " . $gpmResult['msg'];
     return ['ok' => true, 'msg' => $msg . '.'];
 }
 
@@ -1423,10 +1460,156 @@ function mg_github_resolve_download(string $repo): array
 }
 
 /**
+ * Run the staged Grav 2.0's `bin/gpm update` to bring installed plugins
+ * (or themes) up to their latest compatible versions on the 2.0 channel.
+ *
+ * $kind  is 'plugins' or 'themes'.
+ * $excludeSlugs is the list of slugs to leave alone — typically symlinked
+ *   slugs that we don't want gpm to overwrite (gpm replaces plugin dirs
+ *   wholesale; running update on a symlinked dir would unlink the symlink
+ *   and extract a fresh zip in its place, silently breaking dev wiring).
+ *   If non-empty, we enumerate the rest as positional args (gpm interprets
+ *   positional args as an allowlist).
+ *
+ * Streams gpm's stdout line-by-line into $progress so the wizard UI can
+ * render a moving status (gpm prints one or two lines per package).
+ *
+ * Returns ['ok', 'msg', 'updated' => [slug => version], 'skipped' => [...],
+ * 'output' => string].
+ */
+function mg_gpm_update(string $stageRoot, string $kind, array $excludeSlugs, ?callable $progress): array
+{
+    if (!in_array($kind, ['plugins', 'themes'], true)) {
+        return ['ok' => false, 'msg' => "invalid kind: {$kind}", 'updated' => [], 'skipped' => [], 'output' => ''];
+    }
+
+    // popen / proc_open availability — some shared hosts disable them.
+    $disabled = array_map('trim', explode(',', (string) ini_get('disable_functions')));
+    if (in_array('proc_open', $disabled, true) || !function_exists('proc_open')) {
+        return ['ok' => false, 'msg' => 'PHP proc_open() is disabled — cannot invoke staged bin/gpm update', 'updated' => [], 'skipped' => [], 'output' => ''];
+    }
+
+    $bin = $stageRoot . '/bin/gpm';
+    if (!is_file($bin)) {
+        return ['ok' => false, 'msg' => "Staged bin/gpm not found at {$bin}", 'updated' => [], 'skipped' => [], 'output' => ''];
+    }
+
+    $kindFlag = $kind === 'themes' ? '-t' : '-p';
+
+    // If we have exclusions, build an allowlist of (installed slugs) − (excluded).
+    $allowSlugs = [];
+    if (!empty($excludeSlugs)) {
+        $excludeSet = array_flip($excludeSlugs);
+        $dir = $stageRoot . '/user/' . $kind;
+        if (is_dir($dir)) {
+            foreach (scandir($dir) ?: [] as $slug) {
+                if ($slug === '.' || $slug === '..' || $slug[0] === '.') continue;
+                if (isset($excludeSet[$slug])) continue;
+                if (!is_dir($dir . '/' . $slug)) continue;
+                $allowSlugs[] = $slug;
+            }
+        }
+        if (empty($allowSlugs)) {
+            return ['ok' => true, 'msg' => "No {$kind} to update (all installed are symlinked or excluded).", 'updated' => [], 'skipped' => $excludeSlugs, 'output' => ''];
+        }
+    }
+
+    // Build argv. Use PHP_BINARY to match the running PHP version (CLI may
+    // resolve differently than the SAPI we're under, but PHP_BINARY is the
+    // exact interpreter executing this script — what the staged tree just
+    // tested compatible against).
+    $argv = [PHP_BINARY, $bin, 'update', $kindFlag, '-y'];
+    foreach ($allowSlugs as $s) $argv[] = $s;
+
+    $desc = [
+        0 => ['file', '/dev/null', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ];
+
+    $proc = @proc_open($argv, $desc, $pipes, $stageRoot);
+    if (!is_resource($proc)) {
+        return ['ok' => false, 'msg' => 'proc_open failed for bin/gpm update', 'updated' => [], 'skipped' => [], 'output' => ''];
+    }
+
+    stream_set_blocking($pipes[1], false);
+    stream_set_blocking($pipes[2], false);
+
+    $updated   = [];
+    $output    = '';
+    $buffers   = ['', ''];
+    $lastEntry = '';
+
+    // Read stdout+stderr until the process exits.
+    while (true) {
+        $r = [$pipes[1], $pipes[2]];
+        $w = $e = null;
+        if (@stream_select($r, $w, $e, 1) === false) break;
+
+        foreach ($r as $stream) {
+            $idx  = ($stream === $pipes[1]) ? 0 : 1;
+            $data = @fread($stream, 4096);
+            if ($data === false || $data === '') continue;
+
+            $buffers[$idx] .= $data;
+            while (($nl = strpos($buffers[$idx], "\n")) !== false) {
+                $line = rtrim(substr($buffers[$idx], 0, $nl), "\r");
+                $buffers[$idx] = substr($buffers[$idx], $nl + 1);
+                if ($line === '') continue;
+
+                $output .= $line . "\n";
+
+                // Strip ANSI colour escapes — gpm uses them.
+                $clean = preg_replace('/\e\[[0-9;]*m/', '', $line);
+
+                // Heuristic parsers — gpm's exact phrasing varies a bit by
+                // version. Be lenient: any line that mentions a slug we've
+                // seen with a version-looking token counts as "updated".
+                if (preg_match('/Preparing to install\s+([A-Za-z0-9_\-]+)/', $clean, $m)) {
+                    $lastEntry = $m[1];
+                    if ($progress) $progress(['phase' => 'start', 'entry' => "gpm/{$kind}/{$m[1]}"]);
+                } elseif (preg_match('/Installation succeeded.*?for\s+\[?([A-Za-z0-9_\-]+)\]?/', $clean, $m)) {
+                    $updated[$m[1]] = '';
+                    if ($progress) $progress(['phase' => 'done-entry', 'entry' => "gpm/{$kind}/{$m[1]}"]);
+                } elseif (preg_match('/Successfully\s+(?:updated|installed)\s+["\']?([A-Za-z0-9_\-]+)/', $clean, $m)) {
+                    $updated[$m[1]] = '';
+                    if ($progress) $progress(['phase' => 'done-entry', 'entry' => "gpm/{$kind}/{$m[1]}"]);
+                } elseif ($lastEntry !== '' && preg_match('/^\s*([0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-[A-Za-z0-9.]+)?)\s*$/', $clean, $m)) {
+                    $updated[$lastEntry] = $m[1];
+                } elseif ($progress) {
+                    // Generic "still doing things" tick — show the latest line
+                    // so the UI moves while gpm is downloading/extracting.
+                    $progress(['phase' => 'log', 'entry' => "gpm/{$kind}", 'reason' => substr($clean, 0, 200)]);
+                }
+            }
+        }
+
+        $status = @proc_get_status($proc);
+        if (is_array($status) && !$status['running'] && feof($pipes[1]) && feof($pipes[2])) break;
+    }
+
+    foreach ($buffers as $rem) if ($rem !== '') $output .= $rem . "\n";
+    @fclose($pipes[1]);
+    @fclose($pipes[2]);
+    $code = proc_close($proc);
+
+    return [
+        'ok'      => $code === 0,
+        'msg'     => $code === 0
+            ? sprintf('gpm update %s: %d package(s) touched', $kind, count($updated))
+            : "gpm update {$kind} exited {$code}",
+        'updated' => $updated,
+        'skipped' => $excludeSlugs,
+        'output'  => $output,
+    ];
+}
+
+/**
  * Copy the entire source user/ tree into the staged install verbatim.
- * Top-level dotfiles/dotdirs (.git, .DS_Store, editor backups) and
- * top-level symlinks are skipped as filesystem/dev-env cruft. copy_tree
- * handles symlinked directories encountered mid-tree. Downstream phases
+ * Top-level dotfiles/dotdirs (.git, .DS_Store, editor backups) are skipped
+ * as filesystem cruft. Symlinks (top-level and mid-tree) are preserved as
+ * symlinks so dev environments with linked plugin/theme clones keep their
+ * wiring in the staged tree. Downstream phases
  * mutate the staged tree in place (plugin policy, auto-updates, account
  * perm mirror). Appends skipped entries to $copySkipped with a reason
  * tag, and appends successfully-copied top-level names to $copiedEntries.
@@ -1447,8 +1630,17 @@ function mg_bulk_copy_user(string $srcUser, string $dstUser, int &$copied, ?call
         $dst = $dstUser . '/' . $entry;
 
         if (is_link($src)) {
-            $copySkipped[] = "{$entry} (symlink)";
-            if ($progress) $progress(['phase' => 'skip', 'entry' => "user/{$entry}", 'reason' => 'symlink', 'copied' => $copied]);
+            // Preserve top-level symlinks (e.g. user/plugins itself being a
+            // symlink — unusual but possible in shared multi-site setups).
+            // copy_tree handles deeper symlinks the same way.
+            $target = @readlink($src);
+            if (is_string($target) && $target !== '' && @symlink($target, $dst)) {
+                $copiedEntries[] = $entry;
+                if ($progress) $progress(['phase' => 'done-entry', 'entry' => "user/{$entry}", 'reason' => 'symlink preserved', 'copied' => $copied]);
+            } else {
+                $copySkipped[] = "{$entry} (symlink, could not preserve)";
+                if ($progress) $progress(['phase' => 'skip', 'entry' => "user/{$entry}", 'reason' => 'symlink (could not preserve)', 'copied' => $copied]);
+            }
             continue;
         }
 
@@ -1943,8 +2135,18 @@ function copy_tree(string $src, string $dst, callable $onFile, string $prefix = 
         $dstPath = $dst . '/' . $entry;
         $rel     = $prefix === '' ? $entry : $prefix . '/' . $entry;
 
-        if (is_link($srcPath) && is_dir($srcPath)) {
-            // Skip symlinked dirs mid-tree too
+        if (is_link($srcPath)) {
+            // Preserve the symlink as-is. Common in dev environments where
+            // user/plugins/<slug> or user/themes/<slug> point to a sibling
+            // working clone — the staged tree should keep the same wiring so
+            // those clones remain live during testing. The downstream gpm
+            // update phase detects symlinked slugs and skips updating them
+            // (otherwise gpm would unlink the symlink and overwrite with a
+            // fresh zip).
+            $target = @readlink($srcPath);
+            if (is_string($target) && $target !== '') {
+                @symlink($target, $dstPath);
+            }
             continue;
         }
 
