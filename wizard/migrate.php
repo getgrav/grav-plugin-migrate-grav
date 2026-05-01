@@ -96,10 +96,13 @@ if ($method === 'POST') {
         case 'plugins_themes':
             $reqMode = (string) ($_POST['mode'] ?? MG_MODE_STRICT);
             $mode    = in_array($reqMode, MG_MODES_ALL, true) ? $reqMode : MG_MODE_STRICT;
+            // Form's "upgrade_plugins" checkbox is positive-framed (checked
+            // means run gpm update). Internally we keep the legacy
+            // skip_update flag so the rest of the pipeline stays untouched.
             $options = [
                 'mode'        => $mode,
                 'policy'      => (($_POST['policy'] ?? '') === 'skip') ? 'skip' : 'disable',
-                'skip_update' => isset($_POST['skip_update']),
+                'skip_update' => !isset($_POST['upgrade_plugins']),
             ];
             stream_plugins_themes_page($webroot, $flagForAuth, $token, $options);
             exit(0);
@@ -1475,6 +1478,63 @@ function mg_github_resolve_download(string $repo): array
 }
 
 /**
+ * Pre-flight: ask Grav's `bin/gpm index -I -U` what's installed AND
+ * updatable in the given root, so the form step can show "this red row
+ * has a newer version that gpm will pick up". Cheap (~1s) and
+ * authoritative — gpm itself is the source of truth on what'll upgrade
+ * when Phase 3 runs.
+ *
+ * Returns ['plugins' => [slug => ['name','from','to']], 'themes' => [...]]
+ * — empty arrays on any failure (proc_open disabled, gpm missing, parse
+ * miss). Output table format:
+ *   | 1 | AdvancedPageCache | advanced-pagecache | v3.1.1 -> v3.1.2 | …
+ */
+function mg_gpm_pending_updates(string $rootDir): array
+{
+    $empty = ['plugins' => [], 'themes' => []];
+    $bin = $rootDir . '/bin/gpm';
+    if (!is_file($bin)) return $empty;
+
+    $disabled = array_map('trim', explode(',', (string) ini_get('disable_functions')));
+    if (in_array('proc_open', $disabled, true) || !function_exists('proc_open')) return $empty;
+
+    $php = mg_find_php_cli();
+    if ($php === null) return $empty;
+
+    $argv = [$php, $bin, 'index', '-I', '-U', '--no-ansi'];
+    $desc = [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+
+    $proc = @proc_open($argv, $desc, $pipes, $rootDir);
+    if (!is_resource($proc)) return $empty;
+
+    $out = (string) stream_get_contents($pipes[1]);
+    @fclose($pipes[1]);
+    @fclose($pipes[2]);
+    @proc_close($proc);
+
+    $result  = $empty;
+    $section = null;
+    foreach (explode("\n", $out) as $line) {
+        if (preg_match('/^PLUGINS\b/', $line)) { $section = 'plugins'; continue; }
+        if (preg_match('/^THEMES\b/',  $line)) { $section = 'themes';  continue; }
+        if ($section === null) continue;
+
+        // Strip Symfony Console style placeholders ("<blue>", "</green>"
+        // etc.) that --no-ansi doesn't always remove.
+        $clean = preg_replace('/<\/?[a-z]+>/i', '', $line);
+
+        if (preg_match('/^\s*\|\s*\d+\s*\|\s*(.+?)\s*\|\s*([a-z0-9_\-]+)\s*\|\s*v?([\w.\-]+)\s*->\s*v?([\w.\-]+)\s*\|/', $clean, $m)) {
+            $result[$section][$m[2]] = [
+                'name' => trim($m[1]),
+                'from' => $m[3],
+                'to'   => $m[4],
+            ];
+        }
+    }
+    return $result;
+}
+
+/**
  * Locate a CLI php binary suitable for running scripts as argv[1].
  *
  * PHP_BINARY is unreliable from a SAPI context — it can be empty, or it can
@@ -1866,6 +1926,21 @@ function mg_compat_scan_cached(string $webroot, array &$flag): array
     // (replaced_by target + its transitive `requires:`) so the UI shows
     // matching info to what the install path will actually do.
     $scan['github_versions'] = mg_resolve_pending_versions($scan, $curated, $gpm);
+
+    // Pre-flight: ask the SOURCE Grav's bin/gpm what it would update. The
+    // staged tree's gpm would be more authoritative against 2.0 compat,
+    // but the stage doesn't have user/plugins yet at this point — we run
+    // against the source (1.7) and trust that newer-version-on-channel
+    // is a reliable signal. The actual Phase 3 gpm update on the staged
+    // 2.0 tree will only install 2.0-compatible upgrades regardless.
+    $scan['gpm_pending'] = mg_gpm_pending_updates($webroot);
+    foreach (['plugins', 'themes'] as $kind) {
+        foreach (($scan['gpm_pending'][$kind] ?? []) as $slug => $info) {
+            if (isset($scan[$kind][$slug])) {
+                $scan[$kind][$slug]['pending_update'] = $info;
+            }
+        }
+    }
 
     $flag['compat_scan'] = $scan;
     save_flag($webroot . '/.migrating', $flag);
@@ -2704,6 +2779,20 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
                 echo '<div class="mg-callout mg-callout-warn"><i class="mg-i-info"></i><div>Could not reach the curated compatibility registry. Falling back to blueprint + dependency inference only — verdicts may be less accurate.</div></div>';
             }
 
+            // Upgrade preview — surfaces "this red row will actually be fixed
+            // by the gpm upgrade pass" before the user commits.
+            $pendingPlugins = count($scan['gpm_pending']['plugins'] ?? []);
+            $pendingThemes  = count($scan['gpm_pending']['themes']  ?? []);
+            if ($pendingPlugins + $pendingThemes > 0) {
+                $parts = [];
+                if ($pendingPlugins > 0) $parts[] = "<strong>{$pendingPlugins}</strong> plugin update" . ($pendingPlugins === 1 ? '' : 's');
+                if ($pendingThemes  > 0) $parts[] = "<strong>{$pendingThemes}</strong> theme update"  . ($pendingThemes  === 1 ? '' : 's');
+                $msg = implode(' and ', $parts) . ' available on GPM.';
+                echo '<div class="mg-callout mg-callout-info"><i class="mg-i-info"></i><div>'
+                   . $msg . ' With <em>upgrade plugins during migration</em> on (default), Grav 2.0&apos;s GPM picks up these versions during Copy &amp; Migrate — only ones gpm confirms are 2.0-compatible actually get installed. Rows in the table below tagged &ldquo;<strong>↑ will upgrade to vX.Y.Z</strong>&rdquo; are the candidates.'
+                   . '</div></div>';
+            }
+
             render_compat_breakdown($scan);
 
             // Pre-fill from previous run if user rewound to here.
@@ -2723,19 +2812,28 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
             echo '<input type="hidden" name="action" value="plugins_themes">';
             echo '<input type="hidden" name="token"  value="' . htmlspecialchars($token) . '">';
 
-            echo '<p style="margin:0 0 8px;font-size:13.5px;color:#333;font-weight:600">Compatibility mode:</p>';
+            // Upgrade pass — primary action. Positive-framed (checked = run
+            // upgrade) so the default state is unambiguous. The action handler
+            // maps !upgrade_plugins → skip_update for back-compat with the
+            // existing flag schema.
+            echo '<p style="margin:0 0 8px;font-size:13.5px;color:#333;font-weight:600">Upgrade plugins during migration:</p>';
+            echo '<label class="mg-check mg-check-block">'
+               . '<input type="checkbox" name="upgrade_plugins" value="1"' . ($prevAutoUpd ? ' checked' : '') . '>'
+               . ' <strong>Run upgrade pass after copy</strong> '
+               . '<span class="mg-btn-note">(recommended) Grav 2.0&apos;s <code>bin/gpm update</code> runs after the copy step and upgrades any plugin with a newer 2.0-compatible version on GPM. Symlinked plugins and ones without a 2.0-compatible release are left alone.</span>'
+               . '</label>';
+
+            echo '<p style="margin:14px 0 8px;font-size:13.5px;color:#333;font-weight:600">Compatibility mode:</p>';
             echo '<label class="mg-check mg-check-block"><input type="radio" name="mode" value="strict" data-mode="strict"' . $isChecked('strict', $prevMode) . '> <strong>Strict</strong> <span class="mg-btn-note">(recommended) only carry forward plugins/themes the curated registry or their blueprint explicitly marks as 2.0-compatible</span></label>';
             echo '<label class="mg-check mg-check-block"><input type="radio" name="mode" value="permissive" data-mode="permissive"' . $isChecked('permissive', $prevMode) . '> <strong>Permissive</strong> <span class="mg-btn-note">also carry forward plugins where compat is just unknown — only items the curated registry explicitly flags 1.x-only stay incompatible</span></label>';
             echo '<label class="mg-check mg-check-block"><input type="radio" name="mode" value="test" data-mode="test"' . $isChecked('test', $prevMode) . '> <strong>Test</strong> <span class="mg-btn-note">(not for production) carry forward and enable EVERYTHING you have — useful for finding what actually breaks under 2.0</span></label>';
 
             echo '<div id="mg-pt-policy" style="margin-top:14px"' . ($prevMode === 'test' ? ' hidden' : '') . '>';
-            echo '<p style="margin:0 0 8px;font-size:13.5px;color:#333;font-weight:600">For incompatible plugins:</p>';
+            echo '<p style="margin:0 0 8px;font-size:13.5px;color:#333;font-weight:600">For incompatible plugins (after the upgrade pass):</p>';
             echo '<label class="mg-check mg-check-block"><input type="radio" name="policy" value="disable"' . $isChecked('disable', $prevPolicy) . '> Copy but <strong>disable</strong> them <span class="mg-btn-note">(keeps your config; reinstall a compatible version in-place)</span></label>';
             echo '<label class="mg-check mg-check-block"><input type="radio" name="policy" value="skip"' . $isChecked('skip', $prevPolicy) . '> <strong>Skip</strong> them entirely <span class="mg-btn-note">(cleaner; reinstall from scratch via the 2.0 admin)</span></label>';
             echo '</div>';
 
-            echo '<p style="margin:14px 0 6px;font-size:13.5px;color:#333;font-weight:600">Auto-update behavior:</p>';
-            echo '<label class="mg-check mg-check-block"><input type="checkbox" name="skip_update" value="1"' . ($prevAutoUpd === false ? ' checked' : '') . '> Skip auto-update <span class="mg-btn-note">(use the version installed on 1.x — on your head be it)</span></label>';
             echo '<div style="margin-top:14px"><button type="submit" class="mg-btn mg-btn-primary">Copy &amp; migrate user/ →</button></div>';
 
             // Toggle policy section visibility based on mode (test mode has no incompatibles).
@@ -3129,7 +3227,10 @@ function render_compat_breakdown(array $scan): void
                 echo '<span class="mg-compat-slug">' . htmlspecialchars($slug) . '</span>';
                 if ($version !== '') echo ' <span class="mg-compat-version">' . htmlspecialchars($version) . '</span>';
                 echo '<span class="mg-compat-reason">' . htmlspecialchars($rowReason);
-                if ($update) {
+                $pendingUpd = $v['pending_update'] ?? null;
+                if ($pendingUpd) {
+                    echo ' <span class="mg-compat-update">↑ will upgrade to v' . htmlspecialchars($pendingUpd['to']) . '</span>';
+                } elseif ($update) {
                     echo ' <span class="mg-compat-update">↑ updates to v' . htmlspecialchars($update['to']) . '</span>';
                 }
                 if ($replBy) {
