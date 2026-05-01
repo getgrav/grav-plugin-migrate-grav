@@ -535,8 +535,23 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
         $stageRoot = $webroot . '/' . $stageDir;
         $gpmResult = mg_gpm_update($stageRoot, 'plugins', $symlinkedSlugs['plugins'], $progress);
         if ($gpmResult['ok']) {
-            foreach ($gpmResult['updated'] as $slug => $version) {
-                $from = $scan['plugins'][$slug]['installed_version'] ?? '';
+            // gpm reports display names, not slugs. Resolve back to slug via
+            // the scan's blueprint metadata so the upgraded[] entries match
+            // the slug-keyed convention used by the themes path below.
+            $nameToSlug = [];
+            foreach (($scan['plugins'] ?? []) as $s => $v) {
+                $n = (string) ($v['name'] ?? '');
+                if ($n !== '') $nameToSlug[$n] = $s;
+            }
+            foreach ($gpmResult['updated'] as $name => $version) {
+                $slug = $nameToSlug[$name] ?? '';
+                if ($slug === '') {
+                    // Couldn't resolve — record under the display name so it
+                    // still appears in the summary, just without a from-version.
+                    $upgraded["plugins/{$name}"] = ['to' => $version, 'from' => ''];
+                    continue;
+                }
+                $from = (string) ($scan['plugins'][$slug]['installed_version'] ?? '');
                 $upgraded["plugins/{$slug}"] = ['to' => $version, 'from' => $from];
             }
         }
@@ -1535,12 +1550,21 @@ function mg_gpm_update(string $stageRoot, string $kind, array $excludeSlugs, ?ca
     stream_set_blocking($pipes[1], false);
     stream_set_blocking($pipes[2], false);
 
-    $updated   = [];
-    $output    = '';
-    $buffers   = ['', ''];
-    $lastEntry = '';
+    // gpm's output (per package) looks like:
+    //   Preparing to install Login OAuth2 [v2.2.6]
+    //     |- Downloading package...   100%
+    //     |- Checking destination...  ok
+    //     |- Installing package...    ok
+    //     '- Success!
+    // We track the current package name + version from "Preparing to install"
+    // and record it in $updated when "Success!" arrives. Sub-steps drive a
+    // generic "log" tick so the wizard UI moves while gpm is doing its thing.
+    $updated  = [];
+    $output   = '';
+    $buffers  = ['', ''];
+    $curName  = '';
+    $curVer   = '';
 
-    // Read stdout+stderr until the process exits.
     while (true) {
         $r = [$pipes[1], $pipes[2]];
         $w = $e = null;
@@ -1559,26 +1583,27 @@ function mg_gpm_update(string $stageRoot, string $kind, array $excludeSlugs, ?ca
 
                 $output .= $line . "\n";
 
-                // Strip ANSI colour escapes — gpm uses them.
+                // Strip ANSI colour escapes.
                 $clean = preg_replace('/\e\[[0-9;]*m/', '', $line);
 
-                // Heuristic parsers — gpm's exact phrasing varies a bit by
-                // version. Be lenient: any line that mentions a slug we've
-                // seen with a version-looking token counts as "updated".
-                if (preg_match('/Preparing to install\s+([A-Za-z0-9_\-]+)/', $clean, $m)) {
-                    $lastEntry = $m[1];
-                    if ($progress) $progress(['phase' => 'start', 'entry' => "gpm/{$kind}/{$m[1]}"]);
-                } elseif (preg_match('/Installation succeeded.*?for\s+\[?([A-Za-z0-9_\-]+)\]?/', $clean, $m)) {
-                    $updated[$m[1]] = '';
-                    if ($progress) $progress(['phase' => 'done-entry', 'entry' => "gpm/{$kind}/{$m[1]}"]);
-                } elseif (preg_match('/Successfully\s+(?:updated|installed)\s+["\']?([A-Za-z0-9_\-]+)/', $clean, $m)) {
-                    $updated[$m[1]] = '';
-                    if ($progress) $progress(['phase' => 'done-entry', 'entry' => "gpm/{$kind}/{$m[1]}"]);
-                } elseif ($lastEntry !== '' && preg_match('/^\s*([0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-[A-Za-z0-9.]+)?)\s*$/', $clean, $m)) {
-                    $updated[$lastEntry] = $m[1];
+                if (preg_match('/^Preparing to install\s+(.+?)\s+\[v?([^\]]+)\]\s*$/', $clean, $m)) {
+                    $curName = trim($m[1]);
+                    $curVer  = trim($m[2]);
+                    if ($progress) $progress(['phase' => 'start', 'entry' => "gpm/{$kind}/{$curName}", 'reason' => "v{$curVer}"]);
+                } elseif (preg_match("/^\s*'-\s*Success!\s*$/", $clean)) {
+                    if ($curName !== '') {
+                        $updated[$curName] = $curVer;
+                        if ($progress) $progress(['phase' => 'done-entry', 'entry' => "gpm/{$kind}/{$curName}", 'reason' => "v{$curVer}"]);
+                    }
+                    $curName = '';
+                    $curVer  = '';
+                } elseif (preg_match('/^\s*\|-\s*(Downloading package|Checking destination|Installing package)/', $clean, $m)) {
+                    if ($progress && $curName !== '') {
+                        $progress(['phase' => 'log', 'entry' => "gpm/{$kind}/{$curName}", 'reason' => rtrim($m[1], '.')]);
+                    }
                 } elseif ($progress) {
-                    // Generic "still doing things" tick — show the latest line
-                    // so the UI moves while gpm is downloading/extracting.
+                    // Anything else (errors, "Nothing to update", header lines)
+                    // — surface as a log tick so the wizard UI keeps moving.
                     $progress(['phase' => 'log', 'entry' => "gpm/{$kind}", 'reason' => substr($clean, 0, 200)]);
                 }
             }
@@ -1859,6 +1884,9 @@ function mg_scan_category(string $dir, string $kind, ?array $curated, ?array $gp
 
         $verdict = mg_resolve_compat($slug, $installedVersion, $bp, $curated[$kind] ?? []);
         $verdict['installed_version'] = $installedVersion;
+        // Display name from the blueprint — used when matching gpm output back
+        // to slug ("Preparing to install Login OAuth2 [v2.2.6]" → login-oauth2).
+        $verdict['name'] = (string) ($bp['name'] ?? '');
 
         // Annotate with GPM-available update if applicable.
         $verdict['update'] = mg_resolve_update($slug, $installedVersion, $verdict, $gpmIndex);
