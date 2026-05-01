@@ -1540,6 +1540,11 @@ function mg_gpm_update(string $stageRoot, string $kind, array $excludeSlugs, ?ca
         return ['ok' => false, 'msg' => "invalid kind: {$kind}", 'updated' => [], 'skipped' => [], 'output' => ''];
     }
 
+    // Defensive — gpm update of 50+ packages routinely runs longer than the
+    // default 30s execution limit, even though mg_stream_setup already
+    // disables it for streaming pages.
+    @set_time_limit(0);
+
     // popen / proc_open availability — some shared hosts disable them.
     $disabled = array_map('trim', explode(',', (string) ini_get('disable_functions')));
     if (in_array('proc_open', $disabled, true) || !function_exists('proc_open')) {
@@ -2249,6 +2254,14 @@ function ensure_dir(string $path): void
 
 function mg_stream_setup(string $title, string $subtitle): void
 {
+    // Streaming steps are inherently long-running — bulk copies, downloads,
+    // and gpm subprocess invocations routinely exceed PHP's default 30s
+    // max_execution_time. Disable the limit and ignore user abort so a
+    // user accidentally navigating away doesn't strand the migration in a
+    // half-applied state.
+    @set_time_limit(0);
+    @ignore_user_abort(true);
+
     @ini_set('zlib.output_compression', '0');
     @ini_set('output_buffering', '0');
     @ini_set('implicit_flush', '1');
