@@ -520,23 +520,57 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
         }
     }
 
-    // ─── Phase 3: handle supersedes (admin → admin2 etc.) ───────────────────
-    // Remove deprecated slugs BEFORE the upgrade pass so gpm doesn't waste
-    // cycles updating something we're about to delete. The replacement
-    // (admin2, api, …) is installed by mg_install_replacements after policy.
-    $supersedeResult = mg_handle_supersedes($stageRoot, $superseded, $progress);
+    // ─── Phase 3: neutralize superseded plugins against gpm dep resolution ──
+    // Two cooperating tricks so gpm leaves admin (et al.) alone:
+    //   (a) Exclude superseded slugs from gpm's positional allowlist so they
+    //       aren't directly listed for update.
+    //   (b) Pin each superseded plugin's blueprints `version:` to gpm's
+    //       reported latest. gpm's getDependencies() removes any installed
+    //       dep where `currentlyInstalledVersion === latestRelease` from the
+    //       dep list — so transitive declarations like
+    //       `dependencies: [{name: admin, version: '>=1.7.4'}]`
+    //       (data-manager, login-ldap, ...) won't drag admin back in.
+    // Without (b), `bin/gpm update -y` would mark admin as an 'ignore'-type
+    // transitive dep, then with -y still install it (the install command
+    // treats -y as auto-yes for ignore-type deps too).
+    // We don't restore the pinned version — the dir gets deleted in
+    // Phase 4.5 anyway.
+    $supersededPluginSlugs = [];
+    foreach (array_keys($superseded) as $label) {
+        if (!str_starts_with($label, 'plugins/')) continue;
+        $supersededPluginSlugs[] = substr($label, strlen('plugins/'));
+    }
+    $gpmPluginsIndex = $scan['gpm']['plugins'] ?? [];
+    foreach ($supersededPluginSlugs as $slug) {
+        $latest = (string) ($gpmPluginsIndex[$slug]['version'] ?? '');
+        if ($latest === '') continue;
+        $bpPath = $stageRoot . '/user/plugins/' . $slug . '/blueprints.yaml';
+        if (!is_file($bpPath)) continue;
+        $bpContent = @file_get_contents($bpPath);
+        if (!is_string($bpContent) || $bpContent === '') continue;
+        $patched = preg_replace(
+            '/^version:\s*[\'"]?[0-9A-Za-z.\-]+[\'"]?\s*$/m',
+            "version: {$latest}",
+            $bpContent,
+            1
+        );
+        if (is_string($patched) && $patched !== $bpContent) {
+            @file_put_contents($bpPath, $patched);
+        }
+    }
 
     // ─── Phase 4: bring installed plugins/themes up to their 2.0 versions ──
     // Shell out to the staged Grav 2.0's `bin/gpm update -p -y` for plugins
     // (gpm itself enforces 2.0-compat — only compatible upgrades land).
-    // Symlinked slugs excluded via positional allowlist. Themes still use
-    // the per-slug zip path. Running BEFORE policy so the post-upgrade
-    // re-scan reflects what gpm actually did, and policy only kicks in for
-    // plugins gpm couldn't rescue.
+    // Symlinked slugs AND superseded slugs excluded via positional allowlist.
+    // Themes still use the per-slug zip path. Running BEFORE policy so the
+    // post-upgrade re-scan reflects what gpm actually did, and policy only
+    // kicks in for plugins gpm couldn't rescue.
     $upgraded = [];
     $gpmResult = null;
     if ($autoUpdate) {
-        $gpmResult = mg_gpm_update($stageRoot, 'plugins', $symlinkedSlugs['plugins'], $progress);
+        $gpmExclude = array_values(array_unique(array_merge($symlinkedSlugs['plugins'], $supersededPluginSlugs)));
+        $gpmResult = mg_gpm_update($stageRoot, 'plugins', $gpmExclude, $progress);
         if ($gpmResult['ok']) {
             // gpm reports display names, not slugs. Resolve back to slug via
             // the scan's blueprint metadata so upgraded[] keys match the
@@ -546,8 +580,13 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
                 $n = (string) ($v['name'] ?? '');
                 if ($n !== '') $nameToSlug[$n] = $s;
             }
+            $supersededSet = array_flip($supersededPluginSlugs);
             foreach ($gpmResult['updated'] as $name => $version) {
                 $slug = $nameToSlug[$name] ?? '';
+                // Hide superseded slugs from the upgraded report — even if the
+                // pinning trick above didn't fully suppress gpm's dep handling,
+                // the dir gets removed in Phase 4.5 and is replaced by admin2/api.
+                if ($slug !== '' && isset($supersededSet[$slug])) continue;
                 if ($slug === '') {
                     $upgraded["plugins/{$name}"] = ['to' => $version, 'from' => ''];
                     continue;
@@ -578,6 +617,12 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
             }
         }
     }
+
+    // ─── Phase 4.5: delete superseded plugin dirs ───────────────────────────
+    // Now that gpm has had its dep-resolution pass with these dirs in place,
+    // we can remove them. Their replacements (admin2, api, …) are installed
+    // in Phase 7 by mg_install_replacements.
+    $supersedeResult = mg_handle_supersedes($stageRoot, $superseded, $progress);
 
     // ─── Phase 5: re-scan compat on the staged tree (post-upgrade) ──────────
     // Verdicts now reflect whatever gpm actually installed — a plugin that
@@ -1915,10 +1960,12 @@ function mg_rescan_staged(string $stagedUserDir, array $sourceScan): array
 
 /**
  * Remove staged dirs for slugs the curated registry has marked as
- * superseded by a different package (admin → admin2, etc.). Runs before
- * the upgrade pass so gpm doesn't waste cycles updating something we're
- * about to delete; the actual replacement is installed later by
- * mg_install_replacements. Idempotent.
+ * superseded by a different package (admin → admin2, etc.). Runs AFTER
+ * the gpm update pass — keeping the old slug on disk during gpm prevents
+ * its dependents (data-manager etc. which declare `admin` as a dep) from
+ * triggering a missing-dep reinstall. The slug is also excluded from
+ * gpm's update allowlist so gpm leaves it alone version-wise. The actual
+ * replacement is installed later by mg_install_replacements. Idempotent.
  */
 function mg_handle_supersedes(string $stageRoot, array $superseded, ?callable $progress): array
 {
