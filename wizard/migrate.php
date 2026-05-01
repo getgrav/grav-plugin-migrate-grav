@@ -957,22 +957,31 @@ function mg_zip_webroot(ZipArchive $zip, string $webroot, string $skipTop, int &
 
 function mg_rm_tree(string $path): bool
 {
+    // Critical: never traverse INTO symlinks. The wizard's staged tree often
+    // contains symlinks to plugin source clones (a developer convenience), and
+    // RecursiveDirectoryIterator follows them by default, which would attempt
+    // to delete real source files. scandir() returns symlinks as plain entries
+    // we can identify via is_link() before deciding to recurse or just unlink.
     if (is_link($path) || is_file($path)) {
         return @unlink($path);
     }
     if (!is_dir($path)) {
         return true;
     }
-    $rii = new RecursiveIteratorIterator(
-        new RecursiveDirectoryIterator($path, RecursiveDirectoryIterator::SKIP_DOTS),
-        RecursiveIteratorIterator::CHILD_FIRST
-    );
+    $items = @scandir($path);
+    if ($items === false) {
+        return false;
+    }
     $ok = true;
-    foreach ($rii as $f) {
-        if ($f->isDir() && !$f->isLink()) {
-            $ok = @rmdir($f->getPathname()) && $ok;
+    foreach ($items as $item) {
+        if ($item === '.' || $item === '..') continue;
+        $sub = $path . DIRECTORY_SEPARATOR . $item;
+        if (is_link($sub)) {
+            $ok = @unlink($sub) && $ok;
+        } elseif (is_dir($sub)) {
+            $ok = mg_rm_tree($sub) && $ok;
         } else {
-            $ok = @unlink($f->getPathname()) && $ok;
+            $ok = @unlink($sub) && $ok;
         }
     }
     return @rmdir($path) && $ok;
@@ -2082,12 +2091,23 @@ function wizard_reset(string $webroot, string $stageDir): void
 
 function remove_dir(string $path): void
 {
-    $rii = new RecursiveIteratorIterator(
-        new RecursiveDirectoryIterator($path, RecursiveDirectoryIterator::SKIP_DOTS),
-        RecursiveIteratorIterator::CHILD_FIRST
-    );
-    foreach ($rii as $f) {
-        if ($f->isDir()) @rmdir($f->getPathname()); else @unlink($f->getPathname());
+    // Symlinks are unlinked, never traversed — staged trees can contain
+    // symlinked plugin clones (developer convenience). Following the symlinks
+    // would attempt to delete real source files outside the staged tree.
+    if (is_link($path)) { @unlink($path); return; }
+    if (!is_dir($path)) { return; }
+    $items = @scandir($path);
+    if ($items === false) { return; }
+    foreach ($items as $item) {
+        if ($item === '.' || $item === '..') continue;
+        $sub = $path . DIRECTORY_SEPARATOR . $item;
+        if (is_link($sub)) {
+            @unlink($sub);
+        } elseif (is_dir($sub)) {
+            remove_dir($sub);
+        } else {
+            @unlink($sub);
+        }
     }
     @rmdir($path);
 }

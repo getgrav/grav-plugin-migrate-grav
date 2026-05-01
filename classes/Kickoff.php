@@ -292,21 +292,38 @@ class Kickoff
         }
     }
 
+    /**
+     * Recursively delete a directory tree.
+     *
+     * Symlinks are unlinked, never traversed — critical when the wizard's
+     * staged tree contains symlinked plugin clones (a developer convenience
+     * during iteration). Following the symlinks would attempt to delete real
+     * source files outside the staged tree.
+     */
     private function removeDirectory(string $path): bool
     {
+        if (is_link($path)) {
+            return @unlink($path);
+        }
         if (!is_dir($path)) {
             return true;
         }
-        $rii = new \RecursiveIteratorIterator(
-            new \RecursiveDirectoryIterator($path, \RecursiveDirectoryIterator::SKIP_DOTS),
-            \RecursiveIteratorIterator::CHILD_FIRST
-        );
+        $items = @scandir($path);
+        if ($items === false) {
+            return false;
+        }
         $ok = true;
-        foreach ($rii as $file) {
-            if ($file->isDir()) {
-                $ok = @rmdir($file->getPathname()) && $ok;
+        foreach ($items as $item) {
+            if ($item === '.' || $item === '..') {
+                continue;
+            }
+            $sub = $path . DIRECTORY_SEPARATOR . $item;
+            if (is_link($sub)) {
+                $ok = @unlink($sub) && $ok;
+            } elseif (is_dir($sub)) {
+                $ok = $this->removeDirectory($sub) && $ok;
             } else {
-                $ok = @unlink($file->getPathname()) && $ok;
+                $ok = @unlink($sub) && $ok;
             }
         }
         return @rmdir($path) && $ok;
