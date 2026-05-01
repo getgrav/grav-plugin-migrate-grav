@@ -492,31 +492,24 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
     $scan       = mg_compat_scan_cached($webroot, $flag);
     $superseded = mg_collect_superseded($scan); // ['plugins/admin' => 'admin2', ...]
 
+    $stageRoot = $webroot . '/' . $stageDir;
+
     // ─── Phase 1: bulk-copy source user/ → staged user/ ──────────────────────
     // Everything (plugins, themes, accounts, pages, data, config, env,
     // languages, any custom folders, any top-level files) comes across
     // verbatim. Dotfiles/dotdirs at user/ root (.git, .DS_Store, editor
-    // backups) and symlinked top-level entries are skipped — they're
-    // filesystem/dev-env cruft, not site content. Downstream phases mutate
-    // the staged tree in place (policy, auto-updates, replacements).
+    // backups) are skipped as filesystem cruft. Symlinks (top-level and
+    // mid-tree) are preserved so dev clones stay live. Downstream phases
+    // mutate the staged tree in place.
     $copied = 0;
     $copySkipped = [];
     $copiedEntries = [];
     mg_bulk_copy_user($srcUser, $dstUser, $copied, $progress, $copySkipped, $copiedEntries);
 
-    // ─── Phase 2: apply plugin compat policy ─────────────────────────────────
-    // Skip/disable incompatibles (per mode + policy), remove superseded slugs
-    // (admin → admin2). Themes are always kept — Twig 3 compat handles most
-    // at runtime. In test mode, nothing gets disabled/skipped except supersedes.
-    $policyResult = mg_apply_plugin_policy($webroot, $stageDir, $scan, $policy, $mode, $superseded, $progress);
-    $disabled = array_map(static fn($s) => "plugins/{$s}", $policyResult['disabled']);
-    $skipped  = array_map(static fn($s) => "plugins/{$s}", $policyResult['skipped']);
-
-    // ─── Phase 3a: collect symlinked plugin/theme slugs ──────────────────────
-    // Symlinks get preserved by mg_bulk_copy_user/copy_tree so dev-env clones
-    // stay live in the staged tree. They must be excluded from gpm update —
-    // gpm replaces a package by removing its dir and extracting a fresh zip,
-    // which would silently unlink the symlink.
+    // ─── Phase 2: collect symlinked plugin/theme slugs ───────────────────────
+    // Excluded from the upgrade pass (gpm would unlink the symlink and
+    // extract a fresh zip in its place) and from the policy pass (dev
+    // clones manage their own version, leave them alone).
     $symlinkedSlugs = ['plugins' => [], 'themes' => []];
     foreach (['plugins', 'themes'] as $kind) {
         $kindDir = $dstUser . '/' . $kind;
@@ -527,20 +520,27 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
         }
     }
 
-    // ─── Phase 3b: bring installed plugins up to their latest 2.0 versions ──
-    // Shell out to the staged Grav 2.0's `bin/gpm update -p -y` so we inherit
-    // its compatibility/dependency logic instead of duplicating it here.
-    // Symlinked slugs are excluded via positional allowlist. Themes still go
-    // through the per-slug zip path below (Phase B will move them too).
+    // ─── Phase 3: handle supersedes (admin → admin2 etc.) ───────────────────
+    // Remove deprecated slugs BEFORE the upgrade pass so gpm doesn't waste
+    // cycles updating something we're about to delete. The replacement
+    // (admin2, api, …) is installed by mg_install_replacements after policy.
+    $supersedeResult = mg_handle_supersedes($stageRoot, $superseded, $progress);
+
+    // ─── Phase 4: bring installed plugins/themes up to their 2.0 versions ──
+    // Shell out to the staged Grav 2.0's `bin/gpm update -p -y` for plugins
+    // (gpm itself enforces 2.0-compat — only compatible upgrades land).
+    // Symlinked slugs excluded via positional allowlist. Themes still use
+    // the per-slug zip path. Running BEFORE policy so the post-upgrade
+    // re-scan reflects what gpm actually did, and policy only kicks in for
+    // plugins gpm couldn't rescue.
     $upgraded = [];
     $gpmResult = null;
     if ($autoUpdate) {
-        $stageRoot = $webroot . '/' . $stageDir;
         $gpmResult = mg_gpm_update($stageRoot, 'plugins', $symlinkedSlugs['plugins'], $progress);
         if ($gpmResult['ok']) {
             // gpm reports display names, not slugs. Resolve back to slug via
-            // the scan's blueprint metadata so the upgraded[] entries match
-            // the slug-keyed convention used by the themes path below.
+            // the scan's blueprint metadata so upgraded[] keys match the
+            // slug-keyed convention used by the themes path below.
             $nameToSlug = [];
             foreach (($scan['plugins'] ?? []) as $s => $v) {
                 $n = (string) ($v['name'] ?? '');
@@ -549,8 +549,6 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
             foreach ($gpmResult['updated'] as $name => $version) {
                 $slug = $nameToSlug[$name] ?? '';
                 if ($slug === '') {
-                    // Couldn't resolve — record under the display name so it
-                    // still appears in the summary, just without a from-version.
                     $upgraded["plugins/{$name}"] = ['to' => $version, 'from' => ''];
                     continue;
                 }
@@ -567,7 +565,7 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
             if (!$update || empty($update['download']) || empty($update['to'])) continue;
 
             $dst = $dstUser . '/themes/' . $slug;
-            if (!is_dir($dst) || is_link($dst)) continue; // removed by policy / symlinked
+            if (!is_dir($dst) || is_link($dst)) continue;
 
             if ($progress) $progress(['phase' => 'start', 'entry' => "update/themes/{$slug}"]);
 
@@ -581,7 +579,24 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
         }
     }
 
-    // ─── Phase 4: install replacements (admin2, api, etc.) ───────────────────
+    // ─── Phase 5: re-scan compat on the staged tree (post-upgrade) ──────────
+    // Verdicts now reflect whatever gpm actually installed — a plugin that
+    // was 1.7-only on the source but got upgraded to a 2.0-compat release
+    // reads `compatible` here, so policy won't touch it.
+    $postScan = mg_rescan_staged($dstUser, $scan);
+
+    // ─── Phase 6: apply policy to plugins still incompatible after upgrade ─
+    // In strict mode, this is the small residual set gpm couldn't rescue.
+    // In test mode, nothing gets disabled/skipped at all (effective=compat).
+    $policyResult = mg_apply_plugin_policy($stageRoot, $postScan, $policy, $mode, $progress);
+    $disabled = array_map(static fn($s) => "plugins/{$s}", $policyResult['disabled']);
+    $skipped  = array_merge(
+        // mg_handle_supersedes already produces kind/slug-prefixed entries
+        $supersedeResult['skipped'],
+        array_map(static fn($s) => "plugins/{$s}", $policyResult['skipped'])
+    );
+
+    // ─── Phase 7: install replacements (admin2, api, etc.) ──────────────────
     $replacements = mg_install_replacements($webroot, $stageDir, $scan, $disabled, $skipped, $progress);
 
     // Derive the "actually copied" slug list per kind from the scan, minus
@@ -1816,35 +1831,37 @@ function mg_bulk_copy_user(string $srcUser, string $dstUser, int &$copied, ?call
  * ['skipped' => [...], 'disabled' => [...]] (bare slug names; caller
  * prefixes with "plugins/" for summary).
  */
-function mg_apply_plugin_policy(string $webroot, string $stageDir, array $scan, string $policy, string $mode, array $superseded, ?callable $progress): array
+/**
+ * Apply the chosen compat policy to staged plugins, using POST-UPGRADE
+ * verdicts (mg_rescan_staged result). Symlinked dirs are left alone —
+ * dev environments choose their own versions and we don't second-guess
+ * them. Supersedes are handled in their own phase before this runs.
+ *
+ * Returns ['skipped', 'disabled', 'force_included'].
+ */
+function mg_apply_plugin_policy(string $stageRoot, array $postScan, string $policy, string $mode, ?callable $progress): array
 {
     $skipped       = [];
     $disabled      = [];
     $forceIncluded = []; // slugs that strict would have flagged as incompatible
                          // but the chosen mode promoted to compatible
-    $stageRoot     = $webroot . '/' . $stageDir;
     $pluginDir     = $stageRoot . '/user/plugins';
     if (!is_dir($pluginDir)) {
         return ['skipped' => $skipped, 'disabled' => $disabled, 'force_included' => $forceIncluded];
     }
 
-    $verdicts = $scan['plugins'] ?? [];
+    $verdicts = $postScan['plugins'] ?? [];
 
     foreach (scandir($pluginDir) ?: [] as $slug) {
         if ($slug === '.' || $slug === '..') continue;
         if ($slug[0] === '.') continue;
         $slugDir = $pluginDir . '/' . $slug;
+
+        // Symlinked plugins: dev clones, leave alone.
+        if (is_link($slugDir)) continue;
         if (!is_dir($slugDir)) continue;
 
         $label = "plugins/{$slug}";
-
-        if (isset($superseded[$label])) {
-            $replSlug = $superseded[$label];
-            remove_dir($slugDir);
-            $skipped[] = $slug . " (superseded by {$replSlug})";
-            if ($progress) $progress(['phase' => 'skip', 'entry' => $label, 'reason' => "superseded by {$replSlug}"]);
-            continue;
-        }
 
         $rawVerdict = $verdicts[$slug] ?? ['status' => 'unknown'];
         $rawStatus  = (string) ($rawVerdict['status'] ?? 'unknown');
@@ -1874,6 +1891,58 @@ function mg_apply_plugin_policy(string $webroot, string $stageDir, array $scan, 
     }
 
     return ['skipped' => $skipped, 'disabled' => $disabled, 'force_included' => $forceIncluded];
+}
+
+/**
+ * Re-scan compatibility on the STAGED tree after the gpm upgrade pass has
+ * run. Returns a fresh ['plugins' => [slug => verdict], 'themes' => [...]]
+ * map, where verdicts reflect the post-upgrade blueprint state — so a
+ * plugin that was 1.7-only on disk but got upgraded to a 2.0-compatible
+ * release reads as `compatible` here.
+ *
+ * Reuses the source scan's cached curated registry + gpm index so we
+ * don't pay another network round-trip.
+ */
+function mg_rescan_staged(string $stagedUserDir, array $sourceScan): array
+{
+    $curated = $sourceScan['curated'] ?? null;
+    $gpm     = $sourceScan['gpm']     ?? ['plugins' => null, 'themes' => null];
+    return [
+        'plugins' => mg_scan_category($stagedUserDir . '/plugins', 'plugins', $curated, $gpm['plugins'] ?? null),
+        'themes'  => mg_scan_category($stagedUserDir . '/themes',  'themes',  $curated, $gpm['themes']  ?? null),
+    ];
+}
+
+/**
+ * Remove staged dirs for slugs the curated registry has marked as
+ * superseded by a different package (admin → admin2, etc.). Runs before
+ * the upgrade pass so gpm doesn't waste cycles updating something we're
+ * about to delete; the actual replacement is installed later by
+ * mg_install_replacements. Idempotent.
+ */
+function mg_handle_supersedes(string $stageRoot, array $superseded, ?callable $progress): array
+{
+    $skipped = [];
+    foreach ($superseded as $label => $replSlug) {
+        $parts = explode('/', $label, 2);
+        if (count($parts) !== 2) continue;
+        [$kind, $slug] = $parts;
+        if (!in_array($kind, ['plugins', 'themes'], true)) continue;
+
+        $path = $stageRoot . '/user/' . $kind . '/' . $slug;
+        if (!file_exists($path) && !is_link($path)) continue;
+
+        if (is_link($path)) {
+            @unlink($path);
+        } else {
+            remove_dir($path);
+        }
+        // Already kind/slug-prefixed (e.g. "plugins/admin (superseded by admin2)")
+        // so the caller can merge straight into the summary skipped[] list.
+        $skipped[] = $label . " (superseded by {$replSlug})";
+        if ($progress) $progress(['phase' => 'skip', 'entry' => $label, 'reason' => "superseded by {$replSlug}"]);
+    }
+    return ['skipped' => $skipped];
 }
 
 function mg_write_plugin_disable(string $stageRoot, string $slug): void
@@ -1918,6 +1987,7 @@ function mg_compat_scan_cached(string $webroot, array &$flag): array
         'at'      => time(),
         'source'  => $curated !== null ? 'remote' : 'offline',
         'gpm'     => $gpm,  // Cached so install paths can prefer GPM URLs over github_repo fallback.
+        'curated' => $curated, // Cached so mg_rescan_staged() can re-verdict the post-upgrade staged tree without a second fetch.
         'plugins' => mg_scan_category($webroot . '/user/plugins', 'plugins', $curated, $gpm['plugins']),
         'themes'  => mg_scan_category($webroot . '/user/themes',  'themes',  $curated, $gpm['themes']),
     ];
