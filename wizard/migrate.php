@@ -1475,6 +1475,48 @@ function mg_github_resolve_download(string $repo): array
 }
 
 /**
+ * Locate a CLI php binary suitable for running scripts as argv[1].
+ *
+ * PHP_BINARY is unreliable from a SAPI context — it can be empty, or it can
+ * point at php-fpm (which is a daemon, not a script runner). We try, in
+ * order:
+ *   1. Sibling /bin/php next to PHP_BINARY's grandparent dir — handles the
+ *      Homebrew layout where PHP_BINARY is `…/sbin/php-fpm` and the matching
+ *      CLI lives at `…/bin/php`.
+ *   2. PHP_BINARY itself if it's executable and doesn't look like FPM/CGI.
+ *   3. Common system locations: /usr/local/bin/php, /opt/homebrew/bin/php,
+ *      /usr/bin/php.
+ *   4. Bare "php" — proc_open's argv form does PATH lookup when the program
+ *      name has no slash, so this is the last-resort fallback.
+ *
+ * Returns null only if every option fails the executable check (rare).
+ */
+function mg_find_php_cli(): ?string
+{
+    $bin = (defined('PHP_BINARY') && is_string(PHP_BINARY)) ? PHP_BINARY : '';
+
+    if ($bin !== '' && is_executable($bin)) {
+        $base = basename($bin);
+        // Sibling bin/php — works for Homebrew sbin/php-fpm → bin/php
+        $sibling = dirname(dirname($bin)) . '/bin/php';
+        if (is_executable($sibling) && basename($sibling) === 'php') {
+            return $sibling;
+        }
+        // PHP_BINARY itself, if it's plain `php` (not -fpm, -cgi, etc.)
+        if ($base === 'php' || preg_match('/^php-?[0-9]/', $base)) {
+            return $bin;
+        }
+    }
+
+    foreach (['/usr/local/bin/php', '/opt/homebrew/bin/php', '/usr/bin/php'] as $candidate) {
+        if (is_executable($candidate)) return $candidate;
+    }
+
+    // Rely on PATH — proc_open argv form resolves bare names against PATH.
+    return 'php';
+}
+
+/**
  * Run the staged Grav 2.0's `bin/gpm update` to bring installed plugins
  * (or themes) up to their latest compatible versions on the 2.0 channel.
  *
@@ -1529,11 +1571,18 @@ function mg_gpm_update(string $stageRoot, string $kind, array $excludeSlugs, ?ca
         }
     }
 
-    // Build argv. Use PHP_BINARY to match the running PHP version (CLI may
-    // resolve differently than the SAPI we're under, but PHP_BINARY is the
-    // exact interpreter executing this script — what the staged tree just
-    // tested compatible against).
-    $argv = [PHP_BINARY, $bin, 'update', $kindFlag, '-y'];
+    // Resolve a CLI php binary. PHP_BINARY isn't reliable here — it can be
+    // empty (some FPM/SAPI builds), or it can point at php-fpm itself
+    // (Homebrew layouts) which can't run a script as argv[1]. Prefer in
+    // order: a sibling /bin/php next to PHP_BINARY (Homebrew sbin/php-fpm
+    // → bin/php), then PHP_BINARY if it looks CLI, then common system
+    // paths, then bare "php" (PATH lookup).
+    $phpBin = mg_find_php_cli();
+    if ($phpBin === null) {
+        return ['ok' => false, 'msg' => 'Could not locate a CLI php binary to run bin/gpm update', 'updated' => [], 'skipped' => [], 'output' => ''];
+    }
+
+    $argv = [$phpBin, $bin, 'update', $kindFlag, '-y'];
     foreach ($allowSlugs as $s) $argv[] = $s;
 
     $desc = [
@@ -1544,7 +1593,7 @@ function mg_gpm_update(string $stageRoot, string $kind, array $excludeSlugs, ?ca
 
     $proc = @proc_open($argv, $desc, $pipes, $stageRoot);
     if (!is_resource($proc)) {
-        return ['ok' => false, 'msg' => 'proc_open failed for bin/gpm update', 'updated' => [], 'skipped' => [], 'output' => ''];
+        return ['ok' => false, 'msg' => "proc_open failed for {$phpBin} bin/gpm update", 'updated' => [], 'skipped' => [], 'output' => ''];
     }
 
     stream_set_blocking($pipes[1], false);
