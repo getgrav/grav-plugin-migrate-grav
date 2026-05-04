@@ -106,6 +106,8 @@
         }
         .mg-btn-primary { background: #5b3ea8; color: #fff !important; box-shadow: 0 2px 6px rgba(91, 62, 168, 0.25); }
         .mg-btn-primary:hover { background: #4a328b; color: #fff !important; transform: translateY(-1px); box-shadow: 0 4px 10px rgba(91, 62, 168, 0.35); }
+        .mg-btn-secondary { background: #fff; color: #5b3ea8 !important; border: 1px solid #d8d2ec; }
+        .mg-btn-secondary:hover { background: #f5f2fb; color: #4a328b !important; }
         .mg-btn-danger { background: #fff; color: #c62828 !important; border: 1px solid #e5c2c2; }
         .mg-btn-danger:hover { background: #fff1f1; color: #b72020 !important; }
 
@@ -159,7 +161,7 @@
             <div class="mg-callout mg-callout-active">
                 <i class="fa fa-refresh fa-spin"></i>
                 <div>
-                    <strong>A migration is already staged.</strong> Resume it in a fresh PHP process, or reset to start over. The staged files live at <code>/{{ migrate_grav_state.stage_dir }}/</code> and <code>/{{ migrate_grav_state.staged_zip }}</code>.
+                    <strong>A migration is already staged.</strong> Resume it in a fresh PHP process, restart the wizard from step 1, or reset to start over from scratch. The staged files live at <code>/{{ migrate_grav_state.stage_dir }}/</code> and <code>/{{ migrate_grav_state.staged_zip }}</code>.
                 </div>
             </div>
 
@@ -171,10 +173,16 @@
                     <a class="mg-btn mg-btn-primary" href="{{ base_url_simple }}{{ migrate_grav_state.wizard_url }}" target="_blank" rel="noopener">
                         <i class="fa fa-arrow-right"></i> Continue migration
                     </a>
-                    <form method="post" action="{{ base_url_relative }}/task:migrateGravReset" style="margin:0" onsubmit="return confirm('Reset the in-progress migration? This deletes .migrating, migrate.php, the staged zip, and the staged Grav 2.0 directory. Your original site is untouched.');">
+                    <form method="post" action="{{ base_url_relative }}/task:migrateGravRestart" style="margin:0" onsubmit="return confirm('Restart the wizard? This clears the staged Grav 2.0 directory and any wizard progress, but keeps the downloaded release zip and the migration token so you can re-run from step 1 without re-downloading. Your original site is untouched.');">
+                        <input type="hidden" name="admin-nonce" value="{{ admin.getNonce('admin-form') }}" />
+                        <button type="submit" class="mg-btn mg-btn-secondary">
+                            <i class="fa fa-undo"></i> Restart Wizard
+                        </button>
+                    </form>
+                    <form method="post" action="{{ base_url_relative }}/task:migrateGravReset" style="margin:0" onsubmit="return confirm('Reset the migration completely? This deletes .migrating, migrate.php, the staged zip, and the staged Grav 2.0 directory. Your original site is untouched. The next start will re-download Grav 2.0.');">
                         <input type="hidden" name="admin-nonce" value="{{ admin.getNonce('admin-form') }}" />
                         <button type="submit" class="mg-btn mg-btn-danger">
-                            <i class="fa fa-trash"></i> Reset
+                            <i class="fa fa-trash"></i> Reset Migration
                         </button>
                     </form>
                 </div>

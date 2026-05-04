@@ -68,19 +68,36 @@ class MigrateGravPlugin extends Plugin
             return;
         }
 
-        if ($task === 'taskMigrateGravReset') {
+        if ($task === 'taskMigrateGravReset' || $task === 'taskMigrateGravRestart') {
+            $isRestart = $task === 'taskMigrateGravRestart';
+            $verb      = $isRestart ? 'restart wizard' : 'reset migration';
             if (!$authorized) {
-                $this->grav['admin']->setMessage('Super admin required to reset migration.', 'error');
+                $this->grav['admin']->setMessage("Super admin required to {$verb}.", 'error');
                 return;
             }
-            $result = $this->runReset();
+            $result = $this->runReset($isRestart ? 'restart' : 'full');
             if ($result['errors']) {
-                $this->grav['admin']->setMessage('Reset incomplete: ' . implode('; ', $result['errors']), 'error');
+                $label = $isRestart ? 'Restart' : 'Reset';
+                $this->grav['admin']->setMessage("{$label} incomplete: " . implode('; ', $result['errors']), 'error');
             } else {
-                $msg = $result['removed']
-                    ? 'Migration reset. Removed: ' . implode(', ', $result['removed'])
-                    : 'Nothing to reset.';
+                if (!$result['removed']) {
+                    $msg = $isRestart ? 'Nothing to restart — no migration is staged.' : 'Nothing to reset.';
+                } else {
+                    $msg = ($isRestart ? 'Wizard restarted. ' : 'Migration reset. ')
+                        . 'Removed: ' . implode(', ', $result['removed']);
+                }
                 $this->grav['admin']->setMessage($msg, 'info');
+            }
+
+            // Restart preserves .migrating, so send the user back into the
+            // wizard at the staged step. Full reset has nothing to resume —
+            // return to the migrate-grav admin page.
+            if ($isRestart && !$result['errors']) {
+                $state = $this->newKickoff()->readFlag();
+                if (!empty($state['wizard_url'])) {
+                    $this->grav->redirect($state['wizard_url'], 302);
+                    return;
+                }
             }
             // Pass the Route object directly — Grav::redirect() handles
             // Route instances via toString(true), which already includes the
@@ -104,10 +121,13 @@ class MigrateGravPlugin extends Plugin
 
     /**
      * Shared reset entry point used by admin and CLI.
+     *
+     * @param string $mode 'full' nukes everything; 'restart' keeps the staged
+     *                     zip + flag and rewinds the wizard to step='staged'.
      */
-    public function runReset(): array
+    public function runReset(string $mode = 'full'): array
     {
-        return $this->newKickoff()->reset();
+        return $this->newKickoff()->reset($mode);
     }
 
     /**

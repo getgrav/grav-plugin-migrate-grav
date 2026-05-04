@@ -87,7 +87,8 @@ class Kickoff
         $flag = $this->webroot . DIRECTORY_SEPARATOR . self::FLAG_FILE;
         if (file_exists($flag)) {
             throw new RuntimeException(
-                "A migration is already staged ({$flag}). Remove it to restart, " .
+                "A migration is already staged ({$flag}). " .
+                "Use Restart Wizard or Reset Migration on the Migrate Grav admin page, " .
                 "or visit /" . self::MIGRATE_FILE . " to resume."
             );
         }
@@ -95,7 +96,8 @@ class Kickoff
         $stage = $this->webroot . DIRECTORY_SEPARATOR . ($this->config['stage_dir'] ?: 'grav-2');
         if (is_dir($stage)) {
             throw new RuntimeException(
-                "Stage directory already exists: {$stage}. Remove it to restart."
+                "Stage directory already exists: {$stage}. " .
+                "Use Reset Migration on the Migrate Grav admin page to clear it."
             );
         }
     }
@@ -204,36 +206,31 @@ class Kickoff
     }
 
     /**
-     * Reset migration state: delete .migrating, migrate.php, the staged zip,
-     * and the stage directory. Returns a summary of what was removed.
+     * Reset migration state. Two modes:
+     *
+     *   'full'    — delete .migrating, migrate.php, the staged zip, the stage
+     *               directory, and restore .htaccess. Next kickoff starts from
+     *               scratch (re-download, re-stage).
+     *
+     *   'restart' — keep .migrating (rewound to step='staged'), keep migrate.php
+     *               and the staged zip, restore .htaccess, drop only the stage
+     *               directory and any transient run state. Lets the user re-run
+     *               the wizard without re-downloading Grav 2.0.
      *
      * Safe to call even when nothing is staged.
      */
-    public function reset(): array
+    public function reset(string $mode = 'full'): array
     {
+        if (!in_array($mode, ['full', 'restart'], true)) {
+            throw new RuntimeException("Unknown reset mode: {$mode}");
+        }
+
         $removed = [];
         $errors  = [];
+        $stageDir = trim((string)($this->config['stage_dir'] ?? 'grav-2'), '/');
 
-        $stageDir  = trim((string)($this->config['stage_dir'] ?? 'grav-2'), '/');
-        $candidates = [
-            self::FLAG_FILE,
-            self::MIGRATE_FILE,
-            'tmp/' . self::ZIP_NAME,
-        ];
-
-        // Restore .htaccess if the wizard patched it for the Test step.
+        // Both modes restore .htaccess and drop the stage directory.
         $this->restoreHtaccess();
-
-        foreach ($candidates as $rel) {
-            $path = $this->webroot . DIRECTORY_SEPARATOR . $rel;
-            if (is_file($path)) {
-                if (@unlink($path)) {
-                    $removed[] = $rel;
-                } else {
-                    $errors[] = "Could not remove {$rel}";
-                }
-            }
-        }
 
         if ($stageDir !== '') {
             $stagePath = $this->webroot . DIRECTORY_SEPARATOR . $stageDir;
@@ -246,7 +243,46 @@ class Kickoff
             }
         }
 
-        return ['removed' => $removed, 'errors' => $errors];
+        if ($mode === 'restart') {
+            // Rewrite .migrating with only the kickoff-time keys, step rewound
+            // to 'staged'. Strips wizard-side run state (plugins_themes,
+            // accounts, content, _prev_options, staged_zip_version, etc.) so
+            // the wizard restarts cleanly from the staged release.
+            $existing = $this->readFlag();
+            if ($existing !== null) {
+                $minimal = array_filter([
+                    'token'      => $existing['token']      ?? null,
+                    'created'    => $existing['created']    ?? time(),
+                    'step'       => 'staged',
+                    'source'     => $existing['source']     ?? null,
+                    'stage_dir'  => $existing['stage_dir']  ?? ($this->config['stage_dir'] ?: 'grav-2'),
+                    'staged_zip' => $existing['staged_zip'] ?? 'tmp/' . self::ZIP_NAME,
+                    'wizard_url' => $existing['wizard_url'] ?? null,
+                ], static fn($v) => $v !== null);
+                $this->writeFlag($minimal);
+                $removed[] = '.migrating (rewound to staged)';
+            }
+            return ['removed' => $removed, 'errors' => $errors, 'mode' => 'restart'];
+        }
+
+        // mode === 'full'
+        $candidates = [
+            self::FLAG_FILE,
+            self::MIGRATE_FILE,
+            'tmp/' . self::ZIP_NAME,
+        ];
+        foreach ($candidates as $rel) {
+            $path = $this->webroot . DIRECTORY_SEPARATOR . $rel;
+            if (is_file($path)) {
+                if (@unlink($path)) {
+                    $removed[] = $rel;
+                } else {
+                    $errors[] = "Could not remove {$rel}";
+                }
+            }
+        }
+
+        return ['removed' => $removed, 'errors' => $errors, 'mode' => 'full'];
     }
 
     /**

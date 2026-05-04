@@ -28,11 +28,18 @@ const MG_IMPORT_OPTIONAL = ['plugins', 'themes'];
 const MG_COMPAT_URL      = 'https://getgrav.org/gpm/compatibility/v1/_all';
 const MG_COMPAT_TARGET   = '2.0';
 const MG_COMPAT_TTL      = 900;
-// Use the testing channel — during 2.0 migration we WANT betas (admin2, api,
-// and other 2.0-compatible releases that haven't gone stable yet). Testing
-// is a superset of stable, so this catches everything.
-const MG_GPM_PLUGINS_URL = 'https://getgrav.org/downloads/plugins.json?testing=1';
-const MG_GPM_THEMES_URL  = 'https://getgrav.org/downloads/themes.json?testing=1';
+// GPM catalog endpoints. The full URL is built per-fetch by mg_fetch_gpm_index()
+// so we can pass v= (target Grav version) and php= (current PHP version) — the
+// getgrav.org backend uses those to filter each plugin's catalog entry to the
+// newest version whose blueprint compat actually fits. Without v=/php= the
+// endpoint falls back to a "no-constraint" default that returns badly stale
+// versions for plugins that have multiple major lines (e.g. page-toc 1.1.2
+// instead of the 2.0-compatible 4.0.0-beta.3 on testing).
+//
+// Channel is testing — during 2.0 migration we WANT betas. Testing is a
+// superset of stable, so this catches both.
+const MG_GPM_PLUGINS_BASE = 'https://getgrav.org/downloads/plugins.json';
+const MG_GPM_THEMES_BASE  = 'https://getgrav.org/downloads/themes.json';
 const MG_HTACCESS_MARKER = '# migrate-grav stage exclusion';
 
 // Compat handling modes for Step 2. Affects how the wizard treats plugins
@@ -87,6 +94,13 @@ if ($method === 'POST') {
             wizard_reset($webroot, (string) ($flagForAuth['stage_dir'] ?? 'grav-2'));
             header('Location: ' . base_path_from_script(), true, 302);
             exit(0);
+
+        case 'restart':
+            // Light reset: keep flag (rewound), keep zip + wizard, drop stage
+            // dir and restore .htaccess. Send the user back to the wizard
+            // landing so they can re-run from step 1.
+            wizard_restart($webroot, $flagPath, $flagForAuth);
+            redirect_self($token, ['flash' => 'restarted', 'msg' => 'Wizard restarted. The staged Grav 2.0 directory was cleared — re-run from step 1.']);
 
         case 'extract':
             // Long-running. Stream progress instead of blocking then redirecting.
@@ -1501,9 +1515,17 @@ function mg_install_zip_url(string $webroot, string $stageDir, string $kind, str
 }
 
 /**
- * Ask GitHub for the latest tagged release of <owner>/<repo>. If none exists,
- * fall back to the default-branch zipball and mark the version as "1.0.0"
- * (sentinel for "published before first tagged release"). Returns:
+ * Ask GitHub for the latest tagged release of <owner>/<repo>. Three-tier:
+ *   1. /releases/latest    — full releases only (excludes pre-releases)
+ *   2. /releases           — full list, picks newest non-draft (incl. betas)
+ *   3. default-branch HEAD — last-resort sentinel marked version "1.0.0"
+ *
+ * Tier 2 is what catches plugins like admin2/api during the 2.0 beta line:
+ * they only ship pre-release tags, /releases/latest silently 404s for those,
+ * and without this tier the fallback would install untagged HEAD — which is
+ * exactly the surprise we want to avoid for replacement installs.
+ *
+ * Returns:
  *   ['zipball' => URL, 'version' => string, 'source' => 'release'|'default-branch']
  */
 function mg_github_resolve_download(string $repo): array
@@ -1517,6 +1539,7 @@ function mg_github_resolve_download(string $repo): array
         'ssl'  => ['verify_peer' => true, 'verify_peer_name' => true],
     ]);
 
+    // Tier 1: /releases/latest (excludes pre-releases by GitHub's design).
     $raw = @file_get_contents("https://api.github.com/repos/{$repo}/releases/latest", false, $ctx);
     if ($raw !== false) {
         $data = json_decode($raw, true);
@@ -1530,68 +1553,32 @@ function mg_github_resolve_download(string $repo): array
         }
     }
 
+    // Tier 2: /releases — newest non-draft entry, pre-releases included.
+    // GitHub orders the list by created_at desc by default, so the first
+    // non-draft release is the newest tag.
+    $raw = @file_get_contents("https://api.github.com/repos/{$repo}/releases?per_page=10", false, $ctx);
+    if ($raw !== false) {
+        $list = json_decode($raw, true);
+        if (is_array($list)) {
+            foreach ($list as $rel) {
+                if (!is_array($rel) || !empty($rel['draft'])) continue;
+                if (empty($rel['zipball_url'])) continue;
+                $tag = (string) ($rel['tag_name'] ?? '1.0.0');
+                return [
+                    'zipball' => $rel['zipball_url'],
+                    'version' => ltrim($tag, 'v'),
+                    'source'  => 'release',
+                ];
+            }
+        }
+    }
+
+    // Tier 3: default-branch HEAD.
     return [
         'zipball' => "https://api.github.com/repos/{$repo}/zipball",
         'version' => '1.0.0',
         'source'  => 'default-branch',
     ];
-}
-
-/**
- * Pre-flight: ask Grav's `bin/gpm index -I -U` what's installed AND
- * updatable in the given root, so the form step can show "this red row
- * has a newer version that gpm will pick up". Cheap (~1s) and
- * authoritative — gpm itself is the source of truth on what'll upgrade
- * when Phase 3 runs.
- *
- * Returns ['plugins' => [slug => ['name','from','to']], 'themes' => [...]]
- * — empty arrays on any failure (proc_open disabled, gpm missing, parse
- * miss). Output table format:
- *   | 1 | AdvancedPageCache | advanced-pagecache | v3.1.1 -> v3.1.2 | …
- */
-function mg_gpm_pending_updates(string $rootDir): array
-{
-    $empty = ['plugins' => [], 'themes' => []];
-    $bin = $rootDir . '/bin/gpm';
-    if (!is_file($bin)) return $empty;
-
-    $disabled = array_map('trim', explode(',', (string) ini_get('disable_functions')));
-    if (in_array('proc_open', $disabled, true) || !function_exists('proc_open')) return $empty;
-
-    $php = mg_find_php_cli();
-    if ($php === null) return $empty;
-
-    $argv = [$php, $bin, 'index', '-I', '-U', '--no-ansi'];
-    $desc = [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
-
-    $proc = @proc_open($argv, $desc, $pipes, $rootDir);
-    if (!is_resource($proc)) return $empty;
-
-    $out = (string) stream_get_contents($pipes[1]);
-    @fclose($pipes[1]);
-    @fclose($pipes[2]);
-    @proc_close($proc);
-
-    $result  = $empty;
-    $section = null;
-    foreach (explode("\n", $out) as $line) {
-        if (preg_match('/^PLUGINS\b/', $line)) { $section = 'plugins'; continue; }
-        if (preg_match('/^THEMES\b/',  $line)) { $section = 'themes';  continue; }
-        if ($section === null) continue;
-
-        // Strip Symfony Console style placeholders ("<blue>", "</green>"
-        // etc.) that --no-ansi doesn't always remove.
-        $clean = preg_replace('/<\/?[a-z]+>/i', '', $line);
-
-        if (preg_match('/^\s*\|\s*\d+\s*\|\s*(.+?)\s*\|\s*([a-z0-9_\-]+)\s*\|\s*v?([\w.\-]+)\s*->\s*v?([\w.\-]+)\s*\|/', $clean, $m)) {
-            $result[$section][$m[2]] = [
-                'name' => trim($m[1]),
-                'from' => $m[3],
-                'to'   => $m[4],
-            ];
-        }
-    }
-    return $result;
 }
 
 /**
@@ -2025,9 +2012,16 @@ function mg_compat_scan_cached(string $webroot, array &$flag): array
     }
 
     $curated  = mg_fetch_curated();
+
+    // Use the staged Grav 2.0 version (and current PHP) so the catalog
+    // returns each plugin's newest release that's actually compatible with
+    // the migration target. Falls back to '2.0.0' when the zip hasn't been
+    // cracked yet — still a 2.x query, just less specific.
+    $stagedGrav = mg_staged_zip_version($webroot, $flag) ?? '';
+    $php        = PHP_VERSION;
     $gpm = [
-        'plugins' => mg_fetch_gpm_index('plugins'),
-        'themes'  => mg_fetch_gpm_index('themes'),
+        'plugins' => mg_fetch_gpm_index('plugins', $stagedGrav, $php),
+        'themes'  => mg_fetch_gpm_index('themes',  $stagedGrav, $php),
     ];
 
     $scan = [
@@ -2044,20 +2038,13 @@ function mg_compat_scan_cached(string $webroot, array &$flag): array
     // matching info to what the install path will actually do.
     $scan['github_versions'] = mg_resolve_pending_versions($scan, $curated, $gpm);
 
-    // Pre-flight: ask the SOURCE Grav's bin/gpm what it would update. The
-    // staged tree's gpm would be more authoritative against 2.0 compat,
-    // but the stage doesn't have user/plugins yet at this point — we run
-    // against the source (1.7) and trust that newer-version-on-channel
-    // is a reliable signal. The actual Phase 3 gpm update on the staged
-    // 2.0 tree will only install 2.0-compatible upgrades regardless.
-    $scan['gpm_pending'] = mg_gpm_pending_updates($webroot);
-    foreach (['plugins', 'themes'] as $kind) {
-        foreach (($scan['gpm_pending'][$kind] ?? []) as $slug => $info) {
-            if (isset($scan[$kind][$slug])) {
-                $scan[$kind][$slug]['pending_update'] = $info;
-            }
-        }
-    }
+    // No separate "pending update" pre-flight: pending updates are now
+    // derived from the same v=<staged 2.0> + php=<current> GPM query that
+    // mg_fetch_gpm_index() already ran. mg_resolve_update() (called by
+    // mg_scan_category) writes the result into $verdict['update'], and the
+    // UI badge falls back to it. Querying the source 1.7 install's bin/gpm
+    // would filter the catalog with v=1.7.x and miss the 2.0-line upgrades
+    // that are the whole point of the migration.
 
     $flag['compat_scan'] = $scan;
     save_flag($webroot . '/.migrating', $flag);
@@ -2147,14 +2134,22 @@ function mg_scan_category(string $dir, string $kind, ?array $curated, ?array $gp
  * Decide whether the GPM-listed latest version is an "update worth taking"
  * during 2.0 migration. Returns ['to' => version, 'download' => url] or null.
  *
- * Rules (curated registry is authoritative for compat target):
+ * Trust model: mg_fetch_gpm_index() pins the catalog query to v=<staged Grav
+ * 2.0> + php=<current>, so any version returned here has already been
+ * filtered by getgrav.org against the destination's dependency + blueprint
+ * compatibility constraints. We accept the suggested upgrade unless the
+ * curated registry explicitly forbids it.
+ *
+ * Rules:
  *   - Only consider plugins/themes with an entry in the GPM index.
- *   - If the curated entry says the slug supports 2.0 AND has a
- *     minimum_version: only update when GPM latest >= minimum_version.
- *   - If the curated entry has no minimum_version: update whenever GPM
- *     latest > installed (we trust the curated 2.0 verdict).
- *   - For slugs without a curated 2.0 entry: don't auto-update — we have no
- *     signal that the latest is actually 2.0-compatible.
+ *   - Skip when latest <= installed (semver compare).
+ *   - Skip when the curated registry explicitly marks the slug as
+ *     2.0-incompatible (hard block — overrides the GPM filter).
+ *   - When curated supplies minimum_version, skip if GPM latest is below it.
+ *   - Otherwise: trust the GPM filter and offer the update. This is what lets
+ *     us surface major-line upgrades (e.g. page-toc 3.x → 4.x) for plugins
+ *     whose locally-installed blueprint is the legacy 1.x line and has no
+ *     explicit 2.0 compat marker.
  */
 function mg_resolve_update(string $slug, string $installedVersion, array $verdict, ?array $gpmIndex): ?array
 {
@@ -2165,12 +2160,14 @@ function mg_resolve_update(string $slug, string $installedVersion, array $verdic
     if ($latest === '' || $url === '') return null;
     if ($installedVersion !== '' && version_compare($latest, $installedVersion, '<=')) return null;
 
-    // Need positive 2.0 signal to take an update.
-    $curated2x = ($verdict['source'] === 'curated' && $verdict['status'] !== 'incompatible')
-              || ($verdict['status'] === 'needs_update');
-    if (!$curated2x) return null;
+    // Hard block: curated registry says this slug isn't 2.0-compatible at all.
+    // Even if GPM returned a newer version, the registry overrides — typically
+    // means the maintainer has marked it deprecated or replaced_by another slug.
+    if (($verdict['source'] ?? '') === 'curated' && ($verdict['status'] ?? '') === 'incompatible') {
+        return null;
+    }
 
-    // If curated has minimum_version, gate against it.
+    // Curated minimum_version still wins when set.
     $min = (string) ($verdict['min_version'] ?? '');
     if ($min !== '' && version_compare($latest, $min, '<')) return null;
 
@@ -2181,9 +2178,28 @@ function mg_resolve_update(string $slug, string $installedVersion, array $verdic
  * Fetch the GPM plugins.json or themes.json index and reshape to slug → entry.
  * Returns null on any network/parse failure (callers fall back gracefully).
  */
-function mg_fetch_gpm_index(string $kind): ?array
+/**
+ * Fetch a GPM index (plugins.json | themes.json) filtered for the target
+ * Grav + PHP version. v= and php= match the params Grav core sends from
+ * AbstractPackageCollection — required for the catalog to return the right
+ * "latest" per plugin when the plugin has multiple major lines (1.x vs 2.x).
+ *
+ * @param string $kind        'plugins' | 'themes'
+ * @param string $gravVersion Target Grav version (e.g. '2.0.0' or the staged
+ *                            zip's version). Empty falls back to '2.0.0' so
+ *                            migration always queries the 2.x catalog.
+ * @param string $phpVersion  Target PHP version. Defaults to PHP_VERSION since
+ *                            the wizard runs in the same process the staged
+ *                            install will run under.
+ */
+function mg_fetch_gpm_index(string $kind, string $gravVersion = '', string $phpVersion = ''): ?array
 {
-    $url = $kind === 'themes' ? MG_GPM_THEMES_URL : MG_GPM_PLUGINS_URL;
+    $base = $kind === 'themes' ? MG_GPM_THEMES_BASE : MG_GPM_PLUGINS_BASE;
+    $url  = $base . '?' . http_build_query([
+        'v'       => $gravVersion !== '' ? $gravVersion : '2.0.0',
+        'php'     => $phpVersion  !== '' ? $phpVersion  : PHP_VERSION,
+        'testing' => 1,
+    ]);
     $ctx = stream_context_create([
         'http' => ['timeout' => 6, 'ignore_errors' => true, 'header' => "User-Agent: grav-migrate-wizard/1.0\r\n"],
         'ssl'  => ['verify_peer' => true, 'verify_peer_name' => true],
@@ -2573,6 +2589,35 @@ function wizard_reset(string $webroot, string $stageDir): void
     }
 }
 
+/**
+ * Light reset: clear the stage dir + .htaccess patch, keep the staged zip and
+ * the wizard, and rewrite .migrating with only the kickoff-time keys (step
+ * rewound to 'staged'). Wizard run state (plugins_themes/accounts/content
+ * choices, _prev_options, etc.) is dropped so the rerun starts clean. Lets the
+ * user re-run the wizard without re-downloading Grav 2.0.
+ */
+function wizard_restart(string $webroot, string $flagPath, array $flag): void
+{
+    mg_unpatch_htaccess($webroot);
+
+    $stageDir  = trim((string) ($flag['stage_dir'] ?? 'grav-2'), '/');
+    $stagePath = $webroot . '/' . $stageDir;
+    if ($stageDir !== '' && is_dir($stagePath)) {
+        remove_dir($stagePath);
+    }
+
+    $minimal = array_filter([
+        'token'      => $flag['token']      ?? '',
+        'created'    => $flag['created']    ?? time(),
+        'step'       => 'staged',
+        'source'     => $flag['source']     ?? null,
+        'stage_dir'  => $flag['stage_dir']  ?? 'grav-2',
+        'staged_zip' => $flag['staged_zip'] ?? 'tmp/grav-2.0-staged.zip',
+        'wizard_url' => $flag['wizard_url'] ?? null,
+    ], static fn($v) => $v !== null && $v !== '');
+    save_flag($flagPath, $minimal);
+}
+
 function remove_dir(string $path): void
 {
     // Symlinks are unlinked, never traversed — staged trees can contain
@@ -2724,7 +2769,7 @@ function render_wizard(array $flag, string $step, string $webroot, string $stage
     render_stepper($step);
 
     if ($flash) {
-        $successKeys = ['extracted', 'imported', 'ok', 'plugins_done', 'accounts_done', 'content_done', 'test_done'];
+        $successKeys = ['extracted', 'imported', 'ok', 'plugins_done', 'accounts_done', 'content_done', 'test_done', 'restarted'];
         $type = in_array($flash['type'], $successKeys, true)
             ? 'ok'
             : ($flash['type'] === 'error' ? 'error' : 'warn');
@@ -2818,14 +2863,23 @@ function render_wizard(array $flag, string $step, string $webroot, string $stage
     }
     echo '</table></div>';
 
-    // Reset card
-    echo '<div class="mg-card mg-card-muted"><h3>Reset</h3>';
-    echo '<p>Abandon this migration and clean up the staged files. Your original site at <code>' . htmlspecialchars($webroot) . '</code> is <strong>not</strong> touched.</p>';
-    echo '<form method="post" onsubmit="return confirm(\'Delete .migrating, migrate.php, the staged zip, and the staged Grav 2.0 directory?\');">';
+    // Restart / Reset card
+    echo '<div class="mg-card mg-card-muted"><h3>Restart or Reset</h3>';
+    echo '<p>Your original site at <code>' . htmlspecialchars($webroot) . '</code> is <strong>not</strong> touched by either action.</p>';
+    echo '<p><strong>Restart Wizard</strong> clears the staged Grav 2.0 directory and your wizard progress, but keeps the downloaded release zip and your migration token so you can re-run from step 1 without re-downloading.</p>';
+    echo '<p><strong>Reset Migration</strong> abandons the migration entirely — deletes <code>.migrating</code>, <code>migrate.php</code>, the staged zip, and the staged Grav 2.0 directory. Starting over re-downloads Grav 2.0.</p>';
+    echo '<div class="mg-action-buttons" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;">';
+    echo '<form method="post" style="margin:0" onsubmit="return confirm(\'Restart the wizard? Clears the staged Grav 2.0 directory and any wizard progress; keeps the downloaded zip and migration token.\');">';
+    echo '<input type="hidden" name="action" value="restart">';
+    echo '<input type="hidden" name="token"  value="' . htmlspecialchars($token) . '">';
+    echo '<button type="submit" class="mg-btn mg-btn-secondary">Restart Wizard</button>';
+    echo '</form>';
+    echo '<form method="post" style="margin:0" onsubmit="return confirm(\'Reset the migration completely? Deletes .migrating, migrate.php, the staged zip, and the staged Grav 2.0 directory.\');">';
     echo '<input type="hidden" name="action" value="reset">';
     echo '<input type="hidden" name="token"  value="' . htmlspecialchars($token) . '">';
-    echo '<button type="submit" class="mg-btn mg-btn-danger">Reset migration</button>';
+    echo '<button type="submit" class="mg-btn mg-btn-danger">Reset Migration</button>';
     echo '</form>';
+    echo '</div>';
     echo '</div>';
 
     echo '</div>';
@@ -2896,10 +2950,15 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
                 echo '<div class="mg-callout mg-callout-warn"><i class="mg-i-info"></i><div>Could not reach the curated compatibility registry. Falling back to blueprint + dependency inference only — verdicts may be less accurate.</div></div>';
             }
 
-            // Upgrade preview — surfaces "this red row will actually be fixed
-            // by the gpm upgrade pass" before the user commits.
-            $pendingPlugins = count($scan['gpm_pending']['plugins'] ?? []);
-            $pendingThemes  = count($scan['gpm_pending']['themes']  ?? []);
+            // Upgrade preview — counts how many rows have a candidate upgrade
+            // resolved via mg_resolve_update() (i.e. GPM, with v=<staged 2.0>,
+            // is offering a newer version than what's installed).
+            $countUpdates = static fn(array $bucket): int => count(array_filter(
+                $bucket,
+                static fn($v) => is_array($v) && !empty($v['update'])
+            ));
+            $pendingPlugins = $countUpdates($scan['plugins'] ?? []);
+            $pendingThemes  = $countUpdates($scan['themes']  ?? []);
             if ($pendingPlugins + $pendingThemes > 0) {
                 $parts = [];
                 if ($pendingPlugins > 0) $parts[] = "<strong>{$pendingPlugins}</strong> plugin update" . ($pendingPlugins === 1 ? '' : 's');
@@ -3282,43 +3341,60 @@ function render_compat_breakdown(array $scan): void
 
         $total = count($items) + count($pending);
         echo '<div class="mg-compat-group"><h4>' . htmlspecialchars($label) . ' <span class="mg-btn-note">' . $total . ' total</span></h4>';
-        echo '<ul class="mg-compat-list">';
 
-        // Render pending replacements first so the user sees the "incoming" row up top.
+        // Render pending replacements first under their own subhead so the
+        // user sees the "incoming" rows up top.
         $versions = $scan['github_versions'] ?? [];
-        foreach ($pending as $slug => $info) {
-            $ver = $versions[$slug] ?? null;
-            if ($ver) {
-                $verLabel = match ($ver['source']) {
-                    'release'        => 'v' . $ver['version'],
-                    'gpm'            => 'v' . $ver['version'],
-                    'default-branch' => $ver['version'] . ' (default)',
-                    default          => 'v' . $ver['version'],
-                };
-                $sourceTag = strtoupper($ver['source'] === 'release' ? 'github' : ($ver['source'] === 'default-branch' ? 'github' : $ver['source']));
-                $repoTag = $ver['source'] === 'gpm'
-                    ? 'getgrav.org/downloads (gpm)'
-                    : (string) ($info['entry']['github_repo'] ?? '');
-            } else {
-                $verLabel = 'latest';
-                $sourceTag = 'GITHUB';
-                $repoTag = (string) ($info['entry']['github_repo'] ?? '');
-            }
+        if ($pending) {
+            echo '<h5 class="mg-compat-subhead mg-compat-subhead-new">Will be installed <span class="mg-compat-subhead-count">' . count($pending) . '</span></h5>';
+            echo '<ul class="mg-compat-list">';
+            foreach ($pending as $slug => $info) {
+                $ver = $versions[$slug] ?? null;
+                if ($ver) {
+                    $verLabel = match ($ver['source']) {
+                        'release'        => 'v' . $ver['version'],
+                        'gpm'            => 'v' . $ver['version'],
+                        'default-branch' => $ver['version'] . ' (default)',
+                        default          => 'v' . $ver['version'],
+                    };
+                    $sourceKey = $ver['source'] === 'default-branch' ? 'github' : $ver['source'];
+                    $sourceKey = $sourceKey === 'release' ? 'github' : $sourceKey;
+                    $repoTag = $ver['source'] === 'gpm'
+                        ? 'getgrav.org/downloads (gpm)'
+                        : (string) ($info['entry']['github_repo'] ?? '');
+                } else {
+                    $verLabel = 'latest';
+                    $sourceKey = 'github';
+                    $repoTag = (string) ($info['entry']['github_repo'] ?? '');
+                }
 
-            $reasonText = ($info['kind'] ?? 'replaces') === 'requires'
-                ? 'Will be installed (required by <code>' . htmlspecialchars($info['target']) . '</code>)'
-                : 'Will be installed to replace <code>' . htmlspecialchars($info['target']) . '</code>';
-            echo '<li class="mg-compat mg-compat-new">';
-            echo '<span class="mg-compat-icon">+</span>';
-            echo '<span class="mg-compat-slug">' . htmlspecialchars($slug) . '</span>';
-            echo ' <span class="mg-compat-version">' . htmlspecialchars($verLabel) . '</span>';
-            echo '<span class="mg-compat-reason">' . $reasonText . ' <span class="mg-compat-autoinstall">auto-install</span> <span class="mg-compat-repo"><code>' . htmlspecialchars($repoTag) . '</code></span></span>';
-            echo '<span class="mg-compat-source">' . htmlspecialchars($sourceTag) . '</span>';
-            echo '</li>';
+                $reasonText = ($info['kind'] ?? 'replaces') === 'requires'
+                    ? 'Will be installed (required by <code>' . htmlspecialchars($info['target']) . '</code>)'
+                    : 'Will be installed to replace <code>' . htmlspecialchars($info['target']) . '</code>';
+                echo '<li class="mg-compat mg-compat-new">';
+                echo '<span class="mg-compat-icon">+</span>';
+                echo '<span class="mg-compat-slug">' . htmlspecialchars($slug) . '</span>';
+                echo ' <span class="mg-compat-version">' . htmlspecialchars($verLabel) . '</span>';
+                echo '<span class="mg-compat-reason">' . $reasonText . ' <span class="mg-compat-autoinstall">auto-install</span> <span class="mg-compat-repo"><code>' . htmlspecialchars($repoTag) . '</code></span></span>';
+                echo '<span class="mg-compat-source mg-compat-source-' . htmlspecialchars(strtolower($sourceKey)) . '">' . htmlspecialchars(strtoupper($sourceKey)) . '</span>';
+                echo '</li>';
+            }
+            echo '</ul>';
         }
 
-        foreach (['compatible' => ['✓', 'ok'], 'needs_update' => ['⚠', 'warn'], 'incompatible' => ['✗', 'err']] as $status => [$icon, $cls]) {
-            foreach ($buckets[$status] as $slug => $v) {
+        $bucketMeta = [
+            'compatible'   => ['icon' => '✓', 'cls' => 'ok',   'label' => 'Compatible'],
+            'needs_update' => ['icon' => '⚠', 'cls' => 'warn', 'label' => 'Needs update'],
+            'incompatible' => ['icon' => '✗', 'cls' => 'err',  'label' => 'Incompatible'],
+        ];
+        foreach ($bucketMeta as $status => $meta) {
+            $rows = $buckets[$status];
+            if (!$rows) continue;
+            echo '<h5 class="mg-compat-subhead mg-compat-subhead-' . $meta['cls'] . '">'
+                . htmlspecialchars($meta['label'])
+                . ' <span class="mg-compat-subhead-count">' . count($rows) . '</span></h5>';
+            echo '<ul class="mg-compat-list">';
+            foreach ($rows as $slug => $v) {
                 $version = $v['installed_version'] ?? '';
                 $reason  = $v['reason'] ?? '';
                 $src     = $v['source'] ?? '';
@@ -3333,8 +3409,8 @@ function render_compat_breakdown(array $scan): void
                 // Twig 3 compat layer. Reframe the row so users don't see a
                 // scary ✗ next to their working theme.
                 $isKeptTheme = ($k === 'themes' && $status === 'incompatible' && !$replBy);
-                $rowIcon   = $isKeptTheme ? '⚠' : $icon;
-                $rowCls    = $isKeptTheme ? 'warn' : $cls;
+                $rowIcon   = $isKeptTheme ? '⚠' : $meta['icon'];
+                $rowCls    = $isKeptTheme ? 'warn' : $meta['cls'];
                 $rowReason = $isKeptTheme
                     ? 'Kept — Twig 3 compatibility enabled (verify before promoting)'
                     : $reason;
@@ -3344,21 +3420,20 @@ function render_compat_breakdown(array $scan): void
                 echo '<span class="mg-compat-slug">' . htmlspecialchars($slug) . '</span>';
                 if ($version !== '') echo ' <span class="mg-compat-version">' . htmlspecialchars($version) . '</span>';
                 echo '<span class="mg-compat-reason">' . htmlspecialchars($rowReason);
-                $pendingUpd = $v['pending_update'] ?? null;
-                if ($pendingUpd) {
-                    echo ' <span class="mg-compat-update">↑ will upgrade to v' . htmlspecialchars($pendingUpd['to']) . '</span>';
-                } elseif ($update) {
-                    echo ' <span class="mg-compat-update">↑ updates to v' . htmlspecialchars($update['to']) . '</span>';
+                if ($update) {
+                    echo ' <span class="mg-compat-update">↑ will upgrade to v' . htmlspecialchars($update['to']) . '</span>';
                 }
                 if ($replBy) {
                     echo ' <span class="mg-compat-autoinstall">→ <code>' . htmlspecialchars($replBy) . '</code></span>';
                 }
                 echo '</span>';
-                echo '<span class="mg-compat-source">' . htmlspecialchars($src) . '</span>';
+                $srcKey = strtolower($src) ?: 'default';
+                echo '<span class="mg-compat-source mg-compat-source-' . htmlspecialchars($srcKey) . '">' . htmlspecialchars($src) . '</span>';
                 echo '</li>';
             }
+            echo '</ul>';
         }
-        echo '</ul></div>';
+        echo '</div>';
     }
 }
 
@@ -3461,6 +3536,8 @@ function page_css(): string
         transition: background 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease; }
     .mg-btn-primary { background: #5b3ea8; color: #fff; box-shadow: 0 2px 6px rgba(91, 62, 168, 0.25); }
     .mg-btn-primary:not(:disabled):hover { background: #4a328b; transform: translateY(-1px); box-shadow: 0 4px 10px rgba(91, 62, 168, 0.35); }
+    .mg-btn-secondary { background: #fff; color: #5b3ea8; border: 1px solid #d8d2ec; }
+    .mg-btn-secondary:hover { background: #f5f2fb; color: #4a328b; }
     .mg-btn-danger { background: #fff; color: #c62828; border: 1px solid #e5c2c2; }
     .mg-btn-danger:hover { background: #fff1f1; color: #b72020; }
     .mg-btn:disabled { opacity: 0.55; cursor: not-allowed; }
@@ -3535,15 +3612,44 @@ function page_css(): string
 
     .mg-compat-group { margin: 14px 0 6px; }
     .mg-compat-group h4 { margin: 0 0 8px; font-size: 14px; color: #333; }
-    .mg-compat-list { list-style: none; padding: 0; margin: 0; border: 1px solid #eef0f6; border-radius: 4px; }
-    .mg-compat { display: grid; grid-template-columns: 24px 140px 80px 1fr 70px; gap: 10px;
-        align-items: center; padding: 8px 12px; border-bottom: 1px solid #f3f4f8; font-size: 13px; }
+    .mg-compat-subhead { margin: 14px 0 6px; font-size: 12px; font-weight: 600;
+        text-transform: uppercase; letter-spacing: 0.6px; color: #6b7280;
+        display: flex; align-items: center; gap: 8px; }
+    .mg-compat-subhead::before { content: ""; flex: 0 0 3px; height: 14px; border-radius: 2px;
+        background: #c8ccd6; }
+    .mg-compat-subhead-count { display: inline-flex; align-items: center; justify-content: center;
+        min-width: 22px; height: 18px; padding: 0 6px; border-radius: 9px;
+        background: #eef0f6; color: #4b5563; font-size: 11px; font-weight: 700;
+        letter-spacing: 0; text-transform: none; }
+    .mg-compat-subhead-ok::before   { background: #2a7f2a; }
+    .mg-compat-subhead-warn::before { background: #c47d00; }
+    .mg-compat-subhead-err::before  { background: #c62828; }
+    .mg-compat-subhead-new::before  { background: #5b3ea8; }
+    .mg-compat-subhead-ok .mg-compat-subhead-count   { background: #e3f4e3; color: #1f5a1f; }
+    .mg-compat-subhead-warn .mg-compat-subhead-count { background: #fff1d6; color: #80560a; }
+    .mg-compat-subhead-err .mg-compat-subhead-count  { background: #fde2e2; color: #8c2020; }
+    .mg-compat-subhead-new .mg-compat-subhead-count  { background: #ece5fa; color: #4a328b; }
+    .mg-compat-list { list-style: none; padding: 0; margin: 0 0 4px; border: 1px solid #eef0f6;
+        border-radius: 4px; overflow: hidden; }
+    .mg-compat { display: grid; grid-template-columns: 22px 190px 80px 1fr 96px; gap: 10px;
+        align-items: center; padding: 9px 12px; border-bottom: 1px solid #f3f4f8; font-size: 13px; }
     .mg-compat:last-child { border-bottom: 0; }
-    .mg-compat-icon { font-weight: 700; text-align: center; }
-    .mg-compat-slug { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #333; font-weight: 600; }
-    .mg-compat-version { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #666; font-size: 12px; }
-    .mg-compat-reason { color: #666; font-size: 12.5px; }
-    .mg-compat-source { color: #aaa; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; text-align: right; }
+    .mg-compat-icon { font-weight: 700; text-align: center; font-size: 13px; }
+    .mg-compat-slug { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #1f2937;
+        font-weight: 600; word-break: break-all; }
+    .mg-compat-version { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #6b7280;
+        font-size: 12px; }
+    .mg-compat-reason { color: #4b5563; font-size: 12.5px; }
+    .mg-compat-source { display: inline-block; padding: 2px 8px; border-radius: 10px;
+        background: #eef0f6; color: #4b5563; font-size: 10.5px; font-weight: 700;
+        text-transform: uppercase; letter-spacing: 0.5px; text-align: center;
+        justify-self: end; min-width: 76px; }
+    .mg-compat-source-curated   { background: #ece5fa; color: #4a328b; }
+    .mg-compat-source-blueprint { background: #e0ecff; color: #1d4ed8; }
+    .mg-compat-source-inferred  { background: #d8f1ee; color: #0f766e; }
+    .mg-compat-source-default   { background: #eef0f6; color: #6b7280; }
+    .mg-compat-source-github    { background: #1f2937; color: #f3f4f6; }
+    .mg-compat-source-gpm       { background: #d1f0d6; color: #1f5a1f; }
     .mg-compat-ok   { background: #f6fcf6; } .mg-compat-ok   .mg-compat-icon { color: #2a7f2a; }
     .mg-compat-warn { background: #fffaf0; } .mg-compat-warn .mg-compat-icon { color: #c47d00; }
     .mg-compat-err  { background: #fff5f5; } .mg-compat-err  .mg-compat-icon { color: #c62828; }
@@ -3555,14 +3661,16 @@ function page_css(): string
         letter-spacing: 0.3px; }
     .mg-compat-autoinstall code { background: rgba(255,255,255,0.18); color: #fff; padding: 0 4px;
         border-radius: 2px; font-size: 11px; }
-    .mg-compat-update { display: inline-block; margin-left: 6px; padding: 1px 7px;
-        background: #2a7f2a; color: #fff; font-size: 11px; font-weight: 600; border-radius: 3px;
-        letter-spacing: 0.3px; }
+    .mg-compat-update { display: inline-flex; align-items: center; margin-left: 6px;
+        padding: 1px 8px 1px 7px; background: #ecf7ec; color: #1f5a1f;
+        border: 1px solid #b8dcb8; font-size: 11px; font-weight: 600; border-radius: 10px;
+        letter-spacing: 0.2px; line-height: 1.55; }
     .mg-compat-repo { display: inline-block; margin-left: 6px; color: #888; font-size: 12px; }
     .mg-compat-repo code { background: transparent; padding: 0; color: #888; font-size: 12px; }
     @media (max-width: 700px) {
-      .mg-compat { grid-template-columns: 24px 1fr auto; }
-      .mg-compat-reason, .mg-compat-source { grid-column: 1 / -1; padding-left: 34px; }
+      .mg-compat { grid-template-columns: 22px 1fr auto; }
+      .mg-compat-reason, .mg-compat-source { grid-column: 1 / -1; padding-left: 32px; }
+      .mg-compat-source { justify-self: start; }
     }
 
     .mg-table-compact th, .mg-table-compact td { padding: 6px 10px; }
