@@ -54,6 +54,10 @@ class InitCommand extends ConsoleCommand
             $config['source_local_zip'] = $sourceZip;
         }
 
+        // Forward the site's GPM channel so Kickoff can append `?testing` to
+        // the source URL when the user has opted into the testing channel.
+        $config['gpm_channel'] = (string) $grav['config']->get('system.gpm.releases', 'stable');
+
         require_once dirname(__DIR__) . '/classes/Kickoff.php';
 
         $webroot = defined('GRAV_WEBROOT') ? GRAV_WEBROOT : GRAV_ROOT;

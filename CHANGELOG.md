@@ -1,3 +1,23 @@
+# v1.0.0-rc.1
+## 05-04-2026
+
+1. [](#new)
+    * Two reset modes — **Restart Wizard** keeps the downloaded Grav 2.0 zip and lets you re-run from step 1, **Reset Migration** wipes everything and starts over.
+2. [](#improved)
+    * Plugin upgrade lookups now ask GPM for the release that fits Grav 2.0 specifically, so suggested upgrades reflect what actually works on the destination.
+    * Plugin upgrades during migration are offered for any plugin with a newer 2.0-compatible release on GPM, not only those in the curated compatibility registry.
+    * Replacement installs (admin2, api, etc.) now fall back to the newest tagged GitHub release — including beta tags — when a plugin isn't on GPM yet.
+    * Plugin updates during Copy & Migrate now run through Grav 2.0's own `bin/gpm`, matching how a regular admin update behaves.
+    * Compatibility breakdown table groups rows by status with per-bucket counts (Compatible / Needs update / Incompatible / Will be installed) and color-coded labels for where each verdict came from.
+    * Symlinked plugins and themes are preserved through the migration, so developer setups with linked plugin clones don't get clobbered.
+    * Long-running steps (bulk copy, plugin upgrade) no longer time out on shared hosts with low `max_execution_time`.
+    * The "already staged" error when starting a new migration now points at the Restart/Reset buttons instead of asking you to delete files by hand.
+3. [](#bugfix)
+    * Recursive delete during reset no longer follows symlinks — protects real files outside the staged tree.
+    * Plugin upgrade pass no longer clobbers plugins that are about to be replaced (admin → admin2, etc.).
+    * Compatibility policy (skip/disable) now applies *after* the upgrade pass, so freshly upgraded 2.0-compatible plugins aren't then disabled.
+    * CLI php detection handles hosts where `PHP_BINARY` points at `php-fpm` or `php-cgi`.
+
 # v1.0.0-beta.5
 ## 04-25-2026
 

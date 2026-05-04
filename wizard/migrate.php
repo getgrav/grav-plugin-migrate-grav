@@ -28,12 +28,27 @@ const MG_IMPORT_OPTIONAL = ['plugins', 'themes'];
 const MG_COMPAT_URL      = 'https://getgrav.org/gpm/compatibility/v1/_all';
 const MG_COMPAT_TARGET   = '2.0';
 const MG_COMPAT_TTL      = 900;
-// Use the testing channel — during 2.0 migration we WANT betas (admin2, api,
-// and other 2.0-compatible releases that haven't gone stable yet). Testing
-// is a superset of stable, so this catches everything.
-const MG_GPM_PLUGINS_URL = 'https://getgrav.org/downloads/plugins.json?testing=1';
-const MG_GPM_THEMES_URL  = 'https://getgrav.org/downloads/themes.json?testing=1';
+// GPM catalog endpoints. The full URL is built per-fetch by mg_fetch_gpm_index()
+// so we can pass v= (target Grav version) and php= (current PHP version) — the
+// getgrav.org backend uses those to filter each plugin's catalog entry to the
+// newest version whose blueprint compat actually fits. Without v=/php= the
+// endpoint falls back to a "no-constraint" default that returns badly stale
+// versions for plugins that have multiple major lines (e.g. page-toc 1.1.2
+// instead of the 2.0-compatible 4.0.0-beta.3 on testing).
+//
+// Channel is testing — during 2.0 migration we WANT betas. Testing is a
+// superset of stable, so this catches both.
+const MG_GPM_PLUGINS_BASE = 'https://getgrav.org/downloads/plugins.json';
+const MG_GPM_THEMES_BASE  = 'https://getgrav.org/downloads/themes.json';
 const MG_HTACCESS_MARKER = '# migrate-grav stage exclusion';
+
+// Compat handling modes for Step 2. Affects how the wizard treats plugins
+// that aren't on the curated 2.0 list and don't declare 2.0 in their
+// blueprint. See mg_effective_status() for the per-mode rules.
+const MG_MODE_STRICT     = 'strict';
+const MG_MODE_PERMISSIVE = 'permissive';
+const MG_MODE_TEST       = 'test';
+const MG_MODES_ALL       = [MG_MODE_STRICT, MG_MODE_PERMISSIVE, MG_MODE_TEST];
 
 // Inline rocket SVG (bootstrap-icons rocket-takeoff). Used in the hero so the
 // wizard matches the admin migrate-grav page (which uses the same asset).
@@ -48,7 +63,7 @@ $token    = (string) ($_GET['token'] ?? $_POST['token'] ?? '');
 
 // CLI is intentionally not supported for the wizard itself. The multi-step
 // flow (extract / plugins+themes / accounts / content / promote) needs the
-// browser surface for compat review, policy choices, and progress streams.
+// browser UI for compat review, policy choices, and progress streams.
 // `bin/plugin migrate-grav init` is still the right CLI entry point — it
 // stages the files and prints the URL to open.
 if (PHP_SAPI === 'cli') {
@@ -80,13 +95,29 @@ if ($method === 'POST') {
             header('Location: ' . base_path_from_script(), true, 302);
             exit(0);
 
+        case 'restart':
+            // Light reset: keep flag (rewound), keep zip + wizard, drop stage
+            // dir and restore .htaccess. Send the user back to the wizard
+            // landing so they can re-run from step 1.
+            wizard_restart($webroot, $flagPath, $flagForAuth);
+            redirect_self($token, ['flash' => 'restarted', 'msg' => 'Wizard restarted. The staged Grav 2.0 directory was cleared — re-run from step 1.']);
+
         case 'extract':
             // Long-running. Stream progress instead of blocking then redirecting.
             stream_extract_page($webroot, $flagForAuth, $token);
             exit(0);
 
         case 'plugins_themes':
-            $options = ['policy' => (($_POST['policy'] ?? '') === 'skip') ? 'skip' : 'disable'];
+            $reqMode = (string) ($_POST['mode'] ?? MG_MODE_STRICT);
+            $mode    = in_array($reqMode, MG_MODES_ALL, true) ? $reqMode : MG_MODE_STRICT;
+            // Form's "upgrade_plugins" checkbox is positive-framed (checked
+            // means run gpm update). Internally we keep the legacy
+            // skip_update flag so the rest of the pipeline stays untouched.
+            $options = [
+                'mode'        => $mode,
+                'policy'      => (($_POST['policy'] ?? '') === 'skip') ? 'skip' : 'disable',
+                'skip_update' => !isset($_POST['upgrade_plugins']),
+            ];
             stream_plugins_themes_page($webroot, $flagForAuth, $token, $options);
             exit(0);
 
@@ -108,6 +139,34 @@ if ($method === 'POST') {
         case 'promote':
             stream_promote_page($webroot, $flagForAuth, $token);
             exit(0);
+
+        case 'rerun_step':
+            $target = (string) ($_POST['target'] ?? '');
+            $rewindLabels = [
+                'extracted'     => ['Step 2: Copy & Migrate', 'plugins_done'],
+                'plugins_done'  => ['Step 3: Accounts',       'accounts_done'],
+                'accounts_done' => ['Step 4: Content',        'content_done'],
+            ];
+            if (!isset($rewindLabels[$target])) {
+                http_response_code(400);
+                render_error_page('Invalid re-run target', 'Unknown rewind target: ' . htmlspecialchars($target));
+                exit(1);
+            }
+            // Must have actually completed the step we're rewinding past.
+            $required = $rewindLabels[$target][1];
+            $currentStep = (string) ($flagForAuth['step'] ?? '');
+            $stepOrder = MG_STEPS;
+            $currentIdx = array_search($currentStep, $stepOrder, true);
+            $requiredIdx = array_search($required, $stepOrder, true);
+            if ($currentIdx === false || $requiredIdx === false || $currentIdx < $requiredIdx) {
+                http_response_code(409);
+                render_error_page('Cannot re-run step',
+                    "You must have completed {$rewindLabels[$target][0]} before re-running it. Current step: <code>" . htmlspecialchars($currentStep) . '</code>');
+                exit(1);
+            }
+            mg_rewind_to($webroot, $flagForAuth, $target);
+            $msg = 'Rewound to "' . $target . '". Adjust options and re-run.';
+            redirect_self($token, ['flash' => 'rewound', 'msg' => $msg]);
 
         default:
             http_response_code(400);
@@ -278,11 +337,22 @@ function do_extract(string $webroot, array $flag, ?callable $progress = null): a
         @copy($htTmpl, $htRoot);
     }
 
+    // Stash the staged Grav version so the UI can display "what version of
+    // Grav 2.0 are we installing?" without re-reading defines.php on every
+    // request. Reads `define('GRAV_VERSION', '...')` from the staged tree.
+    $stagedGravVersion = mg_read_defines_version($destPath . '/system/defines.php');
+
     $flag['step']       = 'extracted';
-    $flag['extracted']  = ['at' => time(), 'files' => $count, 'prefix_stripped' => $prefix];
+    $flag['extracted']  = [
+        'at'              => time(),
+        'files'           => $count,
+        'prefix_stripped' => $prefix,
+        'grav_version'    => $stagedGravVersion,
+    ];
     save_flag($webroot . '/.migrating', $flag);
 
-    return ['ok' => true, 'msg' => "Extracted {$count} files into /{$stageDir}/"];
+    $verStr = $stagedGravVersion ? " (Grav v{$stagedGravVersion})" : '';
+    return ['ok' => true, 'msg' => "Extracted {$count} files into /{$stageDir}/{$verStr}"];
 }
 
 /**
@@ -429,58 +499,163 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
     }
     ensure_dir($dstUser);
 
+    $mode       = (string) ($options['mode'] ?? MG_MODE_STRICT);
+    if (!in_array($mode, MG_MODES_ALL, true)) $mode = MG_MODE_STRICT;
     $policy     = ($options['policy'] ?? 'disable') === 'skip' ? 'skip' : 'disable';
-    $autoUpdate = !isset($options['skip_update']);
+    $autoUpdate = empty($options['skip_update']);
     $scan       = mg_compat_scan_cached($webroot, $flag);
     $superseded = mg_collect_superseded($scan); // ['plugins/admin' => 'admin2', ...]
+
+    $stageRoot = $webroot . '/' . $stageDir;
 
     // ─── Phase 1: bulk-copy source user/ → staged user/ ──────────────────────
     // Everything (plugins, themes, accounts, pages, data, config, env,
     // languages, any custom folders, any top-level files) comes across
     // verbatim. Dotfiles/dotdirs at user/ root (.git, .DS_Store, editor
-    // backups) and symlinked top-level entries are skipped — they're
-    // filesystem/dev-env cruft, not site content. Downstream phases mutate
-    // the staged tree in place (policy, auto-updates, replacements).
+    // backups) are skipped as filesystem cruft. Symlinks (top-level and
+    // mid-tree) are preserved so dev clones stay live. Downstream phases
+    // mutate the staged tree in place.
     $copied = 0;
     $copySkipped = [];
     $copiedEntries = [];
     mg_bulk_copy_user($srcUser, $dstUser, $copied, $progress, $copySkipped, $copiedEntries);
 
-    // ─── Phase 2: apply plugin compat policy ─────────────────────────────────
-    // Skip/disable incompatibles, remove superseded slugs (admin → admin2).
-    // Themes are always kept — Twig 3 compat handles most at runtime.
-    $policyResult = mg_apply_plugin_policy($webroot, $stageDir, $scan, $policy, $superseded, $progress);
-    $disabled = array_map(static fn($s) => "plugins/{$s}", $policyResult['disabled']);
-    $skipped  = array_map(static fn($s) => "plugins/{$s}", $policyResult['skipped']);
+    // ─── Phase 2: collect symlinked plugin/theme slugs ───────────────────────
+    // Excluded from the upgrade pass (gpm would unlink the symlink and
+    // extract a fresh zip in its place) and from the policy pass (dev
+    // clones manage their own version, leave them alone).
+    $symlinkedSlugs = ['plugins' => [], 'themes' => []];
+    foreach (['plugins', 'themes'] as $kind) {
+        $kindDir = $dstUser . '/' . $kind;
+        if (!is_dir($kindDir)) continue;
+        foreach (scandir($kindDir) ?: [] as $slug) {
+            if ($slug === '.' || $slug === '..' || $slug[0] === '.') continue;
+            if (is_link($kindDir . '/' . $slug)) $symlinkedSlugs[$kind][] = $slug;
+        }
+    }
 
-    // ─── Phase 3: overwrite auto-updatable plugins/themes with GPM 2.0 ───────
-    // Compat plugins/themes with a newer GPM version get their staged dir
-    // replaced with the fresh download. Skip-policy incompatibles have
-    // already been removed in Phase 2, so they're never re-installed here.
+    // ─── Phase 3: neutralize superseded plugins against gpm dep resolution ──
+    // Two cooperating tricks so gpm leaves admin (et al.) alone:
+    //   (a) Exclude superseded slugs from gpm's positional allowlist so they
+    //       aren't directly listed for update.
+    //   (b) Pin each superseded plugin's blueprints `version:` to gpm's
+    //       reported latest. gpm's getDependencies() removes any installed
+    //       dep where `currentlyInstalledVersion === latestRelease` from the
+    //       dep list — so transitive declarations like
+    //       `dependencies: [{name: admin, version: '>=1.7.4'}]`
+    //       (data-manager, login-ldap, ...) won't drag admin back in.
+    // Without (b), `bin/gpm update -y` would mark admin as an 'ignore'-type
+    // transitive dep, then with -y still install it (the install command
+    // treats -y as auto-yes for ignore-type deps too).
+    // We don't restore the pinned version — the dir gets deleted in
+    // Phase 4.5 anyway.
+    $supersededPluginSlugs = [];
+    foreach (array_keys($superseded) as $label) {
+        if (!str_starts_with($label, 'plugins/')) continue;
+        $supersededPluginSlugs[] = substr($label, strlen('plugins/'));
+    }
+    $gpmPluginsIndex = $scan['gpm']['plugins'] ?? [];
+    foreach ($supersededPluginSlugs as $slug) {
+        $latest = (string) ($gpmPluginsIndex[$slug]['version'] ?? '');
+        if ($latest === '') continue;
+        $bpPath = $stageRoot . '/user/plugins/' . $slug . '/blueprints.yaml';
+        if (!is_file($bpPath)) continue;
+        $bpContent = @file_get_contents($bpPath);
+        if (!is_string($bpContent) || $bpContent === '') continue;
+        $patched = preg_replace(
+            '/^version:\s*[\'"]?[0-9A-Za-z.\-]+[\'"]?\s*$/m',
+            "version: {$latest}",
+            $bpContent,
+            1
+        );
+        if (is_string($patched) && $patched !== $bpContent) {
+            @file_put_contents($bpPath, $patched);
+        }
+    }
+
+    // ─── Phase 4: bring installed plugins/themes up to their 2.0 versions ──
+    // Shell out to the staged Grav 2.0's `bin/gpm update -p -y` for plugins
+    // (gpm itself enforces 2.0-compat — only compatible upgrades land).
+    // Symlinked slugs AND superseded slugs excluded via positional allowlist.
+    // Themes still use the per-slug zip path. Running BEFORE policy so the
+    // post-upgrade re-scan reflects what gpm actually did, and policy only
+    // kicks in for plugins gpm couldn't rescue.
     $upgraded = [];
+    $gpmResult = null;
     if ($autoUpdate) {
-        foreach (['plugins', 'themes'] as $kind) {
-            foreach (($scan[$kind] ?? []) as $slug => $verdict) {
-                $update = $verdict['update'] ?? null;
-                if (!$update || empty($update['download']) || empty($update['to'])) continue;
-
-                $dst = $dstUser . '/' . $kind . '/' . $slug;
-                if (!is_dir($dst)) continue; // removed by policy (or never copied)
-
-                if ($progress) $progress(['phase' => 'start', 'entry' => "update/{$kind}/{$slug}"]);
-
-                $res = mg_install_zip_url($webroot, $stageDir, $kind, $slug, $update['download']);
-                if ($res['ok']) {
-                    $upgraded["{$kind}/{$slug}"] = ['to' => $update['to'], 'from' => $verdict['installed_version'] ?? ''];
-                    if ($progress) $progress(['phase' => 'done-entry', 'entry' => "update/{$kind}/{$slug}"]);
-                } else {
-                    if ($progress) $progress(['phase' => 'skip', 'entry' => "update/{$kind}/{$slug}", 'reason' => $res['msg']]);
+        $gpmExclude = array_values(array_unique(array_merge($symlinkedSlugs['plugins'], $supersededPluginSlugs)));
+        $gpmResult = mg_gpm_update($stageRoot, 'plugins', $gpmExclude, $progress);
+        if ($gpmResult['ok']) {
+            // gpm reports display names, not slugs. Resolve back to slug via
+            // the scan's blueprint metadata so upgraded[] keys match the
+            // slug-keyed convention used by the themes path below.
+            $nameToSlug = [];
+            foreach (($scan['plugins'] ?? []) as $s => $v) {
+                $n = (string) ($v['name'] ?? '');
+                if ($n !== '') $nameToSlug[$n] = $s;
+            }
+            $supersededSet = array_flip($supersededPluginSlugs);
+            foreach ($gpmResult['updated'] as $name => $version) {
+                $slug = $nameToSlug[$name] ?? '';
+                // Hide superseded slugs from the upgraded report — even if the
+                // pinning trick above didn't fully suppress gpm's dep handling,
+                // the dir gets removed in Phase 4.5 and is replaced by admin2/api.
+                if ($slug !== '' && isset($supersededSet[$slug])) continue;
+                if ($slug === '') {
+                    $upgraded["plugins/{$name}"] = ['to' => $version, 'from' => ''];
+                    continue;
                 }
+                $from = (string) ($scan['plugins'][$slug]['installed_version'] ?? '');
+                $upgraded["plugins/{$slug}"] = ['to' => $version, 'from' => $from];
+            }
+        }
+
+        // Themes — existing per-slug path, skipping symlinked slugs.
+        $themeSymSet = array_flip($symlinkedSlugs['themes']);
+        foreach (($scan['themes'] ?? []) as $slug => $verdict) {
+            if (isset($themeSymSet[$slug])) continue;
+            $update = $verdict['update'] ?? null;
+            if (!$update || empty($update['download']) || empty($update['to'])) continue;
+
+            $dst = $dstUser . '/themes/' . $slug;
+            if (!is_dir($dst) || is_link($dst)) continue;
+
+            if ($progress) $progress(['phase' => 'start', 'entry' => "update/themes/{$slug}"]);
+
+            $res = mg_install_zip_url($webroot, $stageDir, 'themes', $slug, $update['download']);
+            if ($res['ok']) {
+                $upgraded["themes/{$slug}"] = ['to' => $update['to'], 'from' => $verdict['installed_version'] ?? ''];
+                if ($progress) $progress(['phase' => 'done-entry', 'entry' => "update/themes/{$slug}"]);
+            } else {
+                if ($progress) $progress(['phase' => 'skip', 'entry' => "update/themes/{$slug}", 'reason' => $res['msg']]);
             }
         }
     }
 
-    // ─── Phase 4: install replacements (admin2, api, etc.) ───────────────────
+    // ─── Phase 4.5: delete superseded plugin dirs ───────────────────────────
+    // Now that gpm has had its dep-resolution pass with these dirs in place,
+    // we can remove them. Their replacements (admin2, api, …) are installed
+    // in Phase 7 by mg_install_replacements.
+    $supersedeResult = mg_handle_supersedes($stageRoot, $superseded, $progress);
+
+    // ─── Phase 5: re-scan compat on the staged tree (post-upgrade) ──────────
+    // Verdicts now reflect whatever gpm actually installed — a plugin that
+    // was 1.7-only on the source but got upgraded to a 2.0-compat release
+    // reads `compatible` here, so policy won't touch it.
+    $postScan = mg_rescan_staged($dstUser, $scan);
+
+    // ─── Phase 6: apply policy to plugins still incompatible after upgrade ─
+    // In strict mode, this is the small residual set gpm couldn't rescue.
+    // In test mode, nothing gets disabled/skipped at all (effective=compat).
+    $policyResult = mg_apply_plugin_policy($stageRoot, $postScan, $policy, $mode, $progress);
+    $disabled = array_map(static fn($s) => "plugins/{$s}", $policyResult['disabled']);
+    $skipped  = array_merge(
+        // mg_handle_supersedes already produces kind/slug-prefixed entries
+        $supersedeResult['skipped'],
+        array_map(static fn($s) => "plugins/{$s}", $policyResult['skipped'])
+    );
+
+    // ─── Phase 7: install replacements (admin2, api, etc.) ──────────────────
     $replacements = mg_install_replacements($webroot, $stageDir, $scan, $disabled, $skipped, $progress);
 
     // Derive the "actually copied" slug list per kind from the scan, minus
@@ -501,6 +676,8 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
         }
     }
 
+    $symlinkCount = count($symlinkedSlugs['plugins']) + count($symlinkedSlugs['themes']);
+
     $flag['step']           = 'plugins_done';
     $flag['plugins_themes'] = [
         'at'             => time(),
@@ -510,18 +687,30 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
         'copy_skipped'   => $copySkipped,
         'skipped'        => $skipped,
         'disabled'       => $disabled,
+        'mode'           => $mode,
         'policy'         => $policy,
         'auto_update'    => $autoUpdate,
         'upgraded'       => $upgraded,
+        'symlinked'      => $symlinkedSlugs,
+        'gpm_result'     => $gpmResult ? [
+            'ok'      => $gpmResult['ok'],
+            'msg'     => $gpmResult['msg'],
+            'updated' => $gpmResult['updated'],
+        ] : null,
         'replacements'   => $replacements,
+        'force_included' => $policyResult['force_included'] ?? [],
     ];
     save_flag($webroot . '/.migrating', $flag);
 
     $msg = "Copied {$copied} files across user/ (" . count($copiedEntries) . ' top-level entries)';
+    if ($mode !== MG_MODE_STRICT) $msg .= "; mode: {$mode}";
+    if (!empty($policyResult['force_included'])) $msg .= '; force-included ' . count($policyResult['force_included']);
     if ($upgraded) $msg .= "; updated " . count($upgraded);
+    if ($symlinkCount) $msg .= "; preserved {$symlinkCount} symlink(s)";
     if ($disabled) $msg .= "; disabled " . count($disabled);
     if ($skipped)  $msg .= "; skipped " . count($skipped);
     if (!empty($replacements['installed'])) $msg .= "; installed " . count($replacements['installed']) . " replacement(s)";
+    if ($gpmResult && !$gpmResult['ok']) $msg .= "; gpm: " . $gpmResult['msg'];
     return ['ok' => true, 'msg' => $msg . '.'];
 }
 
@@ -795,6 +984,54 @@ function mg_read_defines_version(string $path): ?string
 }
 
 /**
+ * Peek into the staged Grav zip to read GRAV_VERSION from system/defines.php
+ * without extracting. Used by the wizard's pre-extraction view so users can
+ * see exactly what version they're about to install. Returns null if the zip
+ * is unreadable or doesn't contain a recognizable defines.php.
+ */
+function mg_read_grav_version_from_zip(string $zipPath): ?string
+{
+    if (!is_file($zipPath)) return null;
+    $zip = new ZipArchive();
+    if ($zip->open($zipPath) !== true) return null;
+
+    $found = null;
+    for ($i = 0, $n = $zip->numFiles; $i < $n; $i++) {
+        $name = $zip->getNameIndex($i);
+        if ($name === false) continue;
+        // Match system/defines.php at any depth (zip may have a wrapper prefix
+        // like grav-admin/ or grav-update/).
+        if (!preg_match('~(?:^|/)system/defines\.php$~', $name)) continue;
+        $raw = $zip->getFromIndex($i);
+        if ($raw === false) continue;
+        if (preg_match("/define\\(\\s*['\"]GRAV_VERSION['\"]\\s*,\\s*['\"]([^'\"]+)['\"]/", $raw, $m)) {
+            $found = $m[1];
+            break;
+        }
+    }
+    $zip->close();
+    return $found;
+}
+
+/**
+ * Get the staged zip's Grav version, caching it in the flag so we only
+ * crack the zip once. Returns null when the zip is missing or unreadable.
+ */
+function mg_staged_zip_version(string $webroot, array &$flag): ?string
+{
+    $cached = $flag['staged_zip_version'] ?? null;
+    if (is_string($cached) && $cached !== '') return $cached;
+
+    $stagedZipRel = (string) ($flag['staged_zip'] ?? 'tmp/grav-2.0-staged.zip');
+    $version = mg_read_grav_version_from_zip($webroot . '/' . ltrim($stagedZipRel, '/'));
+    if ($version !== null) {
+        $flag['staged_zip_version'] = $version;
+        save_flag($webroot . '/.migrating', $flag);
+    }
+    return $version;
+}
+
+/**
  * Add everything at the webroot to the zip EXCEPT the stage dir. Skips
  * symlinks (avoids chasing dev-env links into unrelated repos). Streams
  * progress per ~200 files for the UI.
@@ -849,22 +1086,31 @@ function mg_zip_webroot(ZipArchive $zip, string $webroot, string $skipTop, int &
 
 function mg_rm_tree(string $path): bool
 {
+    // Critical: never traverse INTO symlinks. The wizard's staged tree often
+    // contains symlinks to plugin source clones (a developer convenience), and
+    // RecursiveDirectoryIterator follows them by default, which would attempt
+    // to delete real source files. scandir() returns symlinks as plain entries
+    // we can identify via is_link() before deciding to recurse or just unlink.
     if (is_link($path) || is_file($path)) {
         return @unlink($path);
     }
     if (!is_dir($path)) {
         return true;
     }
-    $rii = new RecursiveIteratorIterator(
-        new RecursiveDirectoryIterator($path, RecursiveDirectoryIterator::SKIP_DOTS),
-        RecursiveIteratorIterator::CHILD_FIRST
-    );
+    $items = @scandir($path);
+    if ($items === false) {
+        return false;
+    }
     $ok = true;
-    foreach ($rii as $f) {
-        if ($f->isDir() && !$f->isLink()) {
-            $ok = @rmdir($f->getPathname()) && $ok;
+    foreach ($items as $item) {
+        if ($item === '.' || $item === '..') continue;
+        $sub = $path . DIRECTORY_SEPARATOR . $item;
+        if (is_link($sub)) {
+            $ok = @unlink($sub) && $ok;
+        } elseif (is_dir($sub)) {
+            $ok = mg_rm_tree($sub) && $ok;
         } else {
-            $ok = @unlink($f->getPathname()) && $ok;
+            $ok = @unlink($sub) && $ok;
         }
     }
     return @rmdir($path) && $ok;
@@ -1269,9 +1515,17 @@ function mg_install_zip_url(string $webroot, string $stageDir, string $kind, str
 }
 
 /**
- * Ask GitHub for the latest tagged release of <owner>/<repo>. If none exists,
- * fall back to the default-branch zipball and mark the version as "1.0.0"
- * (sentinel for "published before first tagged release"). Returns:
+ * Ask GitHub for the latest tagged release of <owner>/<repo>. Three-tier:
+ *   1. /releases/latest    — full releases only (excludes pre-releases)
+ *   2. /releases           — full list, picks newest non-draft (incl. betas)
+ *   3. default-branch HEAD — last-resort sentinel marked version "1.0.0"
+ *
+ * Tier 2 is what catches plugins like admin2/api during the 2.0 beta line:
+ * they only ship pre-release tags, /releases/latest silently 404s for those,
+ * and without this tier the fallback would install untagged HEAD — which is
+ * exactly the surprise we want to avoid for replacement installs.
+ *
+ * Returns:
  *   ['zipball' => URL, 'version' => string, 'source' => 'release'|'default-branch']
  */
 function mg_github_resolve_download(string $repo): array
@@ -1285,6 +1539,7 @@ function mg_github_resolve_download(string $repo): array
         'ssl'  => ['verify_peer' => true, 'verify_peer_name' => true],
     ]);
 
+    // Tier 1: /releases/latest (excludes pre-releases by GitHub's design).
     $raw = @file_get_contents("https://api.github.com/repos/{$repo}/releases/latest", false, $ctx);
     if ($raw !== false) {
         $data = json_decode($raw, true);
@@ -1298,6 +1553,27 @@ function mg_github_resolve_download(string $repo): array
         }
     }
 
+    // Tier 2: /releases — newest non-draft entry, pre-releases included.
+    // GitHub orders the list by created_at desc by default, so the first
+    // non-draft release is the newest tag.
+    $raw = @file_get_contents("https://api.github.com/repos/{$repo}/releases?per_page=10", false, $ctx);
+    if ($raw !== false) {
+        $list = json_decode($raw, true);
+        if (is_array($list)) {
+            foreach ($list as $rel) {
+                if (!is_array($rel) || !empty($rel['draft'])) continue;
+                if (empty($rel['zipball_url'])) continue;
+                $tag = (string) ($rel['tag_name'] ?? '1.0.0');
+                return [
+                    'zipball' => $rel['zipball_url'],
+                    'version' => ltrim($tag, 'v'),
+                    'source'  => 'release',
+                ];
+            }
+        }
+    }
+
+    // Tier 3: default-branch HEAD.
     return [
         'zipball' => "https://api.github.com/repos/{$repo}/zipball",
         'version' => '1.0.0',
@@ -1306,10 +1582,220 @@ function mg_github_resolve_download(string $repo): array
 }
 
 /**
+ * Locate a CLI php binary suitable for running scripts as argv[1].
+ *
+ * PHP_BINARY is unreliable from a SAPI context — it can be empty, or it can
+ * point at php-fpm (which is a daemon, not a script runner). We try, in
+ * order:
+ *   1. Sibling /bin/php next to PHP_BINARY's grandparent dir — handles the
+ *      Homebrew layout where PHP_BINARY is `…/sbin/php-fpm` and the matching
+ *      CLI lives at `…/bin/php`.
+ *   2. PHP_BINARY itself if it's executable and doesn't look like FPM/CGI.
+ *   3. Common system locations: /usr/local/bin/php, /opt/homebrew/bin/php,
+ *      /usr/bin/php.
+ *   4. Bare "php" — proc_open's argv form does PATH lookup when the program
+ *      name has no slash, so this is the last-resort fallback.
+ *
+ * Returns null only if every option fails the executable check (rare).
+ */
+function mg_find_php_cli(): ?string
+{
+    $bin = (defined('PHP_BINARY') && is_string(PHP_BINARY)) ? PHP_BINARY : '';
+
+    if ($bin !== '' && is_executable($bin)) {
+        $base = basename($bin);
+        // Sibling bin/php — works for Homebrew sbin/php-fpm → bin/php
+        $sibling = dirname(dirname($bin)) . '/bin/php';
+        if (is_executable($sibling) && basename($sibling) === 'php') {
+            return $sibling;
+        }
+        // PHP_BINARY itself, if it's plain `php` (not -fpm, -cgi, etc.)
+        if ($base === 'php' || preg_match('/^php-?[0-9]/', $base)) {
+            return $bin;
+        }
+    }
+
+    foreach (['/usr/local/bin/php', '/opt/homebrew/bin/php', '/usr/bin/php'] as $candidate) {
+        if (is_executable($candidate)) return $candidate;
+    }
+
+    // Rely on PATH — proc_open argv form resolves bare names against PATH.
+    return 'php';
+}
+
+/**
+ * Run the staged Grav 2.0's `bin/gpm update` to bring installed plugins
+ * (or themes) up to their latest compatible versions on the 2.0 channel.
+ *
+ * $kind  is 'plugins' or 'themes'.
+ * $excludeSlugs is the list of slugs to leave alone — typically symlinked
+ *   slugs that we don't want gpm to overwrite (gpm replaces plugin dirs
+ *   wholesale; running update on a symlinked dir would unlink the symlink
+ *   and extract a fresh zip in its place, silently breaking dev wiring).
+ *   If non-empty, we enumerate the rest as positional args (gpm interprets
+ *   positional args as an allowlist).
+ *
+ * Streams gpm's stdout line-by-line into $progress so the wizard UI can
+ * render a moving status (gpm prints one or two lines per package).
+ *
+ * Returns ['ok', 'msg', 'updated' => [slug => version], 'skipped' => [...],
+ * 'output' => string].
+ */
+function mg_gpm_update(string $stageRoot, string $kind, array $excludeSlugs, ?callable $progress): array
+{
+    if (!in_array($kind, ['plugins', 'themes'], true)) {
+        return ['ok' => false, 'msg' => "invalid kind: {$kind}", 'updated' => [], 'skipped' => [], 'output' => ''];
+    }
+
+    // Defensive — gpm update of 50+ packages routinely runs longer than the
+    // default 30s execution limit, even though mg_stream_setup already
+    // disables it for streaming pages.
+    @set_time_limit(0);
+
+    // popen / proc_open availability — some shared hosts disable them.
+    $disabled = array_map('trim', explode(',', (string) ini_get('disable_functions')));
+    if (in_array('proc_open', $disabled, true) || !function_exists('proc_open')) {
+        return ['ok' => false, 'msg' => 'PHP proc_open() is disabled — cannot invoke staged bin/gpm update', 'updated' => [], 'skipped' => [], 'output' => ''];
+    }
+
+    $bin = $stageRoot . '/bin/gpm';
+    if (!is_file($bin)) {
+        return ['ok' => false, 'msg' => "Staged bin/gpm not found at {$bin}", 'updated' => [], 'skipped' => [], 'output' => ''];
+    }
+
+    $kindFlag = $kind === 'themes' ? '-t' : '-p';
+
+    // If we have exclusions, build an allowlist of (installed slugs) − (excluded).
+    $allowSlugs = [];
+    if (!empty($excludeSlugs)) {
+        $excludeSet = array_flip($excludeSlugs);
+        $dir = $stageRoot . '/user/' . $kind;
+        if (is_dir($dir)) {
+            foreach (scandir($dir) ?: [] as $slug) {
+                if ($slug === '.' || $slug === '..' || $slug[0] === '.') continue;
+                if (isset($excludeSet[$slug])) continue;
+                if (!is_dir($dir . '/' . $slug)) continue;
+                $allowSlugs[] = $slug;
+            }
+        }
+        if (empty($allowSlugs)) {
+            return ['ok' => true, 'msg' => "No {$kind} to update (all installed are symlinked or excluded).", 'updated' => [], 'skipped' => $excludeSlugs, 'output' => ''];
+        }
+    }
+
+    // Resolve a CLI php binary. PHP_BINARY isn't reliable here — it can be
+    // empty (some FPM/SAPI builds), or it can point at php-fpm itself
+    // (Homebrew layouts) which can't run a script as argv[1]. Prefer in
+    // order: a sibling /bin/php next to PHP_BINARY (Homebrew sbin/php-fpm
+    // → bin/php), then PHP_BINARY if it looks CLI, then common system
+    // paths, then bare "php" (PATH lookup).
+    $phpBin = mg_find_php_cli();
+    if ($phpBin === null) {
+        return ['ok' => false, 'msg' => 'Could not locate a CLI php binary to run bin/gpm update', 'updated' => [], 'skipped' => [], 'output' => ''];
+    }
+
+    $argv = [$phpBin, $bin, 'update', $kindFlag, '-y'];
+    foreach ($allowSlugs as $s) $argv[] = $s;
+
+    $desc = [
+        0 => ['file', '/dev/null', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ];
+
+    $proc = @proc_open($argv, $desc, $pipes, $stageRoot);
+    if (!is_resource($proc)) {
+        return ['ok' => false, 'msg' => "proc_open failed for {$phpBin} bin/gpm update", 'updated' => [], 'skipped' => [], 'output' => ''];
+    }
+
+    stream_set_blocking($pipes[1], false);
+    stream_set_blocking($pipes[2], false);
+
+    // gpm's output (per package) looks like:
+    //   Preparing to install Login OAuth2 [v2.2.6]
+    //     |- Downloading package...   100%
+    //     |- Checking destination...  ok
+    //     |- Installing package...    ok
+    //     '- Success!
+    // We track the current package name + version from "Preparing to install"
+    // and record it in $updated when "Success!" arrives. Sub-steps drive a
+    // generic "log" tick so the wizard UI moves while gpm is doing its thing.
+    $updated  = [];
+    $output   = '';
+    $buffers  = ['', ''];
+    $curName  = '';
+    $curVer   = '';
+
+    while (true) {
+        $r = [$pipes[1], $pipes[2]];
+        $w = $e = null;
+        if (@stream_select($r, $w, $e, 1) === false) break;
+
+        foreach ($r as $stream) {
+            $idx  = ($stream === $pipes[1]) ? 0 : 1;
+            $data = @fread($stream, 4096);
+            if ($data === false || $data === '') continue;
+
+            $buffers[$idx] .= $data;
+            while (($nl = strpos($buffers[$idx], "\n")) !== false) {
+                $line = rtrim(substr($buffers[$idx], 0, $nl), "\r");
+                $buffers[$idx] = substr($buffers[$idx], $nl + 1);
+                if ($line === '') continue;
+
+                $output .= $line . "\n";
+
+                // Strip ANSI colour escapes.
+                $clean = preg_replace('/\e\[[0-9;]*m/', '', $line);
+
+                if (preg_match('/^Preparing to install\s+(.+?)\s+\[v?([^\]]+)\]\s*$/', $clean, $m)) {
+                    $curName = trim($m[1]);
+                    $curVer  = trim($m[2]);
+                    if ($progress) $progress(['phase' => 'start', 'entry' => "gpm/{$kind}/{$curName}", 'reason' => "v{$curVer}"]);
+                } elseif (preg_match("/^\s*'-\s*Success!\s*$/", $clean)) {
+                    if ($curName !== '') {
+                        $updated[$curName] = $curVer;
+                        if ($progress) $progress(['phase' => 'done-entry', 'entry' => "gpm/{$kind}/{$curName}", 'reason' => "v{$curVer}"]);
+                    }
+                    $curName = '';
+                    $curVer  = '';
+                } elseif (preg_match('/^\s*\|-\s*(Downloading package|Checking destination|Installing package)/', $clean, $m)) {
+                    if ($progress && $curName !== '') {
+                        $progress(['phase' => 'log', 'entry' => "gpm/{$kind}/{$curName}", 'reason' => rtrim($m[1], '.')]);
+                    }
+                } elseif ($progress) {
+                    // Anything else (errors, "Nothing to update", header lines)
+                    // — surface as a log tick so the wizard UI keeps moving.
+                    $progress(['phase' => 'log', 'entry' => "gpm/{$kind}", 'reason' => substr($clean, 0, 200)]);
+                }
+            }
+        }
+
+        $status = @proc_get_status($proc);
+        if (is_array($status) && !$status['running'] && feof($pipes[1]) && feof($pipes[2])) break;
+    }
+
+    foreach ($buffers as $rem) if ($rem !== '') $output .= $rem . "\n";
+    @fclose($pipes[1]);
+    @fclose($pipes[2]);
+    $code = proc_close($proc);
+
+    return [
+        'ok'      => $code === 0,
+        'msg'     => $code === 0
+            ? sprintf('gpm update %s: %d package(s) touched', $kind, count($updated))
+            : "gpm update {$kind} exited {$code}",
+        'updated' => $updated,
+        'skipped' => $excludeSlugs,
+        'output'  => $output,
+    ];
+}
+
+/**
  * Copy the entire source user/ tree into the staged install verbatim.
- * Top-level dotfiles/dotdirs (.git, .DS_Store, editor backups) and
- * top-level symlinks are skipped as filesystem/dev-env cruft. copy_tree
- * handles symlinked directories encountered mid-tree. Downstream phases
+ * Top-level dotfiles/dotdirs (.git, .DS_Store, editor backups) are skipped
+ * as filesystem cruft. Symlinks (top-level and mid-tree) are preserved as
+ * symlinks so dev environments with linked plugin/theme clones keep their
+ * wiring in the staged tree. Downstream phases
  * mutate the staged tree in place (plugin policy, auto-updates, account
  * perm mirror). Appends skipped entries to $copySkipped with a reason
  * tag, and appends successfully-copied top-level names to $copiedEntries.
@@ -1330,8 +1816,17 @@ function mg_bulk_copy_user(string $srcUser, string $dstUser, int &$copied, ?call
         $dst = $dstUser . '/' . $entry;
 
         if (is_link($src)) {
-            $copySkipped[] = "{$entry} (symlink)";
-            if ($progress) $progress(['phase' => 'skip', 'entry' => "user/{$entry}", 'reason' => 'symlink', 'copied' => $copied]);
+            // Preserve top-level symlinks (e.g. user/plugins itself being a
+            // symlink — unusual but possible in shared multi-site setups).
+            // copy_tree handles deeper symlinks the same way.
+            $target = @readlink($src);
+            if (is_string($target) && $target !== '' && @symlink($target, $dst)) {
+                $copiedEntries[] = $entry;
+                if ($progress) $progress(['phase' => 'done-entry', 'entry' => "user/{$entry}", 'reason' => 'symlink preserved', 'copied' => $copied]);
+            } else {
+                $copySkipped[] = "{$entry} (symlink, could not preserve)";
+                if ($progress) $progress(['phase' => 'skip', 'entry' => "user/{$entry}", 'reason' => 'symlink (could not preserve)', 'copied' => $copied]);
+            }
             continue;
         }
 
@@ -1368,34 +1863,53 @@ function mg_bulk_copy_user(string $srcUser, string $dstUser, int &$copied, ?call
  * ['skipped' => [...], 'disabled' => [...]] (bare slug names; caller
  * prefixes with "plugins/" for summary).
  */
-function mg_apply_plugin_policy(string $webroot, string $stageDir, array $scan, string $policy, array $superseded, ?callable $progress): array
+/**
+ * Apply the chosen compat policy to staged plugins, using POST-UPGRADE
+ * verdicts (mg_rescan_staged result). Symlinked dirs are left alone —
+ * dev environments choose their own versions and we don't second-guess
+ * them. Supersedes are handled in their own phase before this runs.
+ *
+ * Returns ['skipped', 'disabled', 'force_included'].
+ */
+function mg_apply_plugin_policy(string $stageRoot, array $postScan, string $policy, string $mode, ?callable $progress): array
 {
-    $skipped   = [];
-    $disabled  = [];
-    $stageRoot = $webroot . '/' . $stageDir;
-    $pluginDir = $stageRoot . '/user/plugins';
-    if (!is_dir($pluginDir)) return ['skipped' => $skipped, 'disabled' => $disabled];
+    $skipped       = [];
+    $disabled      = [];
+    $forceIncluded = []; // slugs that strict would have flagged as incompatible
+                         // but the chosen mode promoted to compatible
+    $pluginDir     = $stageRoot . '/user/plugins';
+    if (!is_dir($pluginDir)) {
+        return ['skipped' => $skipped, 'disabled' => $disabled, 'force_included' => $forceIncluded];
+    }
 
-    $verdicts = $scan['plugins'] ?? [];
+    $verdicts = $postScan['plugins'] ?? [];
 
     foreach (scandir($pluginDir) ?: [] as $slug) {
         if ($slug === '.' || $slug === '..') continue;
         if ($slug[0] === '.') continue;
         $slugDir = $pluginDir . '/' . $slug;
+
+        // Symlinked plugins: dev clones, leave alone.
+        if (is_link($slugDir)) continue;
         if (!is_dir($slugDir)) continue;
 
         $label = "plugins/{$slug}";
 
-        if (isset($superseded[$label])) {
-            $replSlug = $superseded[$label];
-            remove_dir($slugDir);
-            $skipped[] = $slug . " (superseded by {$replSlug})";
-            if ($progress) $progress(['phase' => 'skip', 'entry' => $label, 'reason' => "superseded by {$replSlug}"]);
-            continue;
+        $rawVerdict = $verdicts[$slug] ?? ['status' => 'unknown'];
+        $rawStatus  = (string) ($rawVerdict['status'] ?? 'unknown');
+        $effective  = mg_effective_status($rawVerdict, $mode);
+
+        // Track plugins that strict mode would mark incompatible but the
+        // chosen mode is force-including. Used for the test-step report.
+        if ($effective === 'compatible' && $rawStatus !== 'compatible' && $rawStatus !== 'needs_update') {
+            $forceIncluded[] = [
+                'slug'   => $slug,
+                'reason' => (string) ($rawVerdict['reason'] ?? 'inferred 1.7-only'),
+                'source' => (string) ($rawVerdict['source'] ?? 'default'),
+            ];
         }
 
-        $verdict = $verdicts[$slug]['status'] ?? 'unknown';
-        if ($verdict === 'compatible') continue;
+        if ($effective === 'compatible' || $effective === 'needs_update') continue;
 
         if ($policy === 'skip') {
             remove_dir($slugDir);
@@ -1408,7 +1922,61 @@ function mg_apply_plugin_policy(string $webroot, string $stageDir, array $scan, 
         }
     }
 
-    return ['skipped' => $skipped, 'disabled' => $disabled];
+    return ['skipped' => $skipped, 'disabled' => $disabled, 'force_included' => $forceIncluded];
+}
+
+/**
+ * Re-scan compatibility on the STAGED tree after the gpm upgrade pass has
+ * run. Returns a fresh ['plugins' => [slug => verdict], 'themes' => [...]]
+ * map, where verdicts reflect the post-upgrade blueprint state — so a
+ * plugin that was 1.7-only on disk but got upgraded to a 2.0-compatible
+ * release reads as `compatible` here.
+ *
+ * Reuses the source scan's cached curated registry + gpm index so we
+ * don't pay another network round-trip.
+ */
+function mg_rescan_staged(string $stagedUserDir, array $sourceScan): array
+{
+    $curated = $sourceScan['curated'] ?? null;
+    $gpm     = $sourceScan['gpm']     ?? ['plugins' => null, 'themes' => null];
+    return [
+        'plugins' => mg_scan_category($stagedUserDir . '/plugins', 'plugins', $curated, $gpm['plugins'] ?? null),
+        'themes'  => mg_scan_category($stagedUserDir . '/themes',  'themes',  $curated, $gpm['themes']  ?? null),
+    ];
+}
+
+/**
+ * Remove staged dirs for slugs the curated registry has marked as
+ * superseded by a different package (admin → admin2, etc.). Runs AFTER
+ * the gpm update pass — keeping the old slug on disk during gpm prevents
+ * its dependents (data-manager etc. which declare `admin` as a dep) from
+ * triggering a missing-dep reinstall. The slug is also excluded from
+ * gpm's update allowlist so gpm leaves it alone version-wise. The actual
+ * replacement is installed later by mg_install_replacements. Idempotent.
+ */
+function mg_handle_supersedes(string $stageRoot, array $superseded, ?callable $progress): array
+{
+    $skipped = [];
+    foreach ($superseded as $label => $replSlug) {
+        $parts = explode('/', $label, 2);
+        if (count($parts) !== 2) continue;
+        [$kind, $slug] = $parts;
+        if (!in_array($kind, ['plugins', 'themes'], true)) continue;
+
+        $path = $stageRoot . '/user/' . $kind . '/' . $slug;
+        if (!file_exists($path) && !is_link($path)) continue;
+
+        if (is_link($path)) {
+            @unlink($path);
+        } else {
+            remove_dir($path);
+        }
+        // Already kind/slug-prefixed (e.g. "plugins/admin (superseded by admin2)")
+        // so the caller can merge straight into the summary skipped[] list.
+        $skipped[] = $label . " (superseded by {$replSlug})";
+        if ($progress) $progress(['phase' => 'skip', 'entry' => $label, 'reason' => "superseded by {$replSlug}"]);
+    }
+    return ['skipped' => $skipped];
 }
 
 function mg_write_plugin_disable(string $stageRoot, string $slug): void
@@ -1444,15 +2012,23 @@ function mg_compat_scan_cached(string $webroot, array &$flag): array
     }
 
     $curated  = mg_fetch_curated();
+
+    // Use the staged Grav 2.0 version (and current PHP) so the catalog
+    // returns each plugin's newest release that's actually compatible with
+    // the migration target. Falls back to '2.0.0' when the zip hasn't been
+    // cracked yet — still a 2.x query, just less specific.
+    $stagedGrav = mg_staged_zip_version($webroot, $flag) ?? '';
+    $php        = PHP_VERSION;
     $gpm = [
-        'plugins' => mg_fetch_gpm_index('plugins'),
-        'themes'  => mg_fetch_gpm_index('themes'),
+        'plugins' => mg_fetch_gpm_index('plugins', $stagedGrav, $php),
+        'themes'  => mg_fetch_gpm_index('themes',  $stagedGrav, $php),
     ];
 
     $scan = [
         'at'      => time(),
         'source'  => $curated !== null ? 'remote' : 'offline',
         'gpm'     => $gpm,  // Cached so install paths can prefer GPM URLs over github_repo fallback.
+        'curated' => $curated, // Cached so mg_rescan_staged() can re-verdict the post-upgrade staged tree without a second fetch.
         'plugins' => mg_scan_category($webroot . '/user/plugins', 'plugins', $curated, $gpm['plugins']),
         'themes'  => mg_scan_category($webroot . '/user/themes',  'themes',  $curated, $gpm['themes']),
     ];
@@ -1461,6 +2037,14 @@ function mg_compat_scan_cached(string $webroot, array &$flag): array
     // (replaced_by target + its transitive `requires:`) so the UI shows
     // matching info to what the install path will actually do.
     $scan['github_versions'] = mg_resolve_pending_versions($scan, $curated, $gpm);
+
+    // No separate "pending update" pre-flight: pending updates are now
+    // derived from the same v=<staged 2.0> + php=<current> GPM query that
+    // mg_fetch_gpm_index() already ran. mg_resolve_update() (called by
+    // mg_scan_category) writes the result into $verdict['update'], and the
+    // UI badge falls back to it. Querying the source 1.7 install's bin/gpm
+    // would filter the catalog with v=1.7.x and miss the 2.0-line upgrades
+    // that are the whole point of the migration.
 
     $flag['compat_scan'] = $scan;
     save_flag($webroot . '/.migrating', $flag);
@@ -1533,6 +2117,9 @@ function mg_scan_category(string $dir, string $kind, ?array $curated, ?array $gp
 
         $verdict = mg_resolve_compat($slug, $installedVersion, $bp, $curated[$kind] ?? []);
         $verdict['installed_version'] = $installedVersion;
+        // Display name from the blueprint — used when matching gpm output back
+        // to slug ("Preparing to install Login OAuth2 [v2.2.6]" → login-oauth2).
+        $verdict['name'] = (string) ($bp['name'] ?? '');
 
         // Annotate with GPM-available update if applicable.
         $verdict['update'] = mg_resolve_update($slug, $installedVersion, $verdict, $gpmIndex);
@@ -1547,14 +2134,22 @@ function mg_scan_category(string $dir, string $kind, ?array $curated, ?array $gp
  * Decide whether the GPM-listed latest version is an "update worth taking"
  * during 2.0 migration. Returns ['to' => version, 'download' => url] or null.
  *
- * Rules (curated registry is authoritative for compat target):
+ * Trust model: mg_fetch_gpm_index() pins the catalog query to v=<staged Grav
+ * 2.0> + php=<current>, so any version returned here has already been
+ * filtered by getgrav.org against the destination's dependency + blueprint
+ * compatibility constraints. We accept the suggested upgrade unless the
+ * curated registry explicitly forbids it.
+ *
+ * Rules:
  *   - Only consider plugins/themes with an entry in the GPM index.
- *   - If the curated entry says the slug supports 2.0 AND has a
- *     minimum_version: only update when GPM latest >= minimum_version.
- *   - If the curated entry has no minimum_version: update whenever GPM
- *     latest > installed (we trust the curated 2.0 verdict).
- *   - For slugs without a curated 2.0 entry: don't auto-update — we have no
- *     signal that the latest is actually 2.0-compatible.
+ *   - Skip when latest <= installed (semver compare).
+ *   - Skip when the curated registry explicitly marks the slug as
+ *     2.0-incompatible (hard block — overrides the GPM filter).
+ *   - When curated supplies minimum_version, skip if GPM latest is below it.
+ *   - Otherwise: trust the GPM filter and offer the update. This is what lets
+ *     us surface major-line upgrades (e.g. page-toc 3.x → 4.x) for plugins
+ *     whose locally-installed blueprint is the legacy 1.x line and has no
+ *     explicit 2.0 compat marker.
  */
 function mg_resolve_update(string $slug, string $installedVersion, array $verdict, ?array $gpmIndex): ?array
 {
@@ -1565,12 +2160,14 @@ function mg_resolve_update(string $slug, string $installedVersion, array $verdic
     if ($latest === '' || $url === '') return null;
     if ($installedVersion !== '' && version_compare($latest, $installedVersion, '<=')) return null;
 
-    // Need positive 2.0 signal to take an update.
-    $curated2x = ($verdict['source'] === 'curated' && $verdict['status'] !== 'incompatible')
-              || ($verdict['status'] === 'needs_update');
-    if (!$curated2x) return null;
+    // Hard block: curated registry says this slug isn't 2.0-compatible at all.
+    // Even if GPM returned a newer version, the registry overrides — typically
+    // means the maintainer has marked it deprecated or replaced_by another slug.
+    if (($verdict['source'] ?? '') === 'curated' && ($verdict['status'] ?? '') === 'incompatible') {
+        return null;
+    }
 
-    // If curated has minimum_version, gate against it.
+    // Curated minimum_version still wins when set.
     $min = (string) ($verdict['min_version'] ?? '');
     if ($min !== '' && version_compare($latest, $min, '<')) return null;
 
@@ -1581,9 +2178,28 @@ function mg_resolve_update(string $slug, string $installedVersion, array $verdic
  * Fetch the GPM plugins.json or themes.json index and reshape to slug → entry.
  * Returns null on any network/parse failure (callers fall back gracefully).
  */
-function mg_fetch_gpm_index(string $kind): ?array
+/**
+ * Fetch a GPM index (plugins.json | themes.json) filtered for the target
+ * Grav + PHP version. v= and php= match the params Grav core sends from
+ * AbstractPackageCollection — required for the catalog to return the right
+ * "latest" per plugin when the plugin has multiple major lines (1.x vs 2.x).
+ *
+ * @param string $kind        'plugins' | 'themes'
+ * @param string $gravVersion Target Grav version (e.g. '2.0.0' or the staged
+ *                            zip's version). Empty falls back to '2.0.0' so
+ *                            migration always queries the 2.x catalog.
+ * @param string $phpVersion  Target PHP version. Defaults to PHP_VERSION since
+ *                            the wizard runs in the same process the staged
+ *                            install will run under.
+ */
+function mg_fetch_gpm_index(string $kind, string $gravVersion = '', string $phpVersion = ''): ?array
 {
-    $url = $kind === 'themes' ? MG_GPM_THEMES_URL : MG_GPM_PLUGINS_URL;
+    $base = $kind === 'themes' ? MG_GPM_THEMES_BASE : MG_GPM_PLUGINS_BASE;
+    $url  = $base . '?' . http_build_query([
+        'v'       => $gravVersion !== '' ? $gravVersion : '2.0.0',
+        'php'     => $phpVersion  !== '' ? $phpVersion  : PHP_VERSION,
+        'testing' => 1,
+    ]);
     $ctx = stream_context_create([
         'http' => ['timeout' => 6, 'ignore_errors' => true, 'header' => "User-Agent: grav-migrate-wizard/1.0\r\n"],
         'ssl'  => ['verify_peer' => true, 'verify_peer_name' => true],
@@ -1697,6 +2313,43 @@ function mg_resolve_compat(string $slug, string $installedVersion, array $bp, ar
 }
 
 /**
+ * Map a raw compat verdict (from mg_resolve_compat) to an effective status
+ * given the user's selected mode. Pure function — same input always yields
+ * same output. The raw scan is mode-agnostic so it can be cached once and
+ * reinterpreted as the user toggles modes during a re-run.
+ *
+ * Rules:
+ *   strict      — return verdict status as-is (current default behavior)
+ *   permissive  — promote default-inferred incompatibles to compatible, but
+ *                 respect curated explicit 1.x-only entries and supersedes
+ *   test        — promote everything to compatible, EXCEPT supersedes (those
+ *                 still get removed so the replacement plugin can be installed
+ *                 cleanly — installing both old + new would conflict)
+ *
+ * needs_update preserved across modes (it's a real signal — the user probably
+ * wants to know they're carrying forward an outdated version).
+ */
+function mg_effective_status(array $verdict, string $mode): string
+{
+    $raw = (string) ($verdict['status'] ?? 'incompatible');
+
+    if ($raw === 'compatible' || $raw === 'needs_update') return $raw;
+    // Supersedes are always honored — Phase 4 will install the replacement.
+    if (!empty($verdict['replaced_by'])) return 'incompatible';
+
+    if ($mode === MG_MODE_TEST) return 'compatible';
+
+    if ($mode === MG_MODE_PERMISSIVE) {
+        // Promote inferred/default incompatibles. Leave curated explicit
+        // 1.x-only entries alone — those have a real reason behind them.
+        $source = (string) ($verdict['source'] ?? 'default');
+        return $source === 'curated' ? 'incompatible' : 'compatible';
+    }
+
+    return 'incompatible';
+}
+
+/**
  * Port of Grav core's Local/Package::inferCompatibility for standalone use.
  */
 function mg_infer_compat_from_deps(array $dependencies): array
@@ -1714,7 +2367,7 @@ function mg_infer_compat_from_deps(array $dependencies): array
 }
 
 /**
- * Read a plugin/theme blueprints.yaml into the small array shape we need.
+ * Read a plugin/theme blueprints.yaml into the small array structure we need.
  * Uses ext-yaml when available; falls back to a narrow hand parser that
  * only understands: version, slug, compatibility.grav, dependencies (list
  * of {name, version} maps). Sufficient for all core Grav blueprints.
@@ -1772,8 +2425,18 @@ function copy_tree(string $src, string $dst, callable $onFile, string $prefix = 
         $dstPath = $dst . '/' . $entry;
         $rel     = $prefix === '' ? $entry : $prefix . '/' . $entry;
 
-        if (is_link($srcPath) && is_dir($srcPath)) {
-            // Skip symlinked dirs mid-tree too
+        if (is_link($srcPath)) {
+            // Preserve the symlink as-is. Common in dev environments where
+            // user/plugins/<slug> or user/themes/<slug> point to a sibling
+            // working clone — the staged tree should keep the same wiring so
+            // those clones remain live during testing. The downstream gpm
+            // update phase detects symlinked slugs and skips updating them
+            // (otherwise gpm would unlink the symlink and overwrite with a
+            // fresh zip).
+            $target = @readlink($srcPath);
+            if (is_string($target) && $target !== '') {
+                @symlink($target, $dstPath);
+            }
             continue;
         }
 
@@ -1799,6 +2462,14 @@ function ensure_dir(string $path): void
 
 function mg_stream_setup(string $title, string $subtitle): void
 {
+    // Streaming steps are inherently long-running — bulk copies, downloads,
+    // and gpm subprocess invocations routinely exceed PHP's default 30s
+    // max_execution_time. Disable the limit and ignore user abort so a
+    // user accidentally navigating away doesn't strand the migration in a
+    // half-applied state.
+    @set_time_limit(0);
+    @ignore_user_abort(true);
+
     @ini_set('zlib.output_compression', '0');
     @ini_set('output_buffering', '0');
     @ini_set('implicit_flush', '1');
@@ -1918,16 +2589,132 @@ function wizard_reset(string $webroot, string $stageDir): void
     }
 }
 
+/**
+ * Light reset: clear the stage dir + .htaccess patch, keep the staged zip and
+ * the wizard, and rewrite .migrating with only the kickoff-time keys (step
+ * rewound to 'staged'). Wizard run state (plugins_themes/accounts/content
+ * choices, _prev_options, etc.) is dropped so the rerun starts clean. Lets the
+ * user re-run the wizard without re-downloading Grav 2.0.
+ */
+function wizard_restart(string $webroot, string $flagPath, array $flag): void
+{
+    mg_unpatch_htaccess($webroot);
+
+    $stageDir  = trim((string) ($flag['stage_dir'] ?? 'grav-2'), '/');
+    $stagePath = $webroot . '/' . $stageDir;
+    if ($stageDir !== '' && is_dir($stagePath)) {
+        remove_dir($stagePath);
+    }
+
+    $minimal = array_filter([
+        'token'      => $flag['token']      ?? '',
+        'created'    => $flag['created']    ?? time(),
+        'step'       => 'staged',
+        'source'     => $flag['source']     ?? null,
+        'stage_dir'  => $flag['stage_dir']  ?? 'grav-2',
+        'staged_zip' => $flag['staged_zip'] ?? 'tmp/grav-2.0-staged.zip',
+        'wizard_url' => $flag['wizard_url'] ?? null,
+    ], static fn($v) => $v !== null && $v !== '');
+    save_flag($flagPath, $minimal);
+}
+
 function remove_dir(string $path): void
 {
-    $rii = new RecursiveIteratorIterator(
-        new RecursiveDirectoryIterator($path, RecursiveDirectoryIterator::SKIP_DOTS),
-        RecursiveIteratorIterator::CHILD_FIRST
-    );
-    foreach ($rii as $f) {
-        if ($f->isDir()) @rmdir($f->getPathname()); else @unlink($f->getPathname());
+    // Symlinks are unlinked, never traversed — staged trees can contain
+    // symlinked plugin clones (developer convenience). Following the symlinks
+    // would attempt to delete real source files outside the staged tree.
+    if (is_link($path)) { @unlink($path); return; }
+    if (!is_dir($path)) { return; }
+    $items = @scandir($path);
+    if ($items === false) { return; }
+    foreach ($items as $item) {
+        if ($item === '.' || $item === '..') continue;
+        $sub = $path . DIRECTORY_SEPARATOR . $item;
+        if (is_link($sub)) {
+            @unlink($sub);
+        } elseif (is_dir($sub)) {
+            remove_dir($sub);
+        } else {
+            @unlink($sub);
+        }
     }
     @rmdir($path);
+}
+
+/**
+ * Rewind the wizard to a previous step so subsequent steps can be re-run with
+ * different options. Wipes the staged files for everything downstream of the
+ * target so the re-run starts clean. Source user/ on the live 1.x install is
+ * never touched.
+ *
+ *   'extracted'     — re-run plugins_themes (Step 2). Wipes staged user/
+ *                     entirely; bulk-copy will rebuild it.
+ *   'plugins_done'  — re-run accounts (Step 3). Re-copies source
+ *                     user/accounts/ over the staged copy so previously-
+ *                     applied perm mirrors are undone.
+ *   'accounts_done' — re-run content (Step 4). Summary-only step; just
+ *                     clears the prior summary blob.
+ *
+ * Previous step options are stashed under flag['_prev_options'][target] so
+ * the prerequisite step's form can pre-fill from the last run.
+ *
+ * NOTE: re-running 'extracted' is destructive to any hand-edits made in the
+ * staged install during Test (Step 5). Documented in the UI confirmation.
+ */
+function mg_rewind_to(string $webroot, array &$flag, string $target): void
+{
+    if (!in_array($target, ['extracted', 'plugins_done', 'accounts_done'], true)) {
+        throw new InvalidArgumentException("Unknown rewind target: {$target}");
+    }
+
+    $stageDir = trim((string)($flag['stage_dir'] ?? 'grav-2'), '/');
+    $stagedUser = $webroot . '/' . $stageDir . '/user';
+    $stash = $flag['_prev_options'] ?? [];
+
+    switch ($target) {
+        case 'extracted':
+            if (is_dir($stagedUser)) {
+                mg_rm_tree($stagedUser);
+            }
+            if (isset($flag['plugins_themes'])) {
+                $stash['plugins_themes'] = [
+                    'mode'        => $flag['plugins_themes']['mode']        ?? MG_MODE_STRICT,
+                    'policy'      => $flag['plugins_themes']['policy']      ?? 'disable',
+                    'auto_update' => $flag['plugins_themes']['auto_update'] ?? true,
+                ];
+            }
+            unset($flag['plugins_themes'], $flag['accounts'], $flag['content']);
+            unset($flag['compat_scan']);
+            break;
+
+        case 'plugins_done':
+            $srcAccounts = $webroot . '/user/accounts';
+            $dstAccounts = $stagedUser . '/accounts';
+            if (is_dir($dstAccounts)) {
+                mg_rm_tree($dstAccounts);
+            }
+            if (is_dir($srcAccounts)) {
+                copy_tree($srcAccounts, $dstAccounts, static function () {});
+            }
+            if (isset($flag['accounts'])) {
+                $stash['accounts'] = [
+                    'migrate_perms' => empty($flag['accounts']['skipped_perms']),
+                ];
+            }
+            unset($flag['accounts'], $flag['content']);
+            break;
+
+        case 'accounts_done':
+            unset($flag['content']);
+            break;
+    }
+
+    if ($stash) {
+        $flag['_prev_options'] = $stash;
+    }
+    $flag['step'] = $target;
+    $flag['rerun_count'][$target] = ($flag['rerun_count'][$target] ?? 0) + 1;
+    save_flag($webroot . '/.migrating', $flag);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1960,17 +2747,29 @@ function render_wizard(array $flag, string $step, string $webroot, string $stage
     page_header('Grav 2.0 Migration Wizard');
     echo '<div class="mg-page">';
 
+    // Cache the staged-zip Grav version into flag once (cheap zip peek the
+    // first time, free after) so hero + staged-state row + Step 1 can all
+    // show the same version pre-extraction.
+    if (empty($flag['extracted']['grav_version']) && empty($flag['staged_zip_version'])) {
+        mg_staged_zip_version($webroot, $flag);
+    }
+
     // Hero
+    $stagedGravVersion = (string) ($flag['extracted']['grav_version'] ?? $flag['staged_zip_version'] ?? '');
+    $heroTitle = $stagedGravVersion !== ''
+        ? 'Grav 2.0 Migration Wizard <span class="mg-hero-version">v' . htmlspecialchars($stagedGravVersion) . '</span>'
+        : 'Grav 2.0 Migration Wizard';
+
     echo '<div class="mg-hero"><div class="mg-hero-inner">';
     echo '<div class="mg-hero-icon">' . MG_ROCKET_SVG . '</div>';
-    echo '<div class="mg-hero-text"><h2>Grav 2.0 Migration Wizard</h2>';
+    echo '<div class="mg-hero-text"><h2>' . $heroTitle . '</h2>';
     echo '<p>Standalone wizard for staging and (eventually) importing your site into a fresh Grav 2.0 at <code>/' . htmlspecialchars($stageDir) . '/</code>. No Grav 1.x code is loaded.</p>';
     echo '</div></div></div>';
 
     render_stepper($step);
 
     if ($flash) {
-        $successKeys = ['extracted', 'imported', 'ok', 'plugins_done', 'accounts_done', 'content_done', 'test_done'];
+        $successKeys = ['extracted', 'imported', 'ok', 'plugins_done', 'accounts_done', 'content_done', 'test_done', 'restarted'];
         $type = in_array($flash['type'], $successKeys, true)
             ? 'ok'
             : ($flash['type'] === 'error' ? 'error' : 'warn');
@@ -2005,13 +2804,15 @@ function render_wizard(array $flag, string $step, string $webroot, string $stage
     // Always-visible staged state
     echo '<div class="mg-card mg-card-collapsed"><h3>Staged state</h3><table class="mg-table">';
     foreach ([
-        'Source root'         => $flag['source']['root'] ?? '',
-        'Source Grav version' => $flag['source']['grav_version'] ?? '',
-        'Trigger'             => $flag['source']['trigger'] ?? '',
-        'Flag created'        => isset($flag['created']) ? date('Y-m-d H:i:s', (int) $flag['created']) : '',
-        'Stage directory'     => $stageDir,
-        'Staged zip'          => $stagedZip,
-        'Current step'        => $step,
+        'Source root'           => $flag['source']['root'] ?? '',
+        'Source Grav version'   => $flag['source']['grav_version'] ?? '',
+        'Staged Grav version'   => $flag['extracted']['grav_version']
+                                       ?? (isset($flag['staged_zip_version']) ? $flag['staged_zip_version'] . ' (in zip; not yet extracted)' : '(not yet extracted)'),
+        'Trigger'               => $flag['source']['trigger'] ?? '',
+        'Flag created'          => isset($flag['created']) ? date('Y-m-d H:i:s', (int) $flag['created']) : '',
+        'Stage directory'       => $stageDir,
+        'Staged zip'            => $stagedZip,
+        'Current step'          => $step,
     ] as $k => $v) {
         echo '<tr><th>' . htmlspecialchars($k) . '</th><td><code>' . htmlspecialchars((string) $v) . '</code></td></tr>';
     }
@@ -2020,15 +2821,19 @@ function render_wizard(array $flag, string $step, string $webroot, string $stage
     }
     if (isset($flag['plugins_themes'])) {
         $pt = $flag['plugins_themes'];
-        $summary = (int) ($pt['files'] ?? 0) . ' files · policy: ' . ($pt['policy'] ?? 'disable')
+        $modeStr = (string) ($pt['mode'] ?? MG_MODE_STRICT);
+        $summary = (int) ($pt['files'] ?? 0) . ' files · mode: ' . $modeStr
+                 . ' · policy: ' . ($pt['policy'] ?? 'disable')
                  . ' · disabled ' . count($pt['disabled'] ?? [])
                  . ' · skipped ' . count($pt['skipped'] ?? [])
+                 . ' · force-included ' . count($pt['force_included'] ?? [])
                  . ' · installed ' . count($pt['replacements']['installed'] ?? []);
 
         echo '<tr><th>Copy &amp; migrate</th><td>';
         echo '<details class="mg-details"><summary><code>' . htmlspecialchars($summary) . '</code></summary>';
         echo '<div class="mg-details-body">';
         mg_render_pt_details($pt);
+        mg_render_rerun_form($token, 'extracted', 'Re-run Step 2 with different options', 'This will wipe the staged user/ and re-bulk-copy from your live 1.x install. Steps 3 and 4 will need to be re-run too.');
         echo '</div></details></td></tr>';
     }
     if (isset($flag['accounts'])) {
@@ -2042,6 +2847,7 @@ function render_wizard(array $flag, string $step, string $webroot, string $stage
         echo '<details class="mg-details"><summary><code>' . htmlspecialchars($summary) . '</code></summary>';
         echo '<div class="mg-details-body">';
         mg_render_accounts_details($ac);
+        mg_render_rerun_form($token, 'plugins_done', 'Re-run Step 3 with different options', 'Re-copies user/accounts/ from your live 1.x install and clears Step 4. Plugins/themes (Step 2) are not affected.');
         echo '</div></details></td></tr>';
     }
     if (isset($flag['content'])) {
@@ -2052,18 +2858,28 @@ function render_wizard(array $flag, string $step, string $webroot, string $stage
         echo '<details class="mg-details"><summary><code>' . htmlspecialchars($summary) . '</code></summary>';
         echo '<div class="mg-details-body">';
         mg_render_content_details($c);
+        mg_render_rerun_form($token, 'accounts_done', 'Re-run Step 4', 'Step 4 is a summary-only step; re-running just refreshes the entry list.');
         echo '</div></details></td></tr>';
     }
     echo '</table></div>';
 
-    // Reset card
-    echo '<div class="mg-card mg-card-muted"><h3>Reset</h3>';
-    echo '<p>Abandon this migration and clean up the staged files. Your original site at <code>' . htmlspecialchars($webroot) . '</code> is <strong>not</strong> touched.</p>';
-    echo '<form method="post" onsubmit="return confirm(\'Delete .migrating, migrate.php, the staged zip, and the staged Grav 2.0 directory?\');">';
+    // Restart / Reset card
+    echo '<div class="mg-card mg-card-muted"><h3>Restart or Reset</h3>';
+    echo '<p>Your original site at <code>' . htmlspecialchars($webroot) . '</code> is <strong>not</strong> touched by either action.</p>';
+    echo '<p><strong>Restart Wizard</strong> clears the staged Grav 2.0 directory and your wizard progress, but keeps the downloaded release zip and your migration token so you can re-run from step 1 without re-downloading.</p>';
+    echo '<p><strong>Reset Migration</strong> abandons the migration entirely — deletes <code>.migrating</code>, <code>migrate.php</code>, the staged zip, and the staged Grav 2.0 directory. Starting over re-downloads Grav 2.0.</p>';
+    echo '<div class="mg-action-buttons" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;">';
+    echo '<form method="post" style="margin:0" onsubmit="return confirm(\'Restart the wizard? Clears the staged Grav 2.0 directory and any wizard progress; keeps the downloaded zip and migration token.\');">';
+    echo '<input type="hidden" name="action" value="restart">';
+    echo '<input type="hidden" name="token"  value="' . htmlspecialchars($token) . '">';
+    echo '<button type="submit" class="mg-btn mg-btn-secondary">Restart Wizard</button>';
+    echo '</form>';
+    echo '<form method="post" style="margin:0" onsubmit="return confirm(\'Reset the migration completely? Deletes .migrating, migrate.php, the staged zip, and the staged Grav 2.0 directory.\');">';
     echo '<input type="hidden" name="action" value="reset">';
     echo '<input type="hidden" name="token"  value="' . htmlspecialchars($token) . '">';
-    echo '<button type="submit" class="mg-btn mg-btn-danger">Reset migration</button>';
+    echo '<button type="submit" class="mg-btn mg-btn-danger">Reset Migration</button>';
     echo '</form>';
+    echo '</div>';
     echo '</div>';
 
     echo '</div>';
@@ -2100,8 +2916,13 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
 {
     switch ($step) {
         case 'staged':
-            echo '<div class="mg-card mg-card-active"><h3>Step 1: Extract Grav 2.0</h3>';
-            echo '<p>The Grav 2.0 zip is ready at <code>' . htmlspecialchars($flag['staged_zip'] ?? '') . '</code>. Once all pre-flight checks pass, extract it into <code>/' . htmlspecialchars($stageDir) . '/</code>.</p>';
+            $webroot = dirname($stageDirAbs);
+            $flagRef = $flag;
+            $stagedVersion = mg_staged_zip_version($webroot, $flagRef);
+            $verBadge = $stagedVersion ? ' <span class="mg-version-pill">v' . htmlspecialchars($stagedVersion) . '</span>' : '';
+
+            echo '<div class="mg-card mg-card-active"><h3>Step 1: Extract Grav 2.0' . $verBadge . '</h3>';
+            echo '<p>The Grav ' . ($stagedVersion ? '<strong>v' . htmlspecialchars($stagedVersion) . '</strong>' : '2.0') . ' zip is ready at <code>' . htmlspecialchars($flag['staged_zip'] ?? '') . '</code>. Once all pre-flight checks pass, extract it into <code>/' . htmlspecialchars($stageDir) . '/</code>.</p>';
             echo '<table class="mg-table">';
             foreach ($preflight as [$label, $ok]) {
                 echo '<tr><th>' . htmlspecialchars($label) . '</th><td class="' . ($ok ? 'mg-ok' : 'mg-fail') . '">' . ($ok ? 'OK' : 'FAILED') . '</td></tr>';
@@ -2129,17 +2950,71 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
                 echo '<div class="mg-callout mg-callout-warn"><i class="mg-i-info"></i><div>Could not reach the curated compatibility registry. Falling back to blueprint + dependency inference only — verdicts may be less accurate.</div></div>';
             }
 
+            // Upgrade preview — counts how many rows have a candidate upgrade
+            // resolved via mg_resolve_update() (i.e. GPM, with v=<staged 2.0>,
+            // is offering a newer version than what's installed).
+            $countUpdates = static fn(array $bucket): int => count(array_filter(
+                $bucket,
+                static fn($v) => is_array($v) && !empty($v['update'])
+            ));
+            $pendingPlugins = $countUpdates($scan['plugins'] ?? []);
+            $pendingThemes  = $countUpdates($scan['themes']  ?? []);
+            if ($pendingPlugins + $pendingThemes > 0) {
+                $parts = [];
+                if ($pendingPlugins > 0) $parts[] = "<strong>{$pendingPlugins}</strong> plugin update" . ($pendingPlugins === 1 ? '' : 's');
+                if ($pendingThemes  > 0) $parts[] = "<strong>{$pendingThemes}</strong> theme update"  . ($pendingThemes  === 1 ? '' : 's');
+                $msg = implode(' and ', $parts) . ' available on GPM.';
+                echo '<div class="mg-callout mg-callout-info"><i class="mg-i-info"></i><div>'
+                   . $msg . ' With <em>upgrade plugins during migration</em> on (default), Grav 2.0&apos;s GPM picks up these versions during Copy &amp; Migrate — only ones gpm confirms are 2.0-compatible actually get installed. Rows in the table below tagged &ldquo;<strong>↑ will upgrade to vX.Y.Z</strong>&rdquo; are the candidates.'
+                   . '</div></div>';
+            }
+
             render_compat_breakdown($scan);
 
-            echo '<form method="post" style="margin-top:18px">';
+            // Pre-fill from previous run if user rewound to here.
+            $prev = $flag['_prev_options']['plugins_themes'] ?? null;
+            $prevMode     = $prev['mode']        ?? MG_MODE_STRICT;
+            $prevPolicy   = $prev['policy']      ?? 'disable';
+            $prevAutoUpd  = $prev['auto_update'] ?? true;
+            $rerunCount   = (int)($flag['rerun_count']['extracted'] ?? 0);
+
+            if ($prev !== null) {
+                echo '<div class="mg-callout mg-callout-warn"><i class="mg-i-info"></i><div>Re-running this step (#' . ($rerunCount + 1) . '). The staged <code>user/</code> was wiped — any hand-edits made while testing have been lost. Source <code>user/</code> on the live 1.x install is unchanged.</div></div>';
+            }
+
+            $isChecked = static fn(string $v, string $cur) => $v === $cur ? ' checked' : '';
+
+            echo '<form method="post" style="margin-top:18px" id="mg-pt-form">';
             echo '<input type="hidden" name="action" value="plugins_themes">';
             echo '<input type="hidden" name="token"  value="' . htmlspecialchars($token) . '">';
-            echo '<p style="margin:0 0 8px;font-size:13.5px;color:#333;font-weight:600">For incompatible plugins:</p>';
-            echo '<label class="mg-check mg-check-block"><input type="radio" name="policy" value="disable" checked> Copy but <strong>disable</strong> them <span class="mg-btn-note">(keeps your config; reinstall a compatible version in-place)</span></label>';
-            echo '<label class="mg-check mg-check-block"><input type="radio" name="policy" value="skip"> <strong>Skip</strong> them entirely <span class="mg-btn-note">(cleaner; reinstall from scratch via the 2.0 admin)</span></label>';
-            echo '<p style="margin:14px 0 6px;font-size:13.5px;color:#333;font-weight:600">Auto-update behavior:</p>';
-            echo '<label class="mg-check mg-check-block"><input type="checkbox" name="skip_update" value="1"> Skip auto-update <span class="mg-btn-note">(use the version installed on 1.x — on your head be it)</span></label>';
+
+            // Upgrade pass — primary action. Positive-framed (checked = run
+            // upgrade) so the default state is unambiguous. The action handler
+            // maps !upgrade_plugins → skip_update for back-compat with the
+            // existing flag schema.
+            echo '<p style="margin:0 0 8px;font-size:13.5px;color:#333;font-weight:600">Upgrade plugins during migration:</p>';
+            echo '<label class="mg-check mg-check-block">'
+               . '<input type="checkbox" name="upgrade_plugins" value="1"' . ($prevAutoUpd ? ' checked' : '') . '>'
+               . ' <strong>Run upgrade pass after copy</strong> '
+               . '<span class="mg-btn-note">(recommended) Grav 2.0&apos;s <code>bin/gpm update</code> runs after the copy step and upgrades any plugin with a newer 2.0-compatible version on GPM. Symlinked plugins and ones without a 2.0-compatible release are left alone.</span>'
+               . '</label>';
+
+            echo '<p style="margin:14px 0 8px;font-size:13.5px;color:#333;font-weight:600">Compatibility mode:</p>';
+            echo '<label class="mg-check mg-check-block"><input type="radio" name="mode" value="strict" data-mode="strict"' . $isChecked('strict', $prevMode) . '> <strong>Strict</strong> <span class="mg-btn-note">(recommended) only carry forward plugins/themes the curated registry or their blueprint explicitly marks as 2.0-compatible</span></label>';
+            echo '<label class="mg-check mg-check-block"><input type="radio" name="mode" value="permissive" data-mode="permissive"' . $isChecked('permissive', $prevMode) . '> <strong>Permissive</strong> <span class="mg-btn-note">also carry forward plugins where compat is just unknown — only items the curated registry explicitly flags 1.x-only stay incompatible</span></label>';
+            echo '<label class="mg-check mg-check-block"><input type="radio" name="mode" value="test" data-mode="test"' . $isChecked('test', $prevMode) . '> <strong>Test</strong> <span class="mg-btn-note">(not for production) carry forward and enable EVERYTHING you have — useful for finding what actually breaks under 2.0</span></label>';
+
+            echo '<div id="mg-pt-policy" style="margin-top:14px"' . ($prevMode === 'test' ? ' hidden' : '') . '>';
+            echo '<p style="margin:0 0 8px;font-size:13.5px;color:#333;font-weight:600">For incompatible plugins (after the upgrade pass):</p>';
+            echo '<label class="mg-check mg-check-block"><input type="radio" name="policy" value="disable"' . $isChecked('disable', $prevPolicy) . '> Copy but <strong>disable</strong> them <span class="mg-btn-note">(keeps your config; reinstall a compatible version in-place)</span></label>';
+            echo '<label class="mg-check mg-check-block"><input type="radio" name="policy" value="skip"' . $isChecked('skip', $prevPolicy) . '> <strong>Skip</strong> them entirely <span class="mg-btn-note">(cleaner; reinstall from scratch via the 2.0 admin)</span></label>';
+            echo '</div>';
+
             echo '<div style="margin-top:14px"><button type="submit" class="mg-btn mg-btn-primary">Copy &amp; migrate user/ →</button></div>';
+
+            // Toggle policy section visibility based on mode (test mode has no incompatibles).
+            echo '<script>(function(){var f=document.getElementById("mg-pt-form");if(!f)return;f.addEventListener("change",function(e){if(e.target.name!=="mode")return;document.getElementById("mg-pt-policy").hidden=(e.target.value==="test");});})();</script>';
+
             echo '</form>';
             echo '</div>';
             break;
@@ -2150,12 +3025,12 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
 
             echo '<div class="mg-card mg-card-active"><h3>Step 3: Accounts</h3>';
             echo '<p>Account yamls were copied verbatim into the staged install during Step 2 (' . $nAccounts . ' yaml(s) detected in staged <code>user/accounts/</code>). This step just applies the optional permission transform.</p>';
-            echo '<p>Grav 2.0 (with Admin 2.0) uses <code>api.*</code> permission names going forward. Your existing <code>admin.*</code> permissions can be mirrored in place so the same users keep full access on both surfaces while you transition.</p>';
+            echo '<p>Grav 2.0 (with Admin 2.0) uses <code>api.*</code> permission names going forward. Your existing <code>admin.*</code> permissions can be mirrored in place so the same users keep full access on both Admin 1.x and 2.0 while you transition.</p>';
             echo '<form method="post" style="margin-top:14px">';
             echo '<input type="hidden" name="action" value="accounts">';
             echo '<input type="hidden" name="token"  value="' . htmlspecialchars($token) . '">';
             echo '<label class="mg-check mg-check-block"><input type="checkbox" name="skip_perms" value="1"> Skip permission mirroring <span class="mg-btn-note">(leave account yamls as-is; you\'ll set <code>api.*</code> perms manually later)</span></label>';
-            echo '<div style="margin-top:14px"><button type="submit" class="mg-btn mg-btn-primary">Apply perm mirror →</button></div>';
+            echo '<div style="margin-top:14px"><button type="submit" class="mg-btn mg-btn-primary">Apply permission mirror →</button></div>';
             echo '</form>';
             echo '</div>';
             break;
@@ -2187,7 +3062,7 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
             $stageUrl = base_path_from_script() . rawurlencode($stageDir) . '/';
 
             // Auto-patch on Apache/LiteSpeed (idempotent). For nginx/Caddy,
-            // skip auto-patch and surface manual config. The parent rule
+            // skip auto-patch and show manual config. The parent rule
             // exclusion is sufficient; the staged install does NOT need a
             // RewriteBase tweak (it works as-is when the parent stops
             // intercepting).
@@ -2198,6 +3073,26 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
 
             echo '<div class="mg-card mg-card-active"><h3>Step 5: Test the staged install</h3>';
             echo '<p>Open the staged Grav 2.0 in a new tab and verify pages, admin login, plugins, and theme behavior. Your live 1.x install at this URL is unchanged.</p>';
+
+            // Test/Permissive-mode report card: list what was force-included
+            // so the user knows which plugins to specifically smoke-test.
+            $pt = $flag['plugins_themes'] ?? [];
+            $ptMode = (string) ($pt['mode'] ?? MG_MODE_STRICT);
+            $forced = $pt['force_included'] ?? [];
+            if ($ptMode !== MG_MODE_STRICT && !empty($forced)) {
+                $modeWord = $ptMode === MG_MODE_TEST ? 'Test' : 'Permissive';
+                echo '<div class="mg-callout mg-callout-warn"><i class="mg-i-warn"></i><div>';
+                echo '<strong>' . count($forced) . ' plugin(s) force-included by ' . $modeWord . ' mode.</strong> ';
+                echo 'These would have been disabled/skipped in Strict mode. Smoke-test these specifically — fatal errors here are expected and informative. ';
+                echo '<details style="margin-top:6px"><summary>Force-included list</summary><div class="mg-details-body">';
+                $lines = [];
+                foreach ($forced as $f) {
+                    $lines[] = '<code>' . htmlspecialchars((string)($f['slug'] ?? '')) . '</code>';
+                }
+                echo '<div class="mg-result-row">' . implode(', ', $lines) . '</div>';
+                echo '</div></details>';
+                echo '</div></div>';
+            }
 
             if ($patchResult && $patchResult['ok']) {
                 echo '<div class="mg-callout mg-callout-ok"><i class="mg-i-info"></i><div>Detected <strong>' . htmlspecialchars(ucfirst($serverKind)) . '</strong>. Patched parent <code>.htaccess</code> so requests under <code>/' . htmlspecialchars($stageDir) . '/</code> bypass the parent install. Reset will restore the original.</div></div>';
@@ -2284,6 +3179,24 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
  */
 function mg_render_pt_details(array $pt): void
 {
+    $mode = (string) ($pt['mode'] ?? MG_MODE_STRICT);
+    if ($mode !== MG_MODE_STRICT) {
+        echo '<div class="mg-result-section"><strong>Mode</strong>';
+        $modeLabel = $mode === MG_MODE_TEST ? 'TEST (everything force-included)' : 'PERMISSIVE (only curated 1.x-only blocked)';
+        echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-warn">' . htmlspecialchars($mode) . '</span> ' . htmlspecialchars($modeLabel) . '</div></div>';
+    }
+
+    if (!empty($pt['force_included'])) {
+        echo '<div class="mg-result-section"><strong>Force-included (would be incompatible in strict)</strong>';
+        $lines = [];
+        foreach ($pt['force_included'] as $f) {
+            $slug = (string) ($f['slug'] ?? '');
+            $reason = (string) ($f['reason'] ?? '');
+            $lines[] = '<code>' . htmlspecialchars($slug) . '</code>' . ($reason !== '' ? ' <span class="mg-result-meta">(' . htmlspecialchars($reason) . ')</span>' : '');
+        }
+        echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-warn">force</span> ' . implode(', ', $lines) . '</div></div>';
+    }
+
     $stripPrefix = static function (array $list, string $kind): array {
         $out = [];
         foreach ($list as $s) {
@@ -2359,6 +3272,19 @@ function mg_render_accounts_details(array $ac): void
     echo '</div>';
 }
 
+function mg_render_rerun_form(string $token, string $target, string $label, string $impact): void
+{
+    $confirmJs = "return confirm('Re-run? ' + " . json_encode($impact) . " + '\\n\\nThis cannot be undone short of using Reset.');";
+    echo '<div class="mg-result-section" style="margin-top:14px">';
+    echo '<form method="post" onsubmit="' . htmlspecialchars($confirmJs) . '">';
+    echo '<input type="hidden" name="action" value="rerun_step">';
+    echo '<input type="hidden" name="target" value="' . htmlspecialchars($target) . '">';
+    echo '<input type="hidden" name="token"  value="' . htmlspecialchars($token) . '">';
+    echo '<button type="submit" class="mg-btn mg-btn-secondary">↺ ' . htmlspecialchars($label) . '</button>';
+    echo ' <span class="mg-btn-note">' . htmlspecialchars($impact) . '</span>';
+    echo '</form></div>';
+}
+
 function mg_render_content_details(array $c): void
 {
     echo '<div class="mg-result-section"><strong>Content in staged <code>user/</code></strong>';
@@ -2415,43 +3341,60 @@ function render_compat_breakdown(array $scan): void
 
         $total = count($items) + count($pending);
         echo '<div class="mg-compat-group"><h4>' . htmlspecialchars($label) . ' <span class="mg-btn-note">' . $total . ' total</span></h4>';
-        echo '<ul class="mg-compat-list">';
 
-        // Render pending replacements first so the user sees the "incoming" row up top.
+        // Render pending replacements first under their own subhead so the
+        // user sees the "incoming" rows up top.
         $versions = $scan['github_versions'] ?? [];
-        foreach ($pending as $slug => $info) {
-            $ver = $versions[$slug] ?? null;
-            if ($ver) {
-                $verLabel = match ($ver['source']) {
-                    'release'        => 'v' . $ver['version'],
-                    'gpm'            => 'v' . $ver['version'],
-                    'default-branch' => $ver['version'] . ' (default)',
-                    default          => 'v' . $ver['version'],
-                };
-                $sourceTag = strtoupper($ver['source'] === 'release' ? 'github' : ($ver['source'] === 'default-branch' ? 'github' : $ver['source']));
-                $repoTag = $ver['source'] === 'gpm'
-                    ? 'getgrav.org/downloads (gpm)'
-                    : (string) ($info['entry']['github_repo'] ?? '');
-            } else {
-                $verLabel = 'latest';
-                $sourceTag = 'GITHUB';
-                $repoTag = (string) ($info['entry']['github_repo'] ?? '');
-            }
+        if ($pending) {
+            echo '<h5 class="mg-compat-subhead mg-compat-subhead-new">Will be installed <span class="mg-compat-subhead-count">' . count($pending) . '</span></h5>';
+            echo '<ul class="mg-compat-list">';
+            foreach ($pending as $slug => $info) {
+                $ver = $versions[$slug] ?? null;
+                if ($ver) {
+                    $verLabel = match ($ver['source']) {
+                        'release'        => 'v' . $ver['version'],
+                        'gpm'            => 'v' . $ver['version'],
+                        'default-branch' => $ver['version'] . ' (default)',
+                        default          => 'v' . $ver['version'],
+                    };
+                    $sourceKey = $ver['source'] === 'default-branch' ? 'github' : $ver['source'];
+                    $sourceKey = $sourceKey === 'release' ? 'github' : $sourceKey;
+                    $repoTag = $ver['source'] === 'gpm'
+                        ? 'getgrav.org/downloads (gpm)'
+                        : (string) ($info['entry']['github_repo'] ?? '');
+                } else {
+                    $verLabel = 'latest';
+                    $sourceKey = 'github';
+                    $repoTag = (string) ($info['entry']['github_repo'] ?? '');
+                }
 
-            $reasonText = ($info['kind'] ?? 'replaces') === 'requires'
-                ? 'Will be installed (required by <code>' . htmlspecialchars($info['target']) . '</code>)'
-                : 'Will be installed to replace <code>' . htmlspecialchars($info['target']) . '</code>';
-            echo '<li class="mg-compat mg-compat-new">';
-            echo '<span class="mg-compat-icon">+</span>';
-            echo '<span class="mg-compat-slug">' . htmlspecialchars($slug) . '</span>';
-            echo ' <span class="mg-compat-version">' . htmlspecialchars($verLabel) . '</span>';
-            echo '<span class="mg-compat-reason">' . $reasonText . ' <span class="mg-compat-autoinstall">auto-install</span> <span class="mg-compat-repo"><code>' . htmlspecialchars($repoTag) . '</code></span></span>';
-            echo '<span class="mg-compat-source">' . htmlspecialchars($sourceTag) . '</span>';
-            echo '</li>';
+                $reasonText = ($info['kind'] ?? 'replaces') === 'requires'
+                    ? 'Will be installed (required by <code>' . htmlspecialchars($info['target']) . '</code>)'
+                    : 'Will be installed to replace <code>' . htmlspecialchars($info['target']) . '</code>';
+                echo '<li class="mg-compat mg-compat-new">';
+                echo '<span class="mg-compat-icon">+</span>';
+                echo '<span class="mg-compat-slug">' . htmlspecialchars($slug) . '</span>';
+                echo ' <span class="mg-compat-version">' . htmlspecialchars($verLabel) . '</span>';
+                echo '<span class="mg-compat-reason">' . $reasonText . ' <span class="mg-compat-autoinstall">auto-install</span> <span class="mg-compat-repo"><code>' . htmlspecialchars($repoTag) . '</code></span></span>';
+                echo '<span class="mg-compat-source mg-compat-source-' . htmlspecialchars(strtolower($sourceKey)) . '">' . htmlspecialchars(strtoupper($sourceKey)) . '</span>';
+                echo '</li>';
+            }
+            echo '</ul>';
         }
 
-        foreach (['compatible' => ['✓', 'ok'], 'needs_update' => ['⚠', 'warn'], 'incompatible' => ['✗', 'err']] as $status => [$icon, $cls]) {
-            foreach ($buckets[$status] as $slug => $v) {
+        $bucketMeta = [
+            'compatible'   => ['icon' => '✓', 'cls' => 'ok',   'label' => 'Compatible'],
+            'needs_update' => ['icon' => '⚠', 'cls' => 'warn', 'label' => 'Needs update'],
+            'incompatible' => ['icon' => '✗', 'cls' => 'err',  'label' => 'Incompatible'],
+        ];
+        foreach ($bucketMeta as $status => $meta) {
+            $rows = $buckets[$status];
+            if (!$rows) continue;
+            echo '<h5 class="mg-compat-subhead mg-compat-subhead-' . $meta['cls'] . '">'
+                . htmlspecialchars($meta['label'])
+                . ' <span class="mg-compat-subhead-count">' . count($rows) . '</span></h5>';
+            echo '<ul class="mg-compat-list">';
+            foreach ($rows as $slug => $v) {
                 $version = $v['installed_version'] ?? '';
                 $reason  = $v['reason'] ?? '';
                 $src     = $v['source'] ?? '';
@@ -2466,8 +3409,8 @@ function render_compat_breakdown(array $scan): void
                 // Twig 3 compat layer. Reframe the row so users don't see a
                 // scary ✗ next to their working theme.
                 $isKeptTheme = ($k === 'themes' && $status === 'incompatible' && !$replBy);
-                $rowIcon   = $isKeptTheme ? '⚠' : $icon;
-                $rowCls    = $isKeptTheme ? 'warn' : $cls;
+                $rowIcon   = $isKeptTheme ? '⚠' : $meta['icon'];
+                $rowCls    = $isKeptTheme ? 'warn' : $meta['cls'];
                 $rowReason = $isKeptTheme
                     ? 'Kept — Twig 3 compatibility enabled (verify before promoting)'
                     : $reason;
@@ -2478,17 +3421,19 @@ function render_compat_breakdown(array $scan): void
                 if ($version !== '') echo ' <span class="mg-compat-version">' . htmlspecialchars($version) . '</span>';
                 echo '<span class="mg-compat-reason">' . htmlspecialchars($rowReason);
                 if ($update) {
-                    echo ' <span class="mg-compat-update">↑ updates to v' . htmlspecialchars($update['to']) . '</span>';
+                    echo ' <span class="mg-compat-update">↑ will upgrade to v' . htmlspecialchars($update['to']) . '</span>';
                 }
                 if ($replBy) {
                     echo ' <span class="mg-compat-autoinstall">→ <code>' . htmlspecialchars($replBy) . '</code></span>';
                 }
                 echo '</span>';
-                echo '<span class="mg-compat-source">' . htmlspecialchars($src) . '</span>';
+                $srcKey = strtolower($src) ?: 'default';
+                echo '<span class="mg-compat-source mg-compat-source-' . htmlspecialchars($srcKey) . '">' . htmlspecialchars($src) . '</span>';
                 echo '</li>';
             }
+            echo '</ul>';
         }
-        echo '</ul></div>';
+        echo '</div>';
     }
 }
 
@@ -2529,6 +3474,12 @@ function page_css(): string
     .mg-rocket { width: 42px; height: 42px; }
     .mg-hero-text { flex: 1 1 320px; min-width: 0; }
     .mg-hero-text h2 { margin: 0 0 6px; color: #fff; font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
+    .mg-hero-version { display: inline-block; margin-left: 10px; padding: 3px 9px; border-radius: 999px;
+                       background: rgba(255,255,255,0.18); color: #fff; font-size: 13px; font-weight: 600;
+                       letter-spacing: 0; vertical-align: middle; }
+    .mg-version-pill { display: inline-block; margin-left: 8px; padding: 2px 8px; border-radius: 999px;
+                       background: #eef2ff; color: #4338ca; font-size: 12px; font-weight: 600;
+                       vertical-align: middle; }
     .mg-hero-text p  { margin: 0; color: rgba(255,255,255,0.92); font-size: 14px; line-height: 1.55; max-width: 620px; }
     .mg-hero-text code { background: rgba(255,255,255,0.16); padding: 1px 6px; border-radius: 3px; color: #fff; }
 
@@ -2585,6 +3536,8 @@ function page_css(): string
         transition: background 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease; }
     .mg-btn-primary { background: #5b3ea8; color: #fff; box-shadow: 0 2px 6px rgba(91, 62, 168, 0.25); }
     .mg-btn-primary:not(:disabled):hover { background: #4a328b; transform: translateY(-1px); box-shadow: 0 4px 10px rgba(91, 62, 168, 0.35); }
+    .mg-btn-secondary { background: #fff; color: #5b3ea8; border: 1px solid #d8d2ec; }
+    .mg-btn-secondary:hover { background: #f5f2fb; color: #4a328b; }
     .mg-btn-danger { background: #fff; color: #c62828; border: 1px solid #e5c2c2; }
     .mg-btn-danger:hover { background: #fff1f1; color: #b72020; }
     .mg-btn:disabled { opacity: 0.55; cursor: not-allowed; }
@@ -2659,15 +3612,44 @@ function page_css(): string
 
     .mg-compat-group { margin: 14px 0 6px; }
     .mg-compat-group h4 { margin: 0 0 8px; font-size: 14px; color: #333; }
-    .mg-compat-list { list-style: none; padding: 0; margin: 0; border: 1px solid #eef0f6; border-radius: 4px; }
-    .mg-compat { display: grid; grid-template-columns: 24px 140px 80px 1fr 70px; gap: 10px;
-        align-items: center; padding: 8px 12px; border-bottom: 1px solid #f3f4f8; font-size: 13px; }
+    .mg-compat-subhead { margin: 14px 0 6px; font-size: 12px; font-weight: 600;
+        text-transform: uppercase; letter-spacing: 0.6px; color: #6b7280;
+        display: flex; align-items: center; gap: 8px; }
+    .mg-compat-subhead::before { content: ""; flex: 0 0 3px; height: 14px; border-radius: 2px;
+        background: #c8ccd6; }
+    .mg-compat-subhead-count { display: inline-flex; align-items: center; justify-content: center;
+        min-width: 22px; height: 18px; padding: 0 6px; border-radius: 9px;
+        background: #eef0f6; color: #4b5563; font-size: 11px; font-weight: 700;
+        letter-spacing: 0; text-transform: none; }
+    .mg-compat-subhead-ok::before   { background: #2a7f2a; }
+    .mg-compat-subhead-warn::before { background: #c47d00; }
+    .mg-compat-subhead-err::before  { background: #c62828; }
+    .mg-compat-subhead-new::before  { background: #5b3ea8; }
+    .mg-compat-subhead-ok .mg-compat-subhead-count   { background: #e3f4e3; color: #1f5a1f; }
+    .mg-compat-subhead-warn .mg-compat-subhead-count { background: #fff1d6; color: #80560a; }
+    .mg-compat-subhead-err .mg-compat-subhead-count  { background: #fde2e2; color: #8c2020; }
+    .mg-compat-subhead-new .mg-compat-subhead-count  { background: #ece5fa; color: #4a328b; }
+    .mg-compat-list { list-style: none; padding: 0; margin: 0 0 4px; border: 1px solid #eef0f6;
+        border-radius: 4px; overflow: hidden; }
+    .mg-compat { display: grid; grid-template-columns: 22px 190px 80px 1fr 96px; gap: 10px;
+        align-items: center; padding: 9px 12px; border-bottom: 1px solid #f3f4f8; font-size: 13px; }
     .mg-compat:last-child { border-bottom: 0; }
-    .mg-compat-icon { font-weight: 700; text-align: center; }
-    .mg-compat-slug { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #333; font-weight: 600; }
-    .mg-compat-version { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #666; font-size: 12px; }
-    .mg-compat-reason { color: #666; font-size: 12.5px; }
-    .mg-compat-source { color: #aaa; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; text-align: right; }
+    .mg-compat-icon { font-weight: 700; text-align: center; font-size: 13px; }
+    .mg-compat-slug { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #1f2937;
+        font-weight: 600; word-break: break-all; }
+    .mg-compat-version { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #6b7280;
+        font-size: 12px; }
+    .mg-compat-reason { color: #4b5563; font-size: 12.5px; }
+    .mg-compat-source { display: inline-block; padding: 2px 8px; border-radius: 10px;
+        background: #eef0f6; color: #4b5563; font-size: 10.5px; font-weight: 700;
+        text-transform: uppercase; letter-spacing: 0.5px; text-align: center;
+        justify-self: end; min-width: 76px; }
+    .mg-compat-source-curated   { background: #ece5fa; color: #4a328b; }
+    .mg-compat-source-blueprint { background: #e0ecff; color: #1d4ed8; }
+    .mg-compat-source-inferred  { background: #d8f1ee; color: #0f766e; }
+    .mg-compat-source-default   { background: #eef0f6; color: #6b7280; }
+    .mg-compat-source-github    { background: #1f2937; color: #f3f4f6; }
+    .mg-compat-source-gpm       { background: #d1f0d6; color: #1f5a1f; }
     .mg-compat-ok   { background: #f6fcf6; } .mg-compat-ok   .mg-compat-icon { color: #2a7f2a; }
     .mg-compat-warn { background: #fffaf0; } .mg-compat-warn .mg-compat-icon { color: #c47d00; }
     .mg-compat-err  { background: #fff5f5; } .mg-compat-err  .mg-compat-icon { color: #c62828; }
@@ -2679,14 +3661,16 @@ function page_css(): string
         letter-spacing: 0.3px; }
     .mg-compat-autoinstall code { background: rgba(255,255,255,0.18); color: #fff; padding: 0 4px;
         border-radius: 2px; font-size: 11px; }
-    .mg-compat-update { display: inline-block; margin-left: 6px; padding: 1px 7px;
-        background: #2a7f2a; color: #fff; font-size: 11px; font-weight: 600; border-radius: 3px;
-        letter-spacing: 0.3px; }
+    .mg-compat-update { display: inline-flex; align-items: center; margin-left: 6px;
+        padding: 1px 8px 1px 7px; background: #ecf7ec; color: #1f5a1f;
+        border: 1px solid #b8dcb8; font-size: 11px; font-weight: 600; border-radius: 10px;
+        letter-spacing: 0.2px; line-height: 1.55; }
     .mg-compat-repo { display: inline-block; margin-left: 6px; color: #888; font-size: 12px; }
     .mg-compat-repo code { background: transparent; padding: 0; color: #888; font-size: 12px; }
     @media (max-width: 700px) {
-      .mg-compat { grid-template-columns: 24px 1fr auto; }
-      .mg-compat-reason, .mg-compat-source { grid-column: 1 / -1; padding-left: 34px; }
+      .mg-compat { grid-template-columns: 22px 1fr auto; }
+      .mg-compat-reason, .mg-compat-source { grid-column: 1 / -1; padding-left: 32px; }
+      .mg-compat-source { justify-self: start; }
     }
 
     .mg-table-compact th, .mg-table-compact td { padding: 6px 10px; }
