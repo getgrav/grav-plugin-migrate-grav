@@ -1379,7 +1379,7 @@ function mg_install_replacements(string $webroot, string $stageDir, array $scan,
 function mg_lookup_registry_entry(string $slug): ?array
 {
     static $all = null;
-    if ($all === null) $all = mg_fetch_curated() ?? [];
+    if ($all === null) $all = mg_apply_baseline_registry(mg_fetch_curated());
     return $all['plugins'][$slug] ?? $all['themes'][$slug] ?? null;
 }
 
@@ -2011,7 +2011,12 @@ function mg_compat_scan_cached(string $webroot, array &$flag): array
         return $cached;
     }
 
-    $curated  = mg_fetch_curated();
+    $remoteCurated = mg_fetch_curated();
+    // Always merge the baseline (admin → admin2 etc.) under the remote
+    // response so the canonical core supersedes apply even if the remote
+    // registry is offline or has been pruned. The 'source' field below still
+    // reflects whether the remote actually responded.
+    $curated = mg_apply_baseline_registry($remoteCurated);
 
     // Use the staged Grav 2.0 version (and current PHP) so the catalog
     // returns each plugin's newest release that's actually compatible with
@@ -2026,7 +2031,7 @@ function mg_compat_scan_cached(string $webroot, array &$flag): array
 
     $scan = [
         'at'      => time(),
-        'source'  => $curated !== null ? 'remote' : 'offline',
+        'source'  => $remoteCurated !== null ? 'remote' : 'offline',
         'gpm'     => $gpm,  // Cached so install paths can prefer GPM URLs over github_repo fallback.
         'curated' => $curated, // Cached so mg_rescan_staged() can re-verdict the post-upgrade staged tree without a second fetch.
         'plugins' => mg_scan_category($webroot . '/user/plugins', 'plugins', $curated, $gpm['plugins']),
@@ -2209,13 +2214,25 @@ function mg_fetch_gpm_index(string $kind, string $gravVersion = '', string $phpV
     $data = json_decode($raw, true);
     if (!is_array($data)) return null;
 
-    // The endpoint returns slug-keyed entries already.
+    // The endpoint returns slug-keyed entries already, but the download URL
+    // ships under `zipball_url` — normalize to the `download` field that
+    // mg_resolve_update() and mg_install_replacements() both consume, so
+    // upgrade detection and GPM-preferred replacement installs both work.
+    foreach ($data as $slug => $entry) {
+        if (!is_array($entry)) continue;
+        if (!isset($entry['download']) && !empty($entry['zipball_url'])) {
+            $data[$slug]['download'] = (string) $entry['zipball_url'];
+        }
+    }
+
     return $data;
 }
 
 /**
  * Fetch the curated compat registry from getgrav.org. Returns null on any
- * network/parse failure — callers must fall back to blueprint-only logic.
+ * network/parse failure — callers should run the result through
+ * mg_apply_baseline_registry() so the canonical core supersedes still apply
+ * even when the remote registry is unreachable or has been pruned.
  */
 function mg_fetch_curated(): ?array
 {
@@ -2228,6 +2245,62 @@ function mg_fetch_curated(): ?array
 
     $data = json_decode($raw, true);
     return is_array($data) ? $data : null;
+}
+
+/**
+ * Hardcoded fallback registry for the canonical 2.0 supersedes — admin →
+ * admin2 (which itself requires api). Merged under the remote registry so
+ * remote entries always win per-slug; this only fills holes for slugs the
+ * remote response is silent on. Without this, a wiped or unreachable
+ * registry produces a migration that copies admin forward as "incompatible"
+ * and never installs admin2/api.
+ */
+function mg_baseline_registry(): array
+{
+    return [
+        'plugins' => [
+            'admin' => [
+                'grav'        => ['1.7'],
+                'replaced_by' => 'admin2',
+                'notes'       => 'Replaced by Admin 2.0',
+            ],
+            'admin2' => [
+                'grav'        => ['2.0'],
+                'github_repo' => 'getgrav/grav-plugin-admin2',
+                'requires'    => ['api'],
+            ],
+            'api' => [
+                'grav'        => ['2.0'],
+                'github_repo' => 'getgrav/grav-plugin-api',
+            ],
+        ],
+        'themes' => [],
+    ];
+}
+
+/**
+ * Merge mg_baseline_registry() under $remote: any slug $remote already
+ * defines wins; missing slugs get the baseline entry. Always returns a
+ * non-null array so install-side lookups have something to work with even
+ * when the network fetch failed (the offline signal is preserved separately
+ * by the caller, not on this return value).
+ */
+function mg_apply_baseline_registry(?array $remote): array
+{
+    $baseline = mg_baseline_registry();
+    if (!is_array($remote)) return $baseline;
+
+    foreach (['plugins', 'themes'] as $kind) {
+        if (!isset($remote[$kind]) || !is_array($remote[$kind])) {
+            $remote[$kind] = [];
+        }
+        foreach ($baseline[$kind] as $slug => $entry) {
+            if (!isset($remote[$kind][$slug])) {
+                $remote[$kind][$slug] = $entry;
+            }
+        }
+    }
+    return $remote;
 }
 
 /**
@@ -3333,10 +3406,23 @@ function render_compat_breakdown(array $scan): void
         $pending = $pendingInstalls[$k] ?? [];
         if (!$items && !$pending) continue;
 
-        $buckets = ['compatible' => [], 'needs_update' => [], 'incompatible' => []];
+        $buckets = ['compatible' => [], 'needs_update' => [], 'will_upgrade' => [], 'incompatible' => []];
         foreach ($items as $slug => $v) {
             $status = $v['status'] ?? 'incompatible';
-            $buckets[$status === 'compatible' ? 'compatible' : ($status === 'needs_update' ? 'needs_update' : 'incompatible')][$slug] = $v;
+            if ($status === 'compatible') {
+                $buckets['compatible'][$slug] = $v;
+            } elseif ($status === 'needs_update') {
+                $buckets['needs_update'][$slug] = $v;
+            } elseif (!empty($v['update']) && empty($v['replaced_by'])) {
+                // Raw verdict is incompatible (no curated/blueprint 2.0 marker
+                // at the installed version), but GPM has a newer release the
+                // 2.0 catalog filter accepted — Phase 4's gpm update will land
+                // it. Pulling these out of "Incompatible" avoids the misleading
+                // implication that the user's skip/disable policy will apply.
+                $buckets['will_upgrade'][$slug] = $v;
+            } else {
+                $buckets['incompatible'][$slug] = $v;
+            }
         }
 
         $total = count($items) + count($pending);
@@ -3383,9 +3469,10 @@ function render_compat_breakdown(array $scan): void
         }
 
         $bucketMeta = [
-            'compatible'   => ['icon' => '✓', 'cls' => 'ok',   'label' => 'Compatible'],
-            'needs_update' => ['icon' => '⚠', 'cls' => 'warn', 'label' => 'Needs update'],
-            'incompatible' => ['icon' => '✗', 'cls' => 'err',  'label' => 'Incompatible'],
+            'compatible'   => ['icon' => '✓', 'cls' => 'ok',      'label' => 'Compatible'],
+            'needs_update' => ['icon' => '⚠', 'cls' => 'warn',    'label' => 'Needs update'],
+            'will_upgrade' => ['icon' => '↑', 'cls' => 'upgrade', 'label' => 'Will be upgraded'],
+            'incompatible' => ['icon' => '✗', 'cls' => 'err',     'label' => 'Incompatible'],
         ];
         foreach ($bucketMeta as $status => $meta) {
             $rows = $buckets[$status];
@@ -3409,11 +3496,16 @@ function render_compat_breakdown(array $scan): void
                 // Twig 3 compat layer. Reframe the row so users don't see a
                 // scary ✗ next to their working theme.
                 $isKeptTheme = ($k === 'themes' && $status === 'incompatible' && !$replBy);
+                $isWillUpgrade = ($status === 'will_upgrade');
                 $rowIcon   = $isKeptTheme ? '⚠' : $meta['icon'];
                 $rowCls    = $isKeptTheme ? 'warn' : $meta['cls'];
-                $rowReason = $isKeptTheme
-                    ? 'Kept — Twig 3 compatibility enabled (verify before promoting)'
-                    : $reason;
+                if ($isKeptTheme) {
+                    $rowReason = 'Kept — Twig 3 compatibility enabled (verify before promoting)';
+                } elseif ($isWillUpgrade) {
+                    $rowReason = 'GPM has a 2.0-compatible release — will upgrade during migration';
+                } else {
+                    $rowReason = $reason;
+                }
 
                 echo '<li class="mg-compat mg-compat-' . $rowCls . '">';
                 echo '<span class="mg-compat-icon">' . $rowIcon . '</span>';
@@ -3621,14 +3713,16 @@ function page_css(): string
         min-width: 22px; height: 18px; padding: 0 6px; border-radius: 9px;
         background: #eef0f6; color: #4b5563; font-size: 11px; font-weight: 700;
         letter-spacing: 0; text-transform: none; }
-    .mg-compat-subhead-ok::before   { background: #2a7f2a; }
-    .mg-compat-subhead-warn::before { background: #c47d00; }
-    .mg-compat-subhead-err::before  { background: #c62828; }
-    .mg-compat-subhead-new::before  { background: #5b3ea8; }
-    .mg-compat-subhead-ok .mg-compat-subhead-count   { background: #e3f4e3; color: #1f5a1f; }
-    .mg-compat-subhead-warn .mg-compat-subhead-count { background: #fff1d6; color: #80560a; }
-    .mg-compat-subhead-err .mg-compat-subhead-count  { background: #fde2e2; color: #8c2020; }
-    .mg-compat-subhead-new .mg-compat-subhead-count  { background: #ece5fa; color: #4a328b; }
+    .mg-compat-subhead-ok::before      { background: #2a7f2a; }
+    .mg-compat-subhead-warn::before    { background: #c47d00; }
+    .mg-compat-subhead-err::before     { background: #c62828; }
+    .mg-compat-subhead-new::before     { background: #5b3ea8; }
+    .mg-compat-subhead-upgrade::before { background: #0f766e; }
+    .mg-compat-subhead-ok .mg-compat-subhead-count      { background: #e3f4e3; color: #1f5a1f; }
+    .mg-compat-subhead-warn .mg-compat-subhead-count    { background: #fff1d6; color: #80560a; }
+    .mg-compat-subhead-err .mg-compat-subhead-count     { background: #fde2e2; color: #8c2020; }
+    .mg-compat-subhead-new .mg-compat-subhead-count     { background: #ece5fa; color: #4a328b; }
+    .mg-compat-subhead-upgrade .mg-compat-subhead-count { background: #d8f1ee; color: #0f766e; }
     .mg-compat-list { list-style: none; padding: 0; margin: 0 0 4px; border: 1px solid #eef0f6;
         border-radius: 4px; overflow: hidden; }
     .mg-compat { display: grid; grid-template-columns: 22px 190px 80px 1fr 96px; gap: 10px;
@@ -3650,9 +3744,10 @@ function page_css(): string
     .mg-compat-source-default   { background: #eef0f6; color: #6b7280; }
     .mg-compat-source-github    { background: #1f2937; color: #f3f4f6; }
     .mg-compat-source-gpm       { background: #d1f0d6; color: #1f5a1f; }
-    .mg-compat-ok   { background: #f6fcf6; } .mg-compat-ok   .mg-compat-icon { color: #2a7f2a; }
-    .mg-compat-warn { background: #fffaf0; } .mg-compat-warn .mg-compat-icon { color: #c47d00; }
-    .mg-compat-err  { background: #fff5f5; } .mg-compat-err  .mg-compat-icon { color: #c62828; }
+    .mg-compat-ok       { background: #f6fcf6; } .mg-compat-ok      .mg-compat-icon { color: #2a7f2a; }
+    .mg-compat-warn     { background: #fffaf0; } .mg-compat-warn    .mg-compat-icon { color: #c47d00; }
+    .mg-compat-err      { background: #fff5f5; } .mg-compat-err     .mg-compat-icon { color: #c62828; }
+    .mg-compat-upgrade  { background: #f0fbf9; } .mg-compat-upgrade .mg-compat-icon { color: #0f766e; }
     .mg-compat-new  { background: linear-gradient(to right, #f4efff, #fff); border-left: 3px solid #5b3ea8; }
     .mg-compat-new .mg-compat-icon { color: #5b3ea8; font-size: 16px; }
     .mg-compat-new .mg-compat-slug { color: #5b3ea8; }

@@ -1,3 +1,12 @@
+# v1.0.0-rc.2
+## 05-06-2026
+
+1. [](#improved)
+    * Step 2 compatibility breakdown now has a dedicated **Will be upgraded** bucket for plugins whose installed version reads as 1.7-only but for which GPM has a newer 2.0-compatible release. Previously these were rendered under **Incompatible** even though Phase 4's `gpm update` will land the new version — misleading because the user's skip/disable policy doesn't apply to them.
+2. [](#bugfix)
+    * Replacement installs (admin2 + api) are now guaranteed even when the curated compatibility registry is offline or has been pruned of those entries — a hardcoded baseline maps `admin → admin2` (with `requires: [api]`) and is merged under the remote response so any remote entry still wins per slug.
+    * GPM upgrade detection no longer silently fails: `getgrav.org/downloads` returns the install URL under `zipball_url`, but the wizard was reading `download`. Normalized inside `mg_fetch_gpm_index` so every plugin with a newer 2.0-compatible release on GPM now lands in the **Will be upgraded** bucket and gets installed via GPM during the upgrade pass (instead of silently falling through to the GitHub fallback path).
+
 # v1.0.0-rc.1
 ## 05-04-2026
 
