@@ -62,6 +62,20 @@ class Kickoff
             'wizard_url' => '/' . self::MIGRATE_FILE . '?token=' . $token,
         ];
 
+        // Forward Grav's system.http.proxy_url / proxy_cert_path into the
+        // flag so the standalone wizard (which runs without Grav loaded)
+        // can apply the same proxy to its own outbound HTTP calls. Empty
+        // values aren't serialized — keeps the flag clean for the common
+        // no-proxy case.
+        $proxyUrl      = (string) ($this->config['proxy_url']       ?? '');
+        $proxyCertPath = (string) ($this->config['proxy_cert_path'] ?? '');
+        if ($proxyUrl !== '') {
+            $payload['proxy'] = ['url' => $proxyUrl];
+            if ($proxyCertPath !== '') {
+                $payload['proxy']['cert_path'] = $proxyCertPath;
+            }
+        }
+
         $this->writeFlag($payload);
 
         return $payload;
@@ -140,7 +154,13 @@ class Kickoff
 
     private function downloadTo(string $url, string $dest): void
     {
-        $in = @fopen($url, 'rb');
+        // Build a stream context that honors Grav's proxy config. Without
+        // this, sites behind a corporate proxy can't fetch the Grav 2.0 zip
+        // and the kickoff fails with a generic "Failed to open source URL".
+        $ctx = $this->buildHttpContext();
+        $in = $ctx !== null
+            ? @fopen($url, 'rb', false, $ctx)
+            : @fopen($url, 'rb');
         if (!$in) {
             throw new RuntimeException("Failed to open source URL: {$url}");
         }
@@ -161,6 +181,43 @@ class Kickoff
             fclose($in);
             fclose($out);
         }
+    }
+
+    /**
+     * Build a stream context for the kickoff's outbound zip download,
+     * threading in proxy config from Grav's system.http.proxy_url /
+     * proxy_cert_path (forwarded into $this->config by migrate-grav.php's
+     * newKickoff() / cli/InitCommand.php). Returns null when no proxy is
+     * configured — the caller then falls back to a bare fopen() so the
+     * common case (no proxy) doesn't pay any context-construction cost.
+     *
+     * @return resource|null
+     */
+    private function buildHttpContext()
+    {
+        $proxyUrl = (string) ($this->config['proxy_url'] ?? '');
+        if ($proxyUrl === '') {
+            return null;
+        }
+
+        // PHP's HTTP stream wrapper wants tcp://host:port. Strip any
+        // http:// or https:// scheme the user wrote in system.yaml.
+        $proxyHostPort = preg_replace('~^[a-zA-Z][a-zA-Z0-9+.\-]*://~', '', $proxyUrl);
+        $http = [
+            'timeout'         => 60, // zip can be large; be generous
+            'header'          => "User-Agent: grav-migrate-kickoff/1.0\r\n",
+            'proxy'           => 'tcp://' . $proxyHostPort,
+            'request_fulluri' => true,
+        ];
+        $ssl = ['verify_peer' => true, 'verify_peer_name' => true];
+
+        $certPath = (string) ($this->config['proxy_cert_path'] ?? '');
+        if ($certPath !== '') {
+            if (is_file($certPath))      $ssl['cafile'] = $certPath;
+            elseif (is_dir($certPath))   $ssl['capath'] = $certPath;
+        }
+
+        return stream_context_create(['http' => $http, 'ssl' => $ssl]);
     }
 
     /**

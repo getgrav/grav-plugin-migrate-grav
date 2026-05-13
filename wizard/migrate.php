@@ -1521,6 +1521,91 @@ function mg_lookup_registry_entry(string $slug): ?array
 }
 
 /**
+/**
+ * Proxy configuration source-of-truth for the wizard. Read once from the
+ * `.migrating` flag (populated by Kickoff at staging time from Grav's
+ * system.http.proxy_url / proxy_cert_path), with an env-var fallback for
+ * standalone / CLI invocations where Kickoff didn't run.
+ *
+ * Returns ['url' => string, 'cert_path' => string]. Empty 'url' = no proxy.
+ *
+ * Cached for the request — proxy config doesn't change mid-wizard, and
+ * cracking open the 2-3 MB flag file repeatedly on every HTTP call adds up.
+ */
+function mg_proxy_config(): array
+{
+    static $cached = null;
+    if ($cached !== null) return $cached;
+
+    $flagPath = __DIR__ . '/.migrating';
+    if (is_file($flagPath)) {
+        $f = json_decode((string) @file_get_contents($flagPath), true);
+        if (is_array($f) && !empty($f['proxy']) && is_array($f['proxy'])) {
+            $url       = (string) ($f['proxy']['url']       ?? '');
+            $certPath  = (string) ($f['proxy']['cert_path'] ?? '');
+            if ($url !== '') {
+                return $cached = ['url' => $url, 'cert_path' => $certPath];
+            }
+        }
+    }
+
+    // Env-var fallback. POSIX env vars are case-sensitive; both forms are
+    // common in the wild (curl honors lowercase; many CI runners set
+    // uppercase). HTTPS_PROXY wins over HTTP_PROXY when both are set, since
+    // most outbound calls here are HTTPS.
+    $url = getenv('HTTPS_PROXY') ?: getenv('https_proxy')
+        ?: getenv('HTTP_PROXY')  ?: getenv('http_proxy')
+        ?: getenv('ALL_PROXY')   ?: getenv('all_proxy')
+        ?: '';
+
+    return $cached = ['url' => (string) $url, 'cert_path' => ''];
+}
+
+/**
+ * Build a stream context for an outbound HTTP call, threading in the
+ * proxy config from mg_proxy_config() automatically. Every outbound call
+ * in this wizard MUST go through here — direct stream_context_create()
+ * silently bypasses proxy settings and breaks for users behind a corporate
+ * proxy / air-gapped network.
+ *
+ * $http accepts the same shape as the 'http' key in stream_context_create
+ * (timeout, header, method, ignore_errors, …). $ssl likewise; defaults
+ * enable peer verification.
+ *
+ * Proxy URL handling:
+ *   - Strip any scheme prefix from the configured proxy URL; PHP's stream
+ *     wrapper expects 'tcp://host:port'.
+ *   - Set request_fulluri so HTTP requests through the proxy include the
+ *     full URL in the request line (proxy requirement). HTTPS requests use
+ *     CONNECT implicitly and ignore this flag.
+ *   - Credentials embedded in the proxy URL (http://user:pass@host:port)
+ *     are preserved as-is; PHP's HTTP wrapper emits Proxy-Authorization
+ *     from them. Grav 1.7 doesn't expose separate proxy_username /
+ *     proxy_password keys, so URL-embedded creds are the only auth path.
+ *   - proxy_cert_path: if it's a file, set as 'cafile'; if a dir, 'capath'.
+ *     Matches Grav 1.7's documented behavior.
+ */
+function mg_http_context(array $http = [], array $ssl = []): mixed
+{
+    $ssl = $ssl + ['verify_peer' => true, 'verify_peer_name' => true];
+
+    $proxy = mg_proxy_config();
+    if ($proxy['url'] !== '') {
+        $proxyHostPort = preg_replace('~^[a-zA-Z][a-zA-Z0-9+.\-]*://~', '', $proxy['url']);
+        $http['proxy']            = 'tcp://' . $proxyHostPort;
+        $http['request_fulluri']  = true;
+
+        $certPath = $proxy['cert_path'];
+        if ($certPath !== '') {
+            if (is_file($certPath))      $ssl['cafile'] = $certPath;
+            elseif (is_dir($certPath))   $ssl['capath'] = $certPath;
+        }
+    }
+
+    return stream_context_create(['http' => $http, 'ssl' => $ssl]);
+}
+
+/**
  * Download a zip of the default branch of <owner>/<repo> from GitHub and
  * extract its single top-level directory's contents into
  * {webroot}/{stageDir}/user/plugins/{slug}/.
@@ -1536,13 +1621,10 @@ function mg_fetch_and_install_github(string $webroot, string $stageDir, string $
     // record version as "1.0.0" — sentinel for "pre-release install".
     $resolved = mg_github_resolve_download($repo);
 
-    $ctx = stream_context_create([
-        'http' => [
-            'timeout' => 20,
-            'header'  => "User-Agent: grav-migrate-wizard/1.0\r\nAccept: application/vnd.github+json\r\n",
-            'ignore_errors' => false,
-        ],
-        'ssl'  => ['verify_peer' => true, 'verify_peer_name' => true],
+    $ctx = mg_http_context([
+        'timeout'       => 20,
+        'header'        => "User-Agent: grav-migrate-wizard/1.0\r\nAccept: application/vnd.github+json\r\n",
+        'ignore_errors' => false,
     ]);
     $bytes = @file_get_contents($resolved['zipball'], false, $ctx);
     if ($bytes === false || strlen($bytes) < 1024) {
@@ -1609,9 +1691,10 @@ function mg_install_zip_url(string $webroot, string $stageDir, string $kind, str
     $safeSlug = preg_replace('/[^a-z0-9\-]/i', '_', $slug);
     $zipPath  = $tmp . '/update-' . $safeKind . '-' . $safeSlug . '.zip';
 
-    $ctx = stream_context_create([
-        'http' => ['timeout' => 25, 'header' => "User-Agent: grav-migrate-wizard/1.0\r\n", 'ignore_errors' => false],
-        'ssl'  => ['verify_peer' => true, 'verify_peer_name' => true],
+    $ctx = mg_http_context([
+        'timeout'       => 25,
+        'header'        => "User-Agent: grav-migrate-wizard/1.0\r\n",
+        'ignore_errors' => false,
     ]);
     $bytes = @file_get_contents($url, false, $ctx);
     if ($bytes === false || strlen($bytes) < 1024) {
@@ -1667,13 +1750,10 @@ function mg_install_zip_url(string $webroot, string $stageDir, string $kind, str
  */
 function mg_github_resolve_download(string $repo): array
 {
-    $ctx = stream_context_create([
-        'http' => [
-            'timeout' => 6,
-            'header'  => "User-Agent: grav-migrate-wizard/1.0\r\nAccept: application/vnd.github+json\r\n",
-            'ignore_errors' => true,
-        ],
-        'ssl'  => ['verify_peer' => true, 'verify_peer_name' => true],
+    $ctx = mg_http_context([
+        'timeout'       => 6,
+        'header'        => "User-Agent: grav-migrate-wizard/1.0\r\nAccept: application/vnd.github+json\r\n",
+        'ignore_errors' => true,
     ]);
 
     // Tier 1: /releases/latest (excludes pre-releases by GitHub's design).
@@ -2342,9 +2422,10 @@ function mg_fetch_gpm_index(string $kind, string $gravVersion = '', string $phpV
         'php'     => $phpVersion  !== '' ? $phpVersion  : PHP_VERSION,
         'testing' => 1,
     ]);
-    $ctx = stream_context_create([
-        'http' => ['timeout' => 6, 'ignore_errors' => true, 'header' => "User-Agent: grav-migrate-wizard/1.0\r\n"],
-        'ssl'  => ['verify_peer' => true, 'verify_peer_name' => true],
+    $ctx = mg_http_context([
+        'timeout'       => 6,
+        'ignore_errors' => true,
+        'header'        => "User-Agent: grav-migrate-wizard/1.0\r\n",
     ]);
     $raw = @file_get_contents($url, false, $ctx);
     if ($raw === false) return null;
@@ -2373,9 +2454,10 @@ function mg_fetch_gpm_index(string $kind, string $gravVersion = '', string $phpV
  */
 function mg_fetch_curated(): ?array
 {
-    $ctx = stream_context_create([
-        'http' => ['timeout' => 4, 'ignore_errors' => true, 'header' => "User-Agent: grav-migrate-wizard/1.0\r\n"],
-        'ssl'  => ['verify_peer' => true, 'verify_peer_name' => true],
+    $ctx = mg_http_context([
+        'timeout'       => 4,
+        'ignore_errors' => true,
+        'header'        => "User-Agent: grav-migrate-wizard/1.0\r\n",
     ]);
     $raw = @file_get_contents(MG_COMPAT_URL, false, $ctx);
     if ($raw === false) return null;
@@ -3353,14 +3435,17 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
             $installPath = rtrim(base_path_from_script(), '/');
             $stagePathFull = $installPath . '/' . $stageDir;
 
-            echo '<div class="mg-result-section"><strong>nginx</strong><div class="mg-result-row">Add a location block above your existing Grav location:</div>';
+            echo '<div class="mg-result-section"><strong>nginx</strong><div class="mg-result-row">Add this block above your existing Grav <code>location</code>. The PHP handler must be <em>nested</em> inside the prefix block — sibling regex locations are never consulted once an <code>^~</code> prefix match wins, so a sibling <code>location ~ \\.php$</code> would silently break PHP execution under the stage path:</div>';
             echo '<pre class="mg-code">location ^~ ' . htmlspecialchars($stagePathFull) . '/ {' . "\n";
-            echo '    try_files $uri $uri/ ' . htmlspecialchars($stagePathFull) . '/index.php?$query_string;' . "\n";
-            echo "}\n";
-            echo 'location ~ ^' . htmlspecialchars($stagePathFull) . "/.+\\.php$ {\n";
-            echo "    fastcgi_pass   unix:/run/php/php-fpm.sock;\n";
-            echo "    include        fastcgi_params;\n";
-            echo "    fastcgi_param  SCRIPT_FILENAME \$document_root\$fastcgi_script_name;\n";
+            echo '    try_files $uri $uri/ ' . htmlspecialchars($stagePathFull) . "/index.php?\$query_string;\n";
+            echo "\n";
+            echo "    location ~ \\.php\$ {\n";
+            echo "        fastcgi_pass            unix:/run/php/php-fpm.sock;\n";
+            echo "        fastcgi_split_path_info ^(.+\\.php)(/.+)\$;\n";
+            echo "        fastcgi_index           index.php;\n";
+            echo "        include                 fastcgi_params;\n";
+            echo "        fastcgi_param           SCRIPT_FILENAME \$document_root\$fastcgi_script_name;\n";
+            echo "    }\n";
             echo '}</pre></div>';
 
             echo '<div class="mg-result-section"><strong>Caddy v2</strong><div class="mg-result-row">Inside your site block:</div>';

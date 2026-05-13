@@ -159,6 +159,13 @@ class MigrateGravPlugin extends Plugin
         // channel the rest of the admin uses (?testing vs stable).
         $config['gpm_channel'] = (string) $this->grav['config']->get('system.gpm.releases', 'stable');
 
+        // Forward Grav's proxy config so both the Kickoff's own zip download
+        // AND the standalone wizard (via the .migrating flag) honor it.
+        // Sites behind a corporate proxy were silently breaking on every
+        // outbound call (GPM catalog, GitHub release lookups, the 2.0 zip).
+        $config['proxy_url']       = (string) $this->grav['config']->get('system.http.proxy_url', '');
+        $config['proxy_cert_path'] = (string) $this->grav['config']->get('system.http.proxy_cert_path', '');
+
         return new Kickoff($webroot, $config);
     }
 }
