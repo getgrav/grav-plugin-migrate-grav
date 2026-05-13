@@ -1,3 +1,13 @@
+# v1.0.0-rc.3
+## 05-13-2026
+
+1. [](#improved)
+    * Pre-promote callout now warns to close any editor, git GUI (Sourcetree, GitHub Desktop, GitKraken), and terminal that has the webroot open — on Windows these processes hold file handles that block the Phase 2 delete pass.
+    * Promote step on Windows now runs a pre-flight scan for locked files BEFORE deleting anything, so the wizard reports the specific paths (e.g. `user/plugins/foo/.git/index`) the user needs to free, rather than half-destroying the webroot and failing midway. macOS and Linux skip the scan — `unlink()` succeeds on open files there.
+    * Promote failure callout now names the specific file that couldn't be deleted (e.g. `user/plugins/foo/.git/objects/pack/pack-abc.idx`) instead of just the top-level entry, so it's obvious which editor or git GUI to close.
+    * Promote failure callout now includes recovery instructions for the backup zip, including a Windows-specific warning that File Explorer's in-place zip viewer renders nested paths as a flat breadcrumb list (`system·src·Grav·…`) and that you must use **Right-click → Extract All…** rather than dragging entries out.
+    * README has a new **Recovering from a failed promote** section documenting the three-phase rollback model and platform-specific extraction commands.
+
 # v1.0.0-rc.2
 ## 05-06-2026
 

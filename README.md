@@ -71,6 +71,26 @@ If you want to start over before launching the wizard, remove:
 
 Your existing Grav 1.x site is untouched.
 
+## Recovering from a failed promote
+
+The promote step is the only point where the wizard touches your live webroot. It runs in three phases:
+
+1. **Phase 1 — backup zip.** Every file in your live 1.x install (except the staged `grav-2/`) is zipped to `grav-2/backup/migration-backup-<version>--<timestamp>.zip`. After promote this lands at `backup/<…>.zip` next to Grav's other backups.
+2. **Phase 2 — delete.** Top-level entries at the webroot are removed.
+3. **Phase 3 — promote.** Contents of `grav-2/` are renamed up to the webroot.
+
+If Phase 2 or Phase 3 fails partway through, your live webroot may be partially destroyed. The backup zip from Phase 1 is your recovery artifact.
+
+**Before you retry, identify and free the lock.** The most common failure (especially on Windows, where open files can't be deleted) is a code editor, git GUI, or terminal holding a file handle on something inside your webroot — `.git/index`, `.git/objects/pack/*.idx`, a `.log` being tailed. The wizard will now report the specific path that failed; close whatever has it open.
+
+**To restore from the backup zip:**
+
+- **Windows:** in File Explorer, right-click the zip → **Extract All…** and pick your webroot. **Do not** drag entries out of File Explorer's in-place zip viewer — that view shows a flat breadcrumb list (`system·src·Grav·…`) and dragging out produces files with literal `·` separators in their names. The Extract All wizard reconstructs the directory tree correctly. 7-Zip and WinRAR also work fine.
+- **macOS:** double-click in Finder (Archive Utility extracts a proper tree), or `unzip migration-backup-*.zip -d /path/to/webroot` from Terminal.
+- **Linux:** `unzip migration-backup-*.zip -d /path/to/webroot`.
+
+Once the webroot is restored, follow the **Aborting** steps above to clear the wizard state, then re-run the wizard from the admin.
+
 ## License
 
 MIT
