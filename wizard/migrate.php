@@ -919,6 +919,27 @@ function do_promote(string $webroot, array $flag, ?callable $progress = null): a
     }
 
     // ─── Phase 2: delete everything at webroot except the stage dir ────────
+    //
+    // Pre-flight: on Windows, a file held open by another process (VSCode
+    // file-watcher, Sourcetree's libgit2, a tail -f, a tmux pane with the
+    // file open in vim) cannot be deleted — unlink() fails. Phase 2 partway
+    // through would leave the webroot half-destroyed AND the backup zip
+    // sitting inside grav-2/backup waiting to be hand-extracted. Detect
+    // locks BEFORE the destructive work so the user can close the offender
+    // and retry without recovering. macOS/Linux skip this — unlink succeeds
+    // there regardless of open handles, so the runtime check would be wasted
+    // I/O and would also produce false negatives (the rename-rename-back
+    // probe always succeeds when share-delete is the default).
+    $locked = mg_check_windows_locks($webroot, $stageDir);
+    if ($locked !== []) {
+        $sample = array_slice($locked, 0, 10);
+        $more   = count($locked) - count($sample);
+        $msg    = "Cannot safely promote — these files are locked by another process (close any editor, git GUI, or terminal that has the webroot open, then retry):\n  - "
+            . implode("\n  - ", $sample)
+            . ($more > 0 ? "\n  …and {$more} more" : '');
+        return ['ok' => false, 'msg' => $msg, 'locked' => $locked];
+    }
+
     $deleted = [];
     foreach (scandir($webroot) ?: [] as $entry) {
         if ($entry === '.' || $entry === '..') continue;
@@ -926,10 +947,19 @@ function do_promote(string $webroot, array $flag, ?callable $progress = null): a
 
         if ($progress) $progress(['phase' => 'copy', 'entry' => 'clear', 'file' => $entry, 'copied' => $added]);
         $path = $webroot . '/' . $entry;
+        $failedPath = null;
         if (is_link($path) || is_file($path)) {
-            if (!@unlink($path)) return ['ok' => false, 'msg' => "Could not delete {$entry}"];
+            if (!@unlink($path)) {
+                $rel = ltrim(substr($path, strlen($webroot)), '/\\');
+                return ['ok' => false, 'msg' => "Could not delete {$rel} (file is locked by another process — close any editor, git GUI, or terminal that has it open, then retry)."];
+            }
         } elseif (is_dir($path)) {
-            if (!mg_rm_tree($path)) return ['ok' => false, 'msg' => "Could not delete directory {$entry}"];
+            if (!mg_rm_tree($path, $failedPath)) {
+                $rel = $failedPath !== null
+                    ? ltrim(substr($failedPath, strlen($webroot)), '/\\')
+                    : $entry;
+                return ['ok' => false, 'msg' => "Could not delete {$rel} (file is locked by another process — close any editor, git GUI, or terminal that has it open, then retry)."];
+            }
         }
         $deleted[] = $entry;
     }
@@ -1084,21 +1114,118 @@ function mg_zip_webroot(ZipArchive $zip, string $webroot, string $skipTop, int &
     return null;
 }
 
-function mg_rm_tree(string $path): bool
+/**
+ * Windows-only pre-flight: scan the webroot (excluding the stage dir) for
+ * files we won't be able to unlink during Phase 2 because another process
+ * holds an exclusive handle. On Windows, MoveFileEx (which underlies PHP's
+ * rename()) refuses when the target file is open without FILE_SHARE_DELETE
+ * — which is the default for editors (VSCode, Sublime), git GUIs
+ * (Sourcetree's libgit2 holds .git/index, packed-refs, *.idx, *.pack), and
+ * even some shells. So a successful rename-to-self-with-suffix-then-back is
+ * a reliable proxy for "PHP's unlink() will succeed on this path."
+ *
+ * On macOS/Linux this is a no-op: unlink() succeeds on open files there
+ * (the inode just sticks around until the last fd closes), so the check
+ * would be both wasted I/O and a source of false positives — share-delete
+ * is implicit, so the rename probe always succeeds, including for files
+ * that ARE problematic for unrelated reasons. Skipping the probe entirely
+ * is the right answer.
+ *
+ * Returns the list of locked paths relative to the webroot. Empty array =
+ * safe to proceed. Caller renders the list to the user. Capped at 50 so
+ * a totally-locked tree doesn't produce a 10MB response body.
+ *
+ * Caveat: rename-rename-back is destructive if power fails between the two
+ * renames (file ends up as `foo.mglocktest`). PHP's rename is atomic on the
+ * same volume (MoveFileEx with MOVEFILE_REPLACE_EXISTING isn't used here so
+ * it's a simple rename), and we stay on the same volume by appending to the
+ * existing path. Risk is low enough to accept against the value of catching
+ * locks before destroying the webroot.
+ */
+function mg_check_windows_locks(string $webroot, string $skipTop): array
+{
+    if (PHP_OS_FAMILY !== 'Windows') {
+        return [];
+    }
+
+    $locked = [];
+    $cap    = 50;
+
+    try {
+        $it = new RecursiveIteratorIterator(
+            new RecursiveCallbackFilterIterator(
+                new RecursiveDirectoryIterator($webroot, RecursiveDirectoryIterator::SKIP_DOTS),
+                static function ($item) use ($webroot, $skipTop) {
+                    $path = $item->getPathname();
+                    if (strpos($path, $webroot . DIRECTORY_SEPARATOR . $skipTop . DIRECTORY_SEPARATOR) === 0
+                        || $path === $webroot . DIRECTORY_SEPARATOR . $skipTop) {
+                        return false;
+                    }
+                    return true;
+                }
+            ),
+            RecursiveIteratorIterator::LEAVES_ONLY
+        );
+    } catch (\Throwable $e) {
+        // Can't iterate — let the destructive phase surface the real error.
+        return [];
+    }
+
+    foreach ($it as $file) {
+        // Symlinks: deleting the link doesn't touch the target, so handle
+        // checks aren't needed. Directories: empty dirs delete cleanly even
+        // when Windows Explorer has the folder selected, and rmdir() will
+        // surface any real failure during the destructive phase.
+        if ($file->isLink() || !$file->isFile()) continue;
+
+        $path = $file->getPathname();
+        $tmp  = $path . '.mglocktest';
+        // If the .mglocktest sibling already exists from a previous crashed
+        // run, treat it as locked rather than overwriting it.
+        if (file_exists($tmp)) {
+            $locked[] = ltrim(substr($path, strlen($webroot)), '/\\');
+        } elseif (@rename($path, $tmp)) {
+            // Free — restore. If restore somehow fails, do not leave it in
+            // limbo: rename failure here is essentially impossible on the
+            // same volume, but if it happens we report the original path
+            // as problematic so the user notices.
+            if (!@rename($tmp, $path)) {
+                $locked[] = ltrim(substr($path, strlen($webroot)), '/\\') . ' (renamed to .mglocktest — please restore manually)';
+            }
+        } else {
+            $locked[] = ltrim(substr($path, strlen($webroot)), '/\\');
+        }
+
+        if (count($locked) >= $cap) break;
+    }
+
+    return $locked;
+}
+
+function mg_rm_tree(string $path, ?string &$failedPath = null): bool
 {
     // Critical: never traverse INTO symlinks. The wizard's staged tree often
     // contains symlinks to plugin source clones (a developer convenience), and
     // RecursiveDirectoryIterator follows them by default, which would attempt
     // to delete real source files. scandir() returns symlinks as plain entries
     // we can identify via is_link() before deciding to recurse or just unlink.
+    //
+    // $failedPath is set to the FIRST path that couldn't be removed, so the
+    // promote-error UI can name exactly which file is locked (typically a
+    // .git/index or editor-held buffer on Windows) instead of just the
+    // top-level entry. Subsequent failures in the same tree are not tracked
+    // — first one wins, since that's the one the user needs to free.
     if (is_link($path) || is_file($path)) {
-        return @unlink($path);
+        if (@unlink($path)) return true;
+        if ($failedPath === null) $failedPath = $path;
+        return false;
     }
     if (!is_dir($path)) {
         return true;
     }
     $items = @scandir($path);
     if ($items === false) {
+        if ($failedPath === null) $failedPath = $path;
         return false;
     }
     $ok = true;
@@ -1106,14 +1233,24 @@ function mg_rm_tree(string $path): bool
         if ($item === '.' || $item === '..') continue;
         $sub = $path . DIRECTORY_SEPARATOR . $item;
         if (is_link($sub)) {
-            $ok = @unlink($sub) && $ok;
+            if (!@unlink($sub)) {
+                if ($failedPath === null) $failedPath = $sub;
+                $ok = false;
+            }
         } elseif (is_dir($sub)) {
-            $ok = mg_rm_tree($sub) && $ok;
+            $ok = mg_rm_tree($sub, $failedPath) && $ok;
         } else {
-            $ok = @unlink($sub) && $ok;
+            if (!@unlink($sub)) {
+                if ($failedPath === null) $failedPath = $sub;
+                $ok = false;
+            }
         }
     }
-    return @rmdir($path) && $ok;
+    if (!@rmdir($path)) {
+        if ($failedPath === null) $failedPath = $path;
+        return false;
+    }
+    return $ok;
 }
 
 // ─── Step 5: Test (server-aware sub-path enabler) ──────────────────────────
@@ -1384,6 +1521,91 @@ function mg_lookup_registry_entry(string $slug): ?array
 }
 
 /**
+/**
+ * Proxy configuration source-of-truth for the wizard. Read once from the
+ * `.migrating` flag (populated by Kickoff at staging time from Grav's
+ * system.http.proxy_url / proxy_cert_path), with an env-var fallback for
+ * standalone / CLI invocations where Kickoff didn't run.
+ *
+ * Returns ['url' => string, 'cert_path' => string]. Empty 'url' = no proxy.
+ *
+ * Cached for the request — proxy config doesn't change mid-wizard, and
+ * cracking open the 2-3 MB flag file repeatedly on every HTTP call adds up.
+ */
+function mg_proxy_config(): array
+{
+    static $cached = null;
+    if ($cached !== null) return $cached;
+
+    $flagPath = __DIR__ . '/.migrating';
+    if (is_file($flagPath)) {
+        $f = json_decode((string) @file_get_contents($flagPath), true);
+        if (is_array($f) && !empty($f['proxy']) && is_array($f['proxy'])) {
+            $url       = (string) ($f['proxy']['url']       ?? '');
+            $certPath  = (string) ($f['proxy']['cert_path'] ?? '');
+            if ($url !== '') {
+                return $cached = ['url' => $url, 'cert_path' => $certPath];
+            }
+        }
+    }
+
+    // Env-var fallback. POSIX env vars are case-sensitive; both forms are
+    // common in the wild (curl honors lowercase; many CI runners set
+    // uppercase). HTTPS_PROXY wins over HTTP_PROXY when both are set, since
+    // most outbound calls here are HTTPS.
+    $url = getenv('HTTPS_PROXY') ?: getenv('https_proxy')
+        ?: getenv('HTTP_PROXY')  ?: getenv('http_proxy')
+        ?: getenv('ALL_PROXY')   ?: getenv('all_proxy')
+        ?: '';
+
+    return $cached = ['url' => (string) $url, 'cert_path' => ''];
+}
+
+/**
+ * Build a stream context for an outbound HTTP call, threading in the
+ * proxy config from mg_proxy_config() automatically. Every outbound call
+ * in this wizard MUST go through here — direct stream_context_create()
+ * silently bypasses proxy settings and breaks for users behind a corporate
+ * proxy / air-gapped network.
+ *
+ * $http accepts the same shape as the 'http' key in stream_context_create
+ * (timeout, header, method, ignore_errors, …). $ssl likewise; defaults
+ * enable peer verification.
+ *
+ * Proxy URL handling:
+ *   - Strip any scheme prefix from the configured proxy URL; PHP's stream
+ *     wrapper expects 'tcp://host:port'.
+ *   - Set request_fulluri so HTTP requests through the proxy include the
+ *     full URL in the request line (proxy requirement). HTTPS requests use
+ *     CONNECT implicitly and ignore this flag.
+ *   - Credentials embedded in the proxy URL (http://user:pass@host:port)
+ *     are preserved as-is; PHP's HTTP wrapper emits Proxy-Authorization
+ *     from them. Grav 1.7 doesn't expose separate proxy_username /
+ *     proxy_password keys, so URL-embedded creds are the only auth path.
+ *   - proxy_cert_path: if it's a file, set as 'cafile'; if a dir, 'capath'.
+ *     Matches Grav 1.7's documented behavior.
+ */
+function mg_http_context(array $http = [], array $ssl = []): mixed
+{
+    $ssl = $ssl + ['verify_peer' => true, 'verify_peer_name' => true];
+
+    $proxy = mg_proxy_config();
+    if ($proxy['url'] !== '') {
+        $proxyHostPort = preg_replace('~^[a-zA-Z][a-zA-Z0-9+.\-]*://~', '', $proxy['url']);
+        $http['proxy']            = 'tcp://' . $proxyHostPort;
+        $http['request_fulluri']  = true;
+
+        $certPath = $proxy['cert_path'];
+        if ($certPath !== '') {
+            if (is_file($certPath))      $ssl['cafile'] = $certPath;
+            elseif (is_dir($certPath))   $ssl['capath'] = $certPath;
+        }
+    }
+
+    return stream_context_create(['http' => $http, 'ssl' => $ssl]);
+}
+
+/**
  * Download a zip of the default branch of <owner>/<repo> from GitHub and
  * extract its single top-level directory's contents into
  * {webroot}/{stageDir}/user/plugins/{slug}/.
@@ -1399,13 +1621,10 @@ function mg_fetch_and_install_github(string $webroot, string $stageDir, string $
     // record version as "1.0.0" — sentinel for "pre-release install".
     $resolved = mg_github_resolve_download($repo);
 
-    $ctx = stream_context_create([
-        'http' => [
-            'timeout' => 20,
-            'header'  => "User-Agent: grav-migrate-wizard/1.0\r\nAccept: application/vnd.github+json\r\n",
-            'ignore_errors' => false,
-        ],
-        'ssl'  => ['verify_peer' => true, 'verify_peer_name' => true],
+    $ctx = mg_http_context([
+        'timeout'       => 20,
+        'header'        => "User-Agent: grav-migrate-wizard/1.0\r\nAccept: application/vnd.github+json\r\n",
+        'ignore_errors' => false,
     ]);
     $bytes = @file_get_contents($resolved['zipball'], false, $ctx);
     if ($bytes === false || strlen($bytes) < 1024) {
@@ -1472,9 +1691,10 @@ function mg_install_zip_url(string $webroot, string $stageDir, string $kind, str
     $safeSlug = preg_replace('/[^a-z0-9\-]/i', '_', $slug);
     $zipPath  = $tmp . '/update-' . $safeKind . '-' . $safeSlug . '.zip';
 
-    $ctx = stream_context_create([
-        'http' => ['timeout' => 25, 'header' => "User-Agent: grav-migrate-wizard/1.0\r\n", 'ignore_errors' => false],
-        'ssl'  => ['verify_peer' => true, 'verify_peer_name' => true],
+    $ctx = mg_http_context([
+        'timeout'       => 25,
+        'header'        => "User-Agent: grav-migrate-wizard/1.0\r\n",
+        'ignore_errors' => false,
     ]);
     $bytes = @file_get_contents($url, false, $ctx);
     if ($bytes === false || strlen($bytes) < 1024) {
@@ -1530,13 +1750,10 @@ function mg_install_zip_url(string $webroot, string $stageDir, string $kind, str
  */
 function mg_github_resolve_download(string $repo): array
 {
-    $ctx = stream_context_create([
-        'http' => [
-            'timeout' => 6,
-            'header'  => "User-Agent: grav-migrate-wizard/1.0\r\nAccept: application/vnd.github+json\r\n",
-            'ignore_errors' => true,
-        ],
-        'ssl'  => ['verify_peer' => true, 'verify_peer_name' => true],
+    $ctx = mg_http_context([
+        'timeout'       => 6,
+        'header'        => "User-Agent: grav-migrate-wizard/1.0\r\nAccept: application/vnd.github+json\r\n",
+        'ignore_errors' => true,
     ]);
 
     // Tier 1: /releases/latest (excludes pre-releases by GitHub's design).
@@ -2205,9 +2422,10 @@ function mg_fetch_gpm_index(string $kind, string $gravVersion = '', string $phpV
         'php'     => $phpVersion  !== '' ? $phpVersion  : PHP_VERSION,
         'testing' => 1,
     ]);
-    $ctx = stream_context_create([
-        'http' => ['timeout' => 6, 'ignore_errors' => true, 'header' => "User-Agent: grav-migrate-wizard/1.0\r\n"],
-        'ssl'  => ['verify_peer' => true, 'verify_peer_name' => true],
+    $ctx = mg_http_context([
+        'timeout'       => 6,
+        'ignore_errors' => true,
+        'header'        => "User-Agent: grav-migrate-wizard/1.0\r\n",
     ]);
     $raw = @file_get_contents($url, false, $ctx);
     if ($raw === false) return null;
@@ -2236,9 +2454,10 @@ function mg_fetch_gpm_index(string $kind, string $gravVersion = '', string $phpV
  */
 function mg_fetch_curated(): ?array
 {
-    $ctx = stream_context_create([
-        'http' => ['timeout' => 4, 'ignore_errors' => true, 'header' => "User-Agent: grav-migrate-wizard/1.0\r\n"],
-        'ssl'  => ['verify_peer' => true, 'verify_peer_name' => true],
+    $ctx = mg_http_context([
+        'timeout'       => 4,
+        'ignore_errors' => true,
+        'header'        => "User-Agent: grav-migrate-wizard/1.0\r\n",
     ]);
     $raw = @file_get_contents(MG_COMPAT_URL, false, $ctx);
     if ($raw === false) return null;
@@ -2636,7 +2855,39 @@ function stream_promote_page(string $webroot, array $flag, string $token): void
         echo '<script>window.location.replace(' . json_encode($base) . ');</script>';
         echo '<noscript><p><a href="' . htmlspecialchars($base) . '">Open the new Grav 2.0 install</a></p></noscript>';
     } else {
-        echo '<div class="mg-callout mg-callout-error"><i class="mg-i-warn"></i><div><strong>Promote failed.</strong> ' . htmlspecialchars($result['msg']) . '</div></div>';
+        // Render the failure message with newlines preserved so a multi-line
+        // lock list (one path per row) reads cleanly. nl2br only inserts <br>
+        // tags; the underlying text is still htmlspecialchars'd.
+        $msg = nl2br(htmlspecialchars((string) $result['msg']));
+        echo '<div class="mg-callout mg-callout-error"><i class="mg-i-warn"></i><div><strong>Promote failed.</strong><br>' . $msg . '</div></div>';
+
+        // Two recovery hints, scoped to where Phase 2 left things:
+        //   - "locked" populated → Phase 2 aborted via the pre-flight check.
+        //     The webroot is INTACT. The backup zip was created in Phase 1
+        //     and is sitting in the stage's backup/ dir, but the user
+        //     doesn't need to touch it — they free the locks and click
+        //     Promote again.
+        //   - locked absent      → Phase 1 or Phase 3 failure, or a Phase 2
+        //     failure that snuck past the pre-flight (race window between
+        //     the probe and the actual unlink, or non-Windows). The webroot
+        //     may be partially destroyed; the backup zip is the only safe
+        //     way back.
+        $stageDir   = trim((string)($flag['stage_dir'] ?? 'grav-2'), '/');
+        $backupGlob = $webroot . '/' . $stageDir . '/backup/migration-backup-*.zip';
+        $backups    = glob($backupGlob) ?: [];
+        $latestZip  = $backups !== [] ? basename(end($backups)) : null;
+
+        if (!empty($result['locked'])) {
+            echo '<div class="mg-callout mg-callout-info"><i class="mg-i-info"></i><div><strong>What to do.</strong> The destructive phase did not start — your 1.x site is unchanged. Close the listed editor/git GUI/terminal, then re-open this wizard and click <em>Promote</em> again. No backup recovery is needed.</div></div>';
+        } else {
+            echo '<div class="mg-callout mg-callout-warn"><i class="mg-i-warn"></i><div><strong>If your webroot looks empty or partial:</strong> a backup zip was created in Phase 1 before the failure. Extract it back over your webroot to restore your 1.x site, then you can retry the wizard from scratch.';
+            if ($latestZip !== null) {
+                echo '<div class="mg-result-row" style="margin-top:8px"><strong>Backup zip:</strong> <code>' . htmlspecialchars($stageDir . '/backup/' . $latestZip) . '</code></div>';
+            }
+            echo '<div class="mg-result-row" style="margin-top:8px"><strong>Windows:</strong> right-click the zip in File Explorer &rarr; <em>Extract All&hellip;</em> and pick the webroot. <strong>Do not</strong> drag entries out of File Explorer\'s in-place zip viewer — it shows a flat breadcrumb list (<code>system&middot;src&middot;Grav&hellip;</code>) and produces files with literal &middot; in the names. The <em>Extract All</em> wizard reconstructs the tree correctly.</div>';
+            echo '<div class="mg-result-row"><strong>macOS / Linux:</strong> <code>unzip /path/to/' . htmlspecialchars((string) ($latestZip ?? 'migration-backup-*.zip')) . ' -d /path/to/webroot</code>, or double-click in Finder to extract via Archive Utility.</div>';
+            echo '</div></div>';
+        }
     }
 
     echo '</div>';
@@ -3184,14 +3435,17 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
             $installPath = rtrim(base_path_from_script(), '/');
             $stagePathFull = $installPath . '/' . $stageDir;
 
-            echo '<div class="mg-result-section"><strong>nginx</strong><div class="mg-result-row">Add a location block above your existing Grav location:</div>';
+            echo '<div class="mg-result-section"><strong>nginx</strong><div class="mg-result-row">Add this block above your existing Grav <code>location</code>. The PHP handler must be <em>nested</em> inside the prefix block — sibling regex locations are never consulted once an <code>^~</code> prefix match wins, so a sibling <code>location ~ \\.php$</code> would silently break PHP execution under the stage path:</div>';
             echo '<pre class="mg-code">location ^~ ' . htmlspecialchars($stagePathFull) . '/ {' . "\n";
-            echo '    try_files $uri $uri/ ' . htmlspecialchars($stagePathFull) . '/index.php?$query_string;' . "\n";
-            echo "}\n";
-            echo 'location ~ ^' . htmlspecialchars($stagePathFull) . "/.+\\.php$ {\n";
-            echo "    fastcgi_pass   unix:/run/php/php-fpm.sock;\n";
-            echo "    include        fastcgi_params;\n";
-            echo "    fastcgi_param  SCRIPT_FILENAME \$document_root\$fastcgi_script_name;\n";
+            echo '    try_files $uri $uri/ ' . htmlspecialchars($stagePathFull) . "/index.php?\$query_string;\n";
+            echo "\n";
+            echo "    location ~ \\.php\$ {\n";
+            echo "        fastcgi_pass            unix:/run/php/php-fpm.sock;\n";
+            echo "        fastcgi_split_path_info ^(.+\\.php)(/.+)\$;\n";
+            echo "        fastcgi_index           index.php;\n";
+            echo "        include                 fastcgi_params;\n";
+            echo "        fastcgi_param           SCRIPT_FILENAME \$document_root\$fastcgi_script_name;\n";
+            echo "    }\n";
             echo '}</pre></div>';
 
             echo '<div class="mg-result-section"><strong>Caddy v2</strong><div class="mg-result-row">Inside your site block:</div>';
@@ -3230,6 +3484,7 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
             echo '<li>Writes a breadcrumb at <code>.migration-complete</code> with the backup path</li>';
             echo '</ol>';
             echo '<div class="mg-callout mg-callout-warn"><i class="mg-i-warn"></i><div><strong>Point of no return.</strong> Your live URL will start serving Grav 2.0 immediately after this step. To revert, you\'d extract the backup zip back into place. Make sure Step 5 testing went well first.</div></div>';
+            echo '<div class="mg-callout mg-callout-warn"><i class="mg-i-warn"></i><div><strong>Close anything that has the webroot open first.</strong> Code editors (VS Code, Sublime, PhpStorm), git GUIs (Sourcetree, GitHub Desktop, GitKraken), open terminals <em>cd</em>\'d into the install, and tail/log viewers can hold file handles that block the delete phase. <strong>On Windows this is the #1 cause of promote failure</strong> — open files cannot be unlinked. macOS and Linux are forgiving here, but closing them first is still recommended.</div></div>';
             echo '<form method="post" onsubmit="return confirm(\'Promote Grav 2.0 to live? Existing install will be zipped up to backup/ and then removed from the webroot. Revert requires manually extracting the backup zip.\');">';
             echo '<input type="hidden" name="action" value="promote">';
             echo '<input type="hidden" name="token"  value="' . htmlspecialchars($token) . '">';

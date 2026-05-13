@@ -1,3 +1,16 @@
+# v1.0.0-rc.3
+## 05-13-2026
+
+1. [](#improved)
+    * Pre-promote callout now warns to close any editor, git GUI (Sourcetree, GitHub Desktop, GitKraken), and terminal that has the webroot open — on Windows these processes hold file handles that block the Phase 2 delete pass.
+    * Promote step on Windows now runs a pre-flight scan for locked files BEFORE deleting anything, so the wizard reports the specific paths (e.g. `user/plugins/foo/.git/index`) the user needs to free, rather than half-destroying the webroot and failing midway. macOS and Linux skip the scan — `unlink()` succeeds on open files there.
+    * Promote failure callout now names the specific file that couldn't be deleted (e.g. `user/plugins/foo/.git/objects/pack/pack-abc.idx`) instead of just the top-level entry, so it's obvious which editor or git GUI to close.
+    * Promote failure callout now includes recovery instructions for the backup zip, including a Windows-specific warning that File Explorer's in-place zip viewer renders nested paths as a flat breadcrumb list (`system·src·Grav·…`) and that you must use **Right-click → Extract All…** rather than dragging entries out.
+    * README has a new **Recovering from a failed promote** section documenting the three-phase rollback model and platform-specific extraction commands.
+2. [](#bugfix)
+    * nginx config snippet shown in Step 5 (Test) is now actually functional. The previous version put the PHP `location ~ \.php$` block as a sibling of the `location ^~ /grav-2/` prefix — but nginx never evaluates sibling regex locations once an `^~` prefix match wins, so PHP under the stage path was served as a static download. The snippet now nests the PHP block *inside* the prefix block and adds `fastcgi_split_path_info` and `fastcgi_index` to match Grav's documented nginx template. [#3]
+    * Outbound HTTP from the migration wizard now honors Grav's `system.http.proxy_url` and `system.http.proxy_cert_path` settings (and the standard `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` env vars as fallback). Previously, every HTTP call — the Grav 2.0 zip download, GPM catalog queries, GitHub release lookups, plugin/theme replacement zips, the curated compat registry — built its own stream context with no proxy support and silently failed for sites behind a corporate proxy. Kickoff now forwards the site's proxy config into the `.migrating` flag at staging time, and the standalone wizard reads it via a new `mg_http_context()` helper. [#2]
+
 # v1.0.0-rc.2
 ## 05-06-2026
 

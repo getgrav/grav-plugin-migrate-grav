@@ -58,6 +58,12 @@ class InitCommand extends ConsoleCommand
         // the source URL when the user has opted into the testing channel.
         $config['gpm_channel'] = (string) $grav['config']->get('system.gpm.releases', 'stable');
 
+        // Forward Grav's proxy config so the zip download (Kickoff) and the
+        // standalone wizard's outbound HTTP (via .migrating flag) both honor
+        // system.http.proxy_url / proxy_cert_path.
+        $config['proxy_url']       = (string) $grav['config']->get('system.http.proxy_url', '');
+        $config['proxy_cert_path'] = (string) $grav['config']->get('system.http.proxy_cert_path', '');
+
         require_once dirname(__DIR__) . '/classes/Kickoff.php';
 
         $webroot = defined('GRAV_WEBROOT') ? GRAV_WEBROOT : GRAV_ROOT;
