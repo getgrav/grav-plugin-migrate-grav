@@ -85,11 +85,25 @@ If Phase 2 or Phase 3 fails partway through, your live webroot may be partially 
 
 **To restore from the backup zip:**
 
-- **Windows:** in File Explorer, right-click the zip → **Extract All…** and pick your webroot. **Do not** drag entries out of File Explorer's in-place zip viewer — that view shows a flat breadcrumb list (`system·src·Grav·…`) and dragging out produces files with literal `·` separators in their names. The Extract All wizard reconstructs the directory tree correctly. 7-Zip and WinRAR also work fine.
+- **Windows:** in File Explorer, right-click the zip → **Extract All…** and pick your webroot. The Extract All wizard reconstructs the directory tree correctly. 7-Zip and WinRAR also work fine.
 - **macOS:** double-click in Finder (Archive Utility extracts a proper tree), or `unzip migration-backup-*.zip -d /path/to/webroot` from Terminal.
 - **Linux:** `unzip migration-backup-*.zip -d /path/to/webroot`.
 
 Once the webroot is restored, follow the **Aborting** steps above to clear the wizard state, then re-run the wizard from the admin.
+
+### "The zip extracts as flat files with `·` or `\` in their names"
+
+If you ran the wizard on **Windows** with a version **prior to 1.0.0-rc.3**, the backup zip it created has a separator bug — entry names use `\` (Windows path separator) instead of `/` (zip spec). Every standards-tolerant extractor (7-Zip, Archive Utility, Windows Explorer's in-place viewer) treats the backslashes as literal filename characters and dumps every file in the zip's root with names like `user\plugins\admin\file.php` (or, in some viewers, `user·plugins·admin·file.php`).
+
+To repair such a zip, copy `user/plugins/migrate-grav/wizard/mg-repair-backup.php` from this plugin to any directory and run:
+
+```
+php mg-repair-backup.php migration-backup-1.7.x--20260507111032.zip
+```
+
+It writes `migration-backup-1.7.x--20260507111032.fixed.zip` next to the original with all entry names normalized to forward slashes. Extract the fixed zip with any tool and the directory tree will be correct.
+
+The script is self-contained — no Grav, no Composer, no plugin context. It just needs PHP 8.1+ with the `zip` extension. Backup-zip writes from 1.0.0-rc.3 onward no longer have this bug regardless of OS.
 
 ## License
 

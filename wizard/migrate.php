@@ -1099,6 +1099,18 @@ function mg_zip_webroot(ZipArchive $zip, string $webroot, string $skipTop, int &
         $rel  = ltrim(substr($path, strlen($webroot)), '/\\');
         if ($rel === '') continue;
 
+        // Zip spec mandates '/' as the path separator. On Windows,
+        // SplFileInfo::getPathname() returns native '\\'-separated paths,
+        // and passing those to ZipArchive::addFile() stores entries like
+        // `user\plugins\admin\file.php` — which non-strict extractors
+        // (7-zip on Windows, macOS Archive Utility, Windows Explorer's
+        // in-place viewer) treat as a flat filename containing literal
+        // backslashes, dumping every file in the zip's root and rendering
+        // directory entries as a flat breadcrumb list. Normalize before
+        // any zip-write so the output is always portable, regardless of
+        // which OS the wizard ran on.
+        $rel = str_replace(DIRECTORY_SEPARATOR, '/', $rel);
+
         if ($file->isDir()) {
             $zip->addEmptyDir($rel);
         } else {
@@ -1388,11 +1400,198 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
         }
     }
 
+    // Scan for editor-authored Twig usage and flip the 2.0 default-off
+    // security.twig_content gates back on where the source site relied on
+    // them. Editor permission stays off — operator opts in deliberately
+    // after migration.
+    $twigScan = mg_scan_twig_content($webroot, $dstUser);
+
     $flag['step']    = 'content_done';
-    $flag['content'] = ['at' => time(), 'entries' => $entries];
+    $flag['content'] = [
+        'at'        => time(),
+        'entries'   => $entries,
+        'twig_scan' => $twigScan,
+    ];
     save_flag($webroot . '/.migrating', $flag);
 
-    return ['ok' => true, 'msg' => 'Content already migrated in Step 2 — ' . count($entries) . ' top-level entries under staged user/.'];
+    $msg = 'Content already migrated in Step 2 — ' . count($entries) . ' top-level entries under staged user/.';
+    if ($twigScan['process_enabled']) {
+        $reasons = [];
+        if ($twigScan['pages_with_twig'] > 0) {
+            $reasons[] = $twigScan['pages_with_twig'] . ' page(s) set process.twig';
+        }
+        if (!empty($twigScan['system_process_twig'])) {
+            $reasons[] = 'system.yaml pages.process.twig was on';
+        }
+        if (!empty($twigScan['frontmatter_twig'])) {
+            $reasons[] = 'system.yaml pages.frontmatter.process_twig was on';
+        }
+        $msg .= ' Enabled security.twig_content.process_enabled (' . implode('; ', $reasons) . ').';
+    }
+    if ($twigScan['config_access']) {
+        $msg .= ' Enabled security.twig_content.config_access (found `config.` usage in ' . count($twigScan['config_pages']) . ' page(s)).';
+    }
+
+    return ['ok' => true, 'msg' => $msg];
+}
+
+/**
+ * Walk the staged user/pages/ tree and the staged system.yaml looking for
+ * editor-authored Twig usage that the source site depended on. When any is
+ * found, flip the matching `security.twig_content.*` gates ON in the staged
+ * `user/config/security.yaml` so the migrated site keeps working.
+ *
+ * Returns a summary used by the wizard's report and stored on .migrating:
+ *   - process_enabled     (bool):  whether we flipped the gate
+ *   - config_access       (bool):  whether we flipped config-in-twig access
+ *   - pages_with_twig     (int):   count of pages with process.twig:true
+ *   - config_pages        (array): paths of pages that use {{ config }} in body
+ *   - frontmatter_twig    (bool):  whether system.pages.frontmatter.process_twig was on
+ *   - system_process_twig (bool):  whether system.pages.process.twig was on (1.x global default — dropped in 2.0 admin UI)
+ */
+function mg_scan_twig_content(string $webroot, string $dstUser): array
+{
+    mg_ensure_yaml_available();
+    $yaml = '\\Symfony\\Component\\Yaml\\Yaml';
+
+    $result = [
+        'process_enabled'     => false,
+        'config_access'       => false,
+        'pages_with_twig'     => 0,
+        'config_pages'        => [],
+        'frontmatter_twig'    => false,
+        'system_process_twig' => false,
+    ];
+
+    // Pass 1: scan pages.
+    $pagesDir = $dstUser . '/pages';
+    if (is_dir($pagesDir)) {
+        $rii = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($pagesDir, \FilesystemIterator::SKIP_DOTS));
+        foreach ($rii as $file) {
+            /** @var \SplFileInfo $file */
+            if ($file->isDir() || $file->getExtension() !== 'md') continue;
+
+            $raw = @file_get_contents($file->getPathname());
+            if ($raw === false || $raw === '') continue;
+
+            [$frontmatter, $body] = mg_split_frontmatter($raw);
+            if ($frontmatter === '') continue;
+
+            try {
+                $parsed = $yaml::parse($frontmatter);
+            } catch (\Throwable) {
+                continue;
+            }
+            if (!is_array($parsed)) continue;
+
+            $twig = $parsed['process']['twig'] ?? null;
+            if ($twig !== true && $twig !== 'true' && $twig !== 1 && $twig !== '1') continue;
+
+            $result['pages_with_twig']++;
+
+            // Heuristic config-usage scan against the markdown body. False
+            // positives are safe (preserve current behavior); false negatives
+            // are also safe (operator can flip the toggle manually after).
+            if (preg_match('/\{\{[^}]*\bconfig\b|\{%[^%]*\bconfig\b/', $body) === 1) {
+                $rel = ltrim(str_replace($pagesDir, '', $file->getPathname()), '/\\');
+                $result['config_pages'][] = $rel;
+            }
+        }
+    }
+
+    // Pass 2: scan system.yaml for the frontmatter-Twig opt-in. Operator
+    // already accepted the risk site-wide there, so honour it.
+    $systemYaml = $dstUser . '/config/system.yaml';
+    if (is_file($systemYaml)) {
+        try {
+            $sys = $yaml::parseFile($systemYaml);
+            if (is_array($sys)) {
+                // Site-wide opt-ins from Grav 1.x. Both were dropped from the
+                // 2.0 admin UI: pages.process.twig (the per-page default — now
+                // only settable per page) and pages.frontmatter.process_twig
+                // (Twig in frontmatter values). Either being true on the
+                // source site means the operator deliberately enabled
+                // editor-authored Twig, so re-open the 2.0 gate to match.
+                if (($sys['pages']['process']['twig'] ?? false) === true) {
+                    $result['system_process_twig'] = true;
+                }
+                if (($sys['pages']['frontmatter']['process_twig'] ?? false) === true) {
+                    $result['frontmatter_twig'] = true;
+                }
+            }
+        } catch (\Throwable) {
+            // Bad YAML in source — leave defaults.
+        }
+    }
+
+    // Decide which gates to flip.
+    if ($result['pages_with_twig'] > 0 || $result['frontmatter_twig'] || !empty($result['system_process_twig'])) {
+        $result['process_enabled'] = true;
+    }
+    if (!empty($result['config_pages'])) {
+        $result['config_access'] = true;
+    }
+
+    // Nothing found → leave fresh-install defaults in place.
+    if (!$result['process_enabled']) {
+        return $result;
+    }
+
+    // Merge into the staged security.yaml.
+    $secYaml = $dstUser . '/config/security.yaml';
+    $current = [];
+    if (is_file($secYaml)) {
+        try {
+            $parsed = $yaml::parseFile($secYaml);
+            if (is_array($parsed)) $current = $parsed;
+        } catch (\Throwable) {
+            // Treat unparseable file as empty — we'll overwrite with valid YAML below.
+        }
+    }
+    $current['twig_content'] = array_merge(
+        ['process_enabled' => false, 'editor_enabled' => false, 'config_access' => false],
+        $current['twig_content'] ?? [],
+        [
+            'process_enabled' => true,
+            'editor_enabled'  => $current['twig_content']['editor_enabled'] ?? false,
+            'config_access'   => $result['config_access'] || (bool) ($current['twig_content']['config_access'] ?? false),
+        ]
+    );
+
+    @mkdir(dirname($secYaml), 0775, true);
+    $dump = "# Generated by migrate-grav: enabled security.twig_content gates to\n"
+          . "# preserve Twig-in-content behavior from the source 1.x install.\n"
+          . "# editor_enabled is intentionally left off — grant the\n"
+          . "# `admin.pages_twig` permission to specific users, or flip\n"
+          . "# editor_enabled to true in Configuration > Security > Twig in Content.\n\n"
+          . $yaml::dump($current, 6, 2);
+    @file_put_contents($secYaml, $dump);
+
+    return $result;
+}
+
+/**
+ * Split a Grav page's raw file content into ['<yaml-frontmatter>', '<body>'].
+ * Frontmatter is the block between the leading `---` and the next `---` line.
+ * Returns ['', $raw] when no frontmatter is present.
+ *
+ * @return array{0:string,1:string}
+ */
+function mg_split_frontmatter(string $raw): array
+{
+    if (!str_starts_with($raw, '---')) {
+        return ['', $raw];
+    }
+    $rest = substr($raw, 3);
+    // Skip optional CR/LF after the opening fence.
+    $rest = preg_replace('/^\r?\n/', '', $rest, 1) ?? $rest;
+    $end = preg_match('/\r?\n---\r?\n/', $rest, $m, PREG_OFFSET_CAPTURE);
+    if (!$end) {
+        return ['', $raw];
+    }
+    $fmEnd = $m[0][1];
+    $bodyStart = $fmEnd + strlen($m[0][0]);
+    return [substr($rest, 0, $fmEnd), substr($rest, $bodyStart)];
 }
 
 /**
@@ -2884,8 +3083,9 @@ function stream_promote_page(string $webroot, array $flag, string $token): void
             if ($latestZip !== null) {
                 echo '<div class="mg-result-row" style="margin-top:8px"><strong>Backup zip:</strong> <code>' . htmlspecialchars($stageDir . '/backup/' . $latestZip) . '</code></div>';
             }
-            echo '<div class="mg-result-row" style="margin-top:8px"><strong>Windows:</strong> right-click the zip in File Explorer &rarr; <em>Extract All&hellip;</em> and pick the webroot. <strong>Do not</strong> drag entries out of File Explorer\'s in-place zip viewer — it shows a flat breadcrumb list (<code>system&middot;src&middot;Grav&hellip;</code>) and produces files with literal &middot; in the names. The <em>Extract All</em> wizard reconstructs the tree correctly.</div>';
+            echo '<div class="mg-result-row" style="margin-top:8px"><strong>Windows:</strong> right-click the zip in File Explorer &rarr; <em>Extract All&hellip;</em> and pick the webroot. 7-Zip and WinRAR also work.</div>';
             echo '<div class="mg-result-row"><strong>macOS / Linux:</strong> <code>unzip /path/to/' . htmlspecialchars((string) ($latestZip ?? 'migration-backup-*.zip')) . ' -d /path/to/webroot</code>, or double-click in Finder to extract via Archive Utility.</div>';
+            echo '<div class="mg-result-row" style="margin-top:8px"><em>If the zip extracts as flat files with <code>\\</code> or <code>&middot;</code> in their names</em>, the backup was written by an older wizard build on Windows with a separator bug. Run the standalone repair script first &mdash; it writes a corrected zip alongside the original: <code>php user/plugins/migrate-grav/wizard/mg-repair-backup.php /path/to/backup.zip</code></div>';
             echo '</div></div>';
         }
     }
