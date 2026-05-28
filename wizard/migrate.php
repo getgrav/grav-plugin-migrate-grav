@@ -1567,7 +1567,90 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
           . $yaml::dump($current, 6, 2);
     @file_put_contents($secYaml, $dump);
 
+    // Promote the legacy `system.pages.process.twig` flag into the security
+    // gate by stripping it from system.yaml. Grav 2.0 defaults the per-page
+    // `process.twig` flag from `security.twig_content.process_enabled` when
+    // the legacy key isn't present, so behavior is preserved and the gate
+    // becomes the single source of truth (visible in the 2.0 admin UI).
+    if ($result['system_process_twig'] && is_file($systemYaml)) {
+        $result['system_process_twig_stripped'] = mg_strip_system_pages_process_twig($systemYaml);
+    }
+
     return $result;
+}
+
+/**
+ * Strip `pages.process.twig` from a staged `system.yaml`. Operates on the
+ * raw text so unrelated keys, comments, and formatting are preserved.
+ * Removes the surrounding `pages.process` block only when `twig` was the
+ * only child key, otherwise just deletes the single twig line.
+ *
+ * @return bool true when the file was modified.
+ */
+function mg_strip_system_pages_process_twig(string $systemYaml): bool
+{
+    $raw = @file_get_contents($systemYaml);
+    if (!is_string($raw) || $raw === '') {
+        return false;
+    }
+
+    // Match the `twig: <truthy>` line nested under `pages: -> process:`. We
+    // only strip when the value is one of the truthy YAML scalars; a false
+    // value would mean the operator deliberately disabled Twig in content
+    // and we must preserve that override.
+    $pattern = '/^([ \t]*)twig:[ \t]+(true|yes|on|1)\b[^\n]*\n/mi';
+    $modified = preg_replace_callback($pattern, function ($match) use ($raw) {
+        $line = $match[0];
+        $offset = strpos($raw, $line);
+        if ($offset === false) {
+            return $line;
+        }
+        // Only strip when this line sits inside `pages: -> process:`. Walk
+        // backwards over preceding sibling/parent lines to confirm.
+        $before = substr($raw, 0, $offset);
+        $indent = strlen($match[1]);
+        // Find the nearest preceding non-blank, non-comment line with less
+        // indentation than this twig line — that's the parent.
+        $lines = preg_split("/\n/", rtrim($before, "\n"));
+        if (!is_array($lines)) {
+            return $line;
+        }
+        $parent = null;
+        for ($i = count($lines) - 1; $i >= 0; $i--) {
+            $l = $lines[$i];
+            if (trim($l) === '' || str_starts_with(ltrim($l), '#')) continue;
+            preg_match('/^([ \t]*)/', $l, $m);
+            if (strlen($m[1]) < $indent) {
+                $parent = trim($l);
+                break;
+            }
+        }
+        if ($parent !== 'process:') {
+            return $line;
+        }
+        // Confirm grandparent is `pages:`.
+        $grand = null;
+        $parentIndent = strlen($m[1]);
+        for ($j = $i - 1; $j >= 0; $j--) {
+            $l = $lines[$j];
+            if (trim($l) === '' || str_starts_with(ltrim($l), '#')) continue;
+            preg_match('/^([ \t]*)/', $l, $mg);
+            if (strlen($mg[1]) < $parentIndent) {
+                $grand = trim($l);
+                break;
+            }
+        }
+        if ($grand !== 'pages:') {
+            return $line;
+        }
+        return '';
+    }, $raw);
+
+    if (!is_string($modified) || $modified === $raw) {
+        return false;
+    }
+
+    return @file_put_contents($systemYaml, $modified) !== false;
 }
 
 /**

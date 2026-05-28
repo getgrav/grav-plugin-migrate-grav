@@ -1,9 +1,11 @@
 # v1.0.0-rc.4
-## 05-18-2026
+## 05-28-2026
 
 1. [](#new)
     * Migration now scans the source site for Twig-in-content usage (both per-page `process: twig: true` and the site-wide `system.yaml` opt-ins) and turns on Grav 2.0's new `security.twig_content` gate in the migrated install, so those pages keep rendering after promote. If any Twig-enabled page also reads site config inside Twig, the `config` access toggle is enabled too.
-2. [](#bugfix)
+2. [](#improved)
+    * After promoting the legacy `system.pages.process.twig: true` flag into the `security.twig_content.process_enabled` gate, the migration now removes the legacy key from the staged `system.yaml`. The gate is the single source of truth in Grav 2.0 — the per-page `process.twig` default falls back to it automatically — so carrying both keys forward created two settings in the migrated install where one is exposed in admin and one isn't. An explicit `pages.process.twig: false` opt-out is preserved (deliberate site-wide override).
+3. [](#bugfix)
     * **Backup zip created on Windows is now extractable.** `mg_zip_webroot` was passing `SplFileInfo::getPathname()` output straight into `ZipArchive::addFile($abs, $rel)` — on Windows that meant entry names were stored with native `\\` separators instead of the `/` the zip spec requires. Every standards-tolerant extractor (7-Zip, Windows Explorer's in-place viewer, macOS Archive Utility) treated the backslashes as literal filename characters, dumping every file in the zip's root with names like `user\plugins\admin\file.php` and rendering directory entries as a flat breadcrumb list. Now normalized to `/` regardless of OS. A standalone repair script `wizard/mg-repair-backup.php` ships in this release for users whose pre-rc.3 Windows backup zips are still on disk — it rewrites the entry names so the zip extracts correctly with any tool.
 
 # v1.0.0-rc.3
