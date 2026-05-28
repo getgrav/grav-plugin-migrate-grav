@@ -1512,10 +1512,16 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
                 // (Twig in frontmatter values). Either being true on the
                 // source site means the operator deliberately enabled
                 // editor-authored Twig, so re-open the 2.0 gate to match.
-                if (($sys['pages']['process']['twig'] ?? false) === true) {
+                // Accept the same truthy set as the per-page scanner so a
+                // source `twig: "true"` (quoted string) or `twig: 1` is
+                // promoted to the gate — otherwise the 2.0 site silently
+                // loses Twig in content after migration.
+                $sysTwig = $sys['pages']['process']['twig'] ?? null;
+                if ($sysTwig === true || $sysTwig === 'true' || $sysTwig === 1 || $sysTwig === '1') {
                     $result['system_process_twig'] = true;
                 }
-                if (($sys['pages']['frontmatter']['process_twig'] ?? false) === true) {
+                $sysFrontTwig = $sys['pages']['frontmatter']['process_twig'] ?? null;
+                if ($sysFrontTwig === true || $sysFrontTwig === 'true' || $sysFrontTwig === 1 || $sysFrontTwig === '1') {
                     $result['frontmatter_twig'] = true;
                 }
             }
@@ -1572,8 +1578,14 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
     // `process.twig` flag from `security.twig_content.process_enabled` when
     // the legacy key isn't present, so behavior is preserved and the gate
     // becomes the single source of truth (visible in the 2.0 admin UI).
+    //
+    // Done BEFORE the security.yaml write below so that a strip failure
+    // never leaves the 2.0 install in a half-applied state. If strip fails,
+    // we still write security.yaml so the gate is on and behavior is
+    // preserved (both keys end up true, functionally equivalent), and the
+    // warning is surfaced so the operator can hand-edit.
     if ($result['system_process_twig'] && is_file($systemYaml)) {
-        $result['system_process_twig_stripped'] = mg_strip_system_pages_process_twig($systemYaml);
+        $result['system_process_twig_stripped'] = mg_strip_system_pages_process_twig($systemYaml, $result);
     }
 
     return $result;
@@ -1582,75 +1594,130 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
 /**
  * Strip `pages.process.twig` from a staged `system.yaml`. Operates on the
  * raw text so unrelated keys, comments, and formatting are preserved.
- * Removes the surrounding `pages.process` block only when `twig` was the
- * only child key, otherwise just deletes the single twig line.
  *
- * @return bool true when the file was modified.
+ * Limitations (surfaced to the caller via `$result['system_process_twig_warning']`):
+ *   - Flow-style mappings (`process: { twig: true }`) are detected but not
+ *     auto-stripped — removing one key from a flow mapping without a real
+ *     YAML rewrite is fragile, so the operator is asked to remove it by hand.
+ *   - The empty `process:` parent mapping is left in place when twig was its
+ *     only child. Grav 2.0 handles `pages.process: null` as `[]`, so this is
+ *     cosmetic only.
+ *
+ * @param array<string,mixed> $result Migration result array; the function
+ *                            may set `system_process_twig_warning` on it.
+ * @return bool true when the file was modified, false otherwise.
  */
-function mg_strip_system_pages_process_twig(string $systemYaml): bool
+function mg_strip_system_pages_process_twig(string $systemYaml, array &$result): bool
 {
     $raw = @file_get_contents($systemYaml);
-    if (!is_string($raw) || $raw === '') {
+    if ($raw === false) {
+        $result['system_process_twig_warning'] = 'could not read staged system.yaml';
+        return false;
+    }
+    if ($raw === '') {
         return false;
     }
 
-    // Match the `twig: <truthy>` line nested under `pages: -> process:`. We
-    // only strip when the value is one of the truthy YAML scalars; a false
-    // value would mean the operator deliberately disabled Twig in content
-    // and we must preserve that override.
-    $pattern = '/^([ \t]*)twig:[ \t]+(true|yes|on|1)\b[^\n]*\n/mi';
-    $modified = preg_replace_callback($pattern, function ($match) use ($raw) {
-        $line = $match[0];
-        $offset = strpos($raw, $line);
-        if ($offset === false) {
-            return $line;
+    // Match `<indent>twig: <truthy>` block-style line. Accept optional
+    // quotes around the truthy scalar (e.g. `twig: "true"`) and end-of-
+    // string in lieu of a trailing newline so the last line of a file with
+    // no final newline is still caught. We only strip truthy values; an
+    // explicit `false` means the operator deliberately disabled Twig in
+    // content and that override must be preserved.
+    $pattern = '/^([ \t]*)twig:[ \t]+["\']?(?:true|yes|on|1)["\']?\b[^\n]*(?:\r?\n|\z)/m';
+    $modified = $raw;
+    if (preg_match_all($pattern, $raw, $matches, PREG_OFFSET_CAPTURE)) {
+        // Collect (offset, length, indent) per match and process in reverse
+        // order so earlier offsets remain valid as we mutate $modified.
+        $entries = [];
+        foreach ($matches[0] as $i => $m) {
+            $entries[] = [$m[1], strlen($m[0]), strlen($matches[1][$i][0])];
         }
-        // Only strip when this line sits inside `pages: -> process:`. Walk
-        // backwards over preceding sibling/parent lines to confirm.
-        $before = substr($raw, 0, $offset);
-        $indent = strlen($match[1]);
-        // Find the nearest preceding non-blank, non-comment line with less
-        // indentation than this twig line — that's the parent.
-        $lines = preg_split("/\n/", rtrim($before, "\n"));
-        if (!is_array($lines)) {
-            return $line;
-        }
-        $parent = null;
-        for ($i = count($lines) - 1; $i >= 0; $i--) {
-            $l = $lines[$i];
-            if (trim($l) === '' || str_starts_with(ltrim($l), '#')) continue;
-            preg_match('/^([ \t]*)/', $l, $m);
-            if (strlen($m[1]) < $indent) {
-                $parent = trim($l);
-                break;
+        usort($entries, static fn($a, $b) => $b[0] - $a[0]);
+        foreach ($entries as [$offset, $len, $indent]) {
+            // Only strip when this exact match sits under `pages: -> process:`.
+            // Walking the original $raw is safe because offsets came from it.
+            if (!mg_yaml_match_under_pages_process($raw, $offset, $indent)) {
+                continue;
             }
+            $modified = substr($modified, 0, $offset) . substr($modified, $offset + $len);
         }
-        if ($parent !== 'process:') {
-            return $line;
-        }
-        // Confirm grandparent is `pages:`.
-        $grand = null;
-        $parentIndent = strlen($m[1]);
-        for ($j = $i - 1; $j >= 0; $j--) {
-            $l = $lines[$j];
-            if (trim($l) === '' || str_starts_with(ltrim($l), '#')) continue;
-            preg_match('/^([ \t]*)/', $l, $mg);
-            if (strlen($mg[1]) < $parentIndent) {
-                $grand = trim($l);
-                break;
-            }
-        }
-        if ($grand !== 'pages:') {
-            return $line;
-        }
-        return '';
-    }, $raw);
+    }
 
-    if (!is_string($modified) || $modified === $raw) {
+    // Detect flow-style mappings the block-style regex can't reach. If the
+    // scanner triggered (caller only invokes us when system_process_twig is
+    // true) but no block-style match was usable, the truthy must live in a
+    // flow mapping or in a form we can't safely auto-edit. Warn so the
+    // operator knows to remove it manually.
+    if ($modified === $raw && preg_match('/process:[ \t]*\{[^}]*\btwig[ \t]*:[ \t]*["\']?(?:true|yes|on|1)["\']?/i', $raw)) {
+        $result['system_process_twig_warning'] = 'flow-style `process: { twig: true }` detected; please remove the twig key from user/config/system.yaml manually';
         return false;
     }
 
-    return @file_put_contents($systemYaml, $modified) !== false;
+    if ($modified === $raw) {
+        return false;
+    }
+
+    // Atomic write: temp file + rename, so an interruption mid-write can't
+    // truncate the staged system.yaml.
+    $tmp = $systemYaml . '.tmp.' . getmypid();
+    if (@file_put_contents($tmp, $modified) === false) {
+        $result['system_process_twig_warning'] = 'failed to write temp file for system.yaml strip';
+        return false;
+    }
+    if (!@rename($tmp, $systemYaml)) {
+        @unlink($tmp);
+        $result['system_process_twig_warning'] = 'failed to rename temp file over system.yaml';
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Walk backwards from $offset in $raw to confirm the line at that offset
+ * (with the given indent) sits under a `process:` parent whose own parent
+ * is `pages:`. Used to gate `mg_strip_system_pages_process_twig` so unrelated
+ * `twig:` keys elsewhere in the file aren't stripped.
+ */
+function mg_yaml_match_under_pages_process(string $raw, int $offset, int $indent): bool
+{
+    $before = substr($raw, 0, $offset);
+    $lines = preg_split('/\r?\n/', $before);
+    if (!is_array($lines)) {
+        return false;
+    }
+
+    $parentFound = false;
+    $parentIndent = 0;
+    for ($i = count($lines) - 1; $i >= 0; $i--) {
+        $l = $lines[$i];
+        $trimmed = trim($l);
+        if ($trimmed === '' || str_starts_with($trimmed, '#')) {
+            continue;
+        }
+        if (!preg_match('/^([ \t]*)/', $l, $m)) {
+            continue;
+        }
+        $thisIndent = strlen($m[1]);
+
+        if (!$parentFound) {
+            if ($thisIndent >= $indent) {
+                continue;
+            }
+            if ($trimmed !== 'process:') {
+                return false;
+            }
+            $parentFound = true;
+            $parentIndent = $thisIndent;
+            continue;
+        }
+        // Now searching for grandparent.
+        if ($thisIndent >= $parentIndent) {
+            continue;
+        }
+        return $trimmed === 'pages:';
+    }
+    return false;
 }
 
 /**
