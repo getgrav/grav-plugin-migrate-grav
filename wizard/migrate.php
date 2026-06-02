@@ -1432,6 +1432,49 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
         $msg .= ' Enabled security.twig_content.config_access (found `config.` usage in ' . count($twigScan['config_pages']) . ' page(s)).';
     }
 
+    // Twig function/filter seeding.
+    $safeAdded = array_merge($twigScan['safe_functions_added'] ?? [], $twigScan['safe_filters_added'] ?? []);
+    if ($safeAdded) {
+        $msg .= ' Added ' . count($safeAdded) . ' PHP function(s) to system.twig.safe_functions/safe_filters ('
+              . implode(', ', $safeAdded) . ') so they stay callable in Twig.';
+    }
+    $addedFns = $twigScan['sandbox_functions_added'] ?? [];
+    $addedFls = $twigScan['sandbox_filters_added'] ?? [];
+    if ($addedFns || $addedFls) {
+        $bits = [];
+        if ($addedFns) $bits[] = count($addedFns) . ' function(s)';
+        if ($addedFls) $bits[] = count($addedFls) . ' filter(s)';
+        $msg .= ' Widened security.twig_sandbox allowlist (' . implode(', ', $bits) . ') so page content can use them.';
+    }
+    $plugin = $twigScan['sandbox_plugin_funcs'] ?? [];
+    if ($plugin) {
+        $msg .= ' NOTE: ' . count($plugin) . ' name(s) in content are not PHP functions (' . implode(', ', $plugin)
+              . ') — these are plugin-provided Twig functions. The providing plugin must register them (ideally via'
+              . ' the onBuildTwigSandboxPolicy event); otherwise they will still fail after migration.';
+    }
+    $fromContent = $twigScan['sandbox_from_content'] ?? [];
+    if ($fromContent && !empty($twigScan['undefined_functions_was_on'])) {
+        $msg .= ' Your source site had system.twig.undefined_functions ON, and ' . count($fromContent)
+              . ' name(s) used in content were not in your safe_functions list — review the additions and remove any you do not trust.';
+    }
+    $blockedDanger = $twigScan['sandbox_blocked_dangerous'] ?? [];
+    if ($blockedDanger) {
+        $msg .= ' Did NOT add ' . count($blockedDanger) . ' dangerous function(s) Grav 2.0 always refuses ('
+              . implode(', ', $blockedDanger) . ') — those content usages will not work and must be reworked.';
+    }
+    $blocked = $twigScan['sandbox_blocked'] ?? [];
+    if ($blocked) {
+        $msg .= ' Did NOT allowlist ' . count($blocked) . ' function(s) the content sandbox blocks by design ('
+              . implode(', ', $blocked) . ').';
+    }
+    $stripped = $twigScan['system_twig_undefined_stripped'] ?? [];
+    if ($stripped) {
+        $msg .= ' Removed dead 1.x key(s) from system.yaml: ' . implode(', ', $stripped) . '.';
+    }
+    if (!empty($twigScan['system_twig_warning'])) {
+        $msg .= ' WARNING (system.yaml): ' . $twigScan['system_twig_warning'] . '.';
+    }
+
     return ['ok' => true, 'msg' => $msg];
 }
 
@@ -1448,6 +1491,17 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
  *   - config_pages        (array): paths of pages that use {{ config }} in body
  *   - frontmatter_twig    (bool):  whether system.pages.frontmatter.process_twig was on
  *   - system_process_twig (bool):  whether system.pages.process.twig was on (1.x global default — dropped in 2.0 admin UI)
+ *   - safe_functions_added    (list): PHP functions added to system.twig.safe_functions
+ *   - safe_filters_added      (list): PHP functions added to system.twig.safe_filters
+ *   - sandbox_functions_added (list): names added to security.twig_sandbox.allowed_functions
+ *   - sandbox_filters_added   (list): names added to security.twig_sandbox.allowed_filters
+ *   - sandbox_plugin_funcs    (list): content names that aren't PHP functions (need plugin registration)
+ *   - sandbox_from_content    (list): names used in content but not in source safe_functions (escape-hatch category)
+ *   - sandbox_blocked         (list): sandbox-denylisted names found but NOT added (blocked by 2.0 design)
+ *   - sandbox_blocked_dangerous (list): isDangerousFunction() names found but NOT added
+ *   - sandbox_token_pages     (array): content-derived token => sample page path
+ *   - undefined_functions_was_on (bool): whether 1.x system.twig.undefined_functions was on
+ *   - system_twig_undefined_stripped (list): dead undefined_* keys removed from staged system.yaml
  */
 function mg_scan_twig_content(string $webroot, string $dstUser): array
 {
@@ -1455,16 +1509,34 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
     $yaml = '\\Symfony\\Component\\Yaml\\Yaml';
 
     $result = [
-        'process_enabled'     => false,
-        'config_access'       => false,
-        'pages_with_twig'     => 0,
-        'config_pages'        => [],
-        'frontmatter_twig'    => false,
-        'system_process_twig' => false,
+        'process_enabled'         => false,
+        'config_access'           => false,
+        'pages_with_twig'         => 0,
+        'config_pages'            => [],
+        'frontmatter_twig'        => false,
+        'system_process_twig'     => false,
+        // Twig function/filter seeding (Grav 2.0).
+        'sandbox_safe_functions'  => [],   // existing source system.twig.safe_functions
+        'sandbox_safe_filters'    => [],   // existing source system.twig.safe_filters
+        'safe_functions_added'    => [],   // PHP functions added to system.twig.safe_functions
+        'safe_filters_added'      => [],   // PHP functions added to system.twig.safe_filters
+        'sandbox_functions_added' => [],   // names added to security.twig_sandbox.allowed_functions
+        'sandbox_filters_added'   => [],   // names added to security.twig_sandbox.allowed_filters
+        'sandbox_from_content'    => [],   // subset discovered in page bodies (escape-hatch category)
+        'sandbox_plugin_funcs'    => [],   // content funcs that aren't PHP functions (need plugin registration)
+        'sandbox_blocked'         => [],   // sandbox-denylisted names found but NOT added (blocked by design)
+        'sandbox_blocked_dangerous' => [], // isDangerousFunction() names found but NOT added
+        'sandbox_token_pages'     => [],   // token => [sample page paths] for content-derived names
+        'undefined_functions_was_on'  => false,
+        'system_twig_undefined_stripped' => [],
     ];
 
     // Pass 1: scan pages.
     $pagesDir = $dstUser . '/pages';
+    // Custom Twig function/filter tokens seen in twig-enabled page bodies,
+    // mapped to the pages they appear in (for the migration report).
+    $bodyFuncPages = [];
+    $bodyFilterPages = [];
     if (is_dir($pagesDir)) {
         $rii = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($pagesDir, \FilesystemIterator::SKIP_DOTS));
         foreach ($rii as $file) {
@@ -1488,13 +1560,23 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
             if ($twig !== true && $twig !== 'true' && $twig !== 1 && $twig !== '1') continue;
 
             $result['pages_with_twig']++;
+            $rel = ltrim(str_replace($pagesDir, '', $file->getPathname()), '/\\');
 
             // Heuristic config-usage scan against the markdown body. False
             // positives are safe (preserve current behavior); false negatives
             // are also safe (operator can flip the toggle manually after).
             if (preg_match('/\{\{[^}]*\bconfig\b|\{%[^%]*\bconfig\b/', $body) === 1) {
-                $rel = ltrim(str_replace($pagesDir, '', $file->getPathname()), '/\\');
                 $result['config_pages'][] = $rel;
+            }
+
+            // Collect the Twig function/filter names used in this body so we
+            // can seed the 2.0 sandbox allowlist with the custom ones below.
+            $tokens = mg_extract_twig_tokens($body);
+            foreach ($tokens['functions'] as $fn) {
+                $bodyFuncPages[$fn][] = $rel;
+            }
+            foreach ($tokens['filters'] as $fl) {
+                $bodyFilterPages[$fl][] = $rel;
             }
         }
     }
@@ -1524,6 +1606,21 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
                 if ($sysFrontTwig === true || $sysFrontTwig === 'true' || $sysFrontTwig === 1 || $sysFrontTwig === '1') {
                     $result['frontmatter_twig'] = true;
                 }
+
+                // 1.x `system.twig.safe_functions` / `safe_filters` are the
+                // operator's curated allowlist of custom functions/filters for
+                // content Twig — the authoritative source for seeding the 2.0
+                // sandbox below. `undefined_functions` (default ON in 1.x) was
+                // the escape hatch 2.0 removed (GHSA-9wg2-prc3-vx89); track it
+                // so the report can warn that undeclared functions in content
+                // will now hard-fail. All four keys are dead in 2.0 and get
+                // stripped from the staged system.yaml further down.
+                $result['sandbox_safe_functions'] = mg_normalize_token_list($sys['twig']['safe_functions'] ?? []);
+                $result['sandbox_safe_filters']   = mg_normalize_token_list($sys['twig']['safe_filters'] ?? []);
+                $undef = $sys['twig']['undefined_functions'] ?? null;
+                // Unset means the 1.x default (true), which is the risky case.
+                $result['undefined_functions_was_on'] =
+                    $undef === null || $undef === true || $undef === 'true' || $undef === 1 || $undef === '1';
             }
         } catch (\Throwable) {
             // Bad YAML in source — leave defaults.
@@ -1538,8 +1635,16 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
         $result['config_access'] = true;
     }
 
-    // Nothing found → leave fresh-install defaults in place.
+    // Nothing found → just drop the two dead keys and leave fresh-install
+    // defaults in place. Grav 2.0 removed `undefined_functions` /
+    // `undefined_filters` (the blanket auto-allow); `safe_functions` /
+    // `safe_filters` are RETAINED (hardened) so they're preserved here and, in
+    // the process_enabled path below, merged with anything found in content.
     if (!$result['process_enabled']) {
+        if (is_file($systemYaml)) {
+            $result['system_twig_undefined_stripped'] =
+                mg_rewrite_system_twig_keys($systemYaml, ['undefined_functions', 'undefined_filters'], [], $result);
+        }
         return $result;
     }
 
@@ -1564,14 +1669,126 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
         ]
     );
 
+    // Seed the Twig allowlists so the custom functions/filters this site used
+    // in content keep resolving under Grav 2.0. Two layers are involved:
+    //   - system.twig.safe_functions / safe_filters — registers a raw PHP
+    //     function (e.g. `strtoupper`) so it's callable by name at all.
+    //   - security.twig_sandbox.allowed_functions / allowed_filters — lets
+    //     sandboxed PAGE CONTENT call it. Both are needed for content; a theme
+    //     template only needs the first.
+    // We scan Twig-enabled page bodies and, for each non-core name used:
+    //   - refuse anything Utils::isDangerousFunction() blocks (reported), and
+    //     anything the sandbox deny-lists by design (reported);
+    //   - real PHP functions → both safe_functions and the sandbox allowlist;
+    //   - everything else (plugin-provided Twig functions) → the sandbox
+    //     allowlist, plus a note that the plugin must register them.
+    $baseline   = mg_read_sandbox_baseline(dirname($dstUser));
+    $denylist   = array_flip(mg_twig_sandbox_denylist());
+    $coreFnsSet = array_flip($baseline['functions']);
+    $coreFlsSet = array_flip($baseline['filters']);
+    $existingSafeFns = array_flip($result['sandbox_safe_functions']);
+    $existingSafeFls = array_flip($result['sandbox_safe_filters']);
+
+    $allowFnAdd = $safeFnAdd = $pluginFns = [];
+    $contentTokens = [];   // name => sample page paths (escape-hatch category)
+    foreach ($bodyFuncPages as $fn => $pages) {
+        if (isset($coreFnsSet[$fn])) continue;                 // already a permitted Twig function
+        if (mg_is_dangerous_function((string) $fn)) { $result['sandbox_blocked_dangerous'][] = $fn; continue; }
+        if (isset($denylist[strtolower((string) $fn)])) { $result['sandbox_blocked'][] = $fn; continue; }
+        $allowFnAdd[$fn] = true;
+        if (function_exists((string) $fn)) {
+            $safeFnAdd[$fn] = true;                            // real PHP function → register it
+        } else {
+            $pluginFns[$fn] = true;                            // plugin-provided Twig function
+        }
+        // Escape-hatch category = used in content but not already blessed.
+        if (!isset($existingSafeFns[$fn])) {
+            $contentTokens[$fn] = array_values(array_unique($pages));
+        }
+    }
+
+    $allowFlAdd = $safeFlAdd = [];
+    foreach ($bodyFilterPages as $fl => $pages) {
+        if (isset($coreFlsSet[$fl])) continue;
+        if (mg_is_dangerous_function((string) $fl)) { $result['sandbox_blocked_dangerous'][] = $fl; continue; }
+        $allowFlAdd[$fl] = true;
+        if (function_exists((string) $fl)) {
+            $safeFlAdd[$fl] = true;
+        } else {
+            $pluginFns[$fl] = true;
+        }
+        if (!isset($existingSafeFls[$fl])) {
+            $contentTokens[$fl] = array_values(array_unique($pages));
+        }
+    }
+
+    // Merged safe_* lists for system.yaml = existing (preserved) + new PHP funcs.
+    $unionSafeFns = array_values(array_unique(array_merge($result['sandbox_safe_functions'], array_keys($safeFnAdd))));
+    $unionSafeFls = array_values(array_unique(array_merge($result['sandbox_safe_filters'], array_keys($safeFlAdd))));
+
+    $result['sandbox_blocked']           = array_values(array_unique($result['sandbox_blocked']));
+    $result['sandbox_blocked_dangerous'] = array_values(array_unique($result['sandbox_blocked_dangerous']));
+    $result['sandbox_functions_added']   = array_keys($allowFnAdd);
+    $result['sandbox_filters_added']     = array_keys($allowFlAdd);
+    // "added to safe_*" = the genuinely new entries (exclude pre-existing).
+    $result['safe_functions_added']      = array_values(array_diff(array_keys($safeFnAdd), $result['sandbox_safe_functions']));
+    $result['safe_filters_added']        = array_values(array_diff(array_keys($safeFlAdd), $result['sandbox_safe_filters']));
+    $result['sandbox_plugin_funcs']      = array_keys($pluginFns);
+    $result['sandbox_from_content']      = array_keys($contentTokens);
+    // One sample page per content-derived token keeps the report payload small.
+    $result['sandbox_token_pages']       = array_map(static fn($p) => $p[0] ?? null, $contentTokens);
+
+    $sandboxComment = '';
+    if ($allowFnAdd || $allowFlAdd) {
+        // Write the FULL union (core defaults first, then additions). The
+        // sandbox lists have no blueprint, so Grav merges them BY INDEX — a
+        // partial list here would corrupt the core defaults. Keep them whole.
+        $sandbox = $current['twig_sandbox'] ?? [];
+        if ($allowFnAdd) {
+            $sandbox['allowed_functions'] = array_values(array_unique(array_merge($baseline['functions'], array_keys($allowFnAdd))));
+        }
+        if ($allowFlAdd) {
+            $sandbox['allowed_filters'] = array_values(array_unique(array_merge($baseline['filters'], array_keys($allowFlAdd))));
+        }
+        $current['twig_sandbox'] = $sandbox;
+
+        $sandboxComment =
+            "#\n"
+          . "# Widened the Twig sandbox allowlist (security.twig_sandbox) to keep\n"
+          . "# custom functions/filters from your 1.x content working. These are\n"
+          . "# the FULL lists (core defaults + additions): the sandbox lists have\n"
+          . "# no blueprint, so Grav merges them by index — a partial list here\n"
+          . "# would corrupt the core defaults. Keep them complete.\n"
+          . "# Raw PHP functions are also added to system.twig.safe_functions so\n"
+          . "# they're callable at all. Durable fix for plugin-provided functions:\n"
+          . "# update the plugin to register them via the onBuildTwigSandboxPolicy\n"
+          . "# event, then delete them from this file.\n";
+    }
+
     @mkdir(dirname($secYaml), 0775, true);
     $dump = "# Generated by migrate-grav: enabled security.twig_content gates to\n"
           . "# preserve Twig-in-content behavior from the source 1.x install.\n"
           . "# editor_enabled is intentionally left off — grant the\n"
           . "# `admin.pages_twig` permission to specific users, or flip\n"
-          . "# editor_enabled to true in Configuration > Security > Twig in Content.\n\n"
+          . "# editor_enabled to true in Configuration > Security > Twig in Content.\n"
+          . $sandboxComment
+          . "\n"
           . $yaml::dump($current, 6, 2);
     @file_put_contents($secYaml, $dump);
+
+    // Rewrite the staged system.yaml twig block: drop the dead
+    // `undefined_functions` / `undefined_filters` keys Grav 2.0 removed, and
+    // (re)write `safe_functions` / `safe_filters` as the merged list of the
+    // operator's originals plus the raw PHP functions found in content. Empty
+    // lists are skipped, existing comments/keys are preserved.
+    if (is_file($systemYaml)) {
+        $result['system_twig_undefined_stripped'] = mg_rewrite_system_twig_keys(
+            $systemYaml,
+            ['undefined_functions', 'undefined_filters'],
+            array_filter(['safe_functions' => $unionSafeFns, 'safe_filters' => $unionSafeFls]),
+            $result
+        );
+    }
 
     // Promote the legacy `system.pages.process.twig` flag into the security
     // gate by stripping it from system.yaml. Grav 2.0 defaults the per-page
@@ -1718,6 +1935,366 @@ function mg_yaml_match_under_pages_process(string $raw, int $offset, int $indent
         return $trimmed === 'pages:';
     }
     return false;
+}
+
+/**
+ * Normalize a YAML value into a clean list of non-empty string tokens.
+ * 1.x `safe_functions: {  }` (empty map) and `safe_functions: []` both parse
+ * to an empty array; a populated list parses to a string list. Anything else
+ * (scalar, null) yields an empty list.
+ *
+ * @return list<string>
+ */
+function mg_normalize_token_list(mixed $val): array
+{
+    if (!is_array($val)) {
+        return [];
+    }
+    $out = [];
+    foreach ($val as $v) {
+        if (is_string($v) && $v !== '') {
+            $out[] = $v;
+        }
+    }
+    return array_values(array_unique($out));
+}
+
+/**
+ * Functions Grav 2.0 deliberately keeps OUT of the default sandbox allowlist
+ * because they enable SSTI / arbitrary file or code access from editor content
+ * (see the comments in system/config/security.yaml). migrate never auto-adds
+ * these even if the source site used them — it reports them instead.
+ *
+ * @return list<string>
+ */
+function mg_twig_sandbox_denylist(): array
+{
+    return [
+        // Twig core
+        'include', 'source', 'template_from_string', 'constant',
+        // Grav extras
+        'evaluate', 'evaluate_twig', 'svg_image', 'read_file',
+        'redirect_me', 'http_response_code',
+    ];
+}
+
+/**
+ * Extract the Twig function-call and filter names used inside `{{ … }}` /
+ * `{% … %}` regions of a page body. Prose parentheses and `|` characters
+ * outside Twig delimiters are ignored. Method calls (`obj.method()`) and
+ * piped filters are excluded from the function set, and macros declared in the
+ * same body are not mistaken for custom functions.
+ *
+ * Over-inclusion is safe here — a stray name only widens an allowlist that the
+ * operator is told to review. Under-inclusion is safe too (operator can add it
+ * by hand). So the heuristics favour simplicity over a full Twig lexer.
+ *
+ * @return array{functions:list<string>,filters:list<string>}
+ */
+function mg_extract_twig_tokens(string $body): array
+{
+    if ($body === '' || (!str_contains($body, '{{') && !str_contains($body, '{%'))) {
+        return ['functions' => [], 'filters' => []];
+    }
+
+    // Macro names declared in this body — excluded from the function set.
+    $macros = [];
+    if (preg_match_all('/\{%-?\s*macro\s+([a-zA-Z_]\w*)\s*\(/', $body, $mm)) {
+        foreach ($mm[1] as $n) {
+            $macros[strtolower($n)] = true;
+        }
+    }
+    if (preg_match_all('/\{%-?\s*from\b[^%]*\bimport\b([^%]*)%\}/', $body, $im)) {
+        foreach ($im[1] as $clause) {
+            if (preg_match_all('/[a-zA-Z_]\w*/', $clause, $names)) {
+                foreach ($names[0] as $n) {
+                    if (strtolower($n) !== 'as') {
+                        $macros[strtolower($n)] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    $functions = [];
+    $filters = [];
+    if (preg_match_all('/\{\{.*?\}\}|\{%.*?%\}/s', $body, $regions)) {
+        foreach ($regions[0] as $region) {
+            // Function calls: `name(` not preceded by a word char, `.` (method
+            // call) or `|` (piped filter).
+            if (preg_match_all('/(?<![\w.|])([a-zA-Z_]\w*)\s*\(/', $region, $fm)) {
+                foreach ($fm[1] as $fn) {
+                    if (!isset($macros[strtolower($fn)])) {
+                        $functions[$fn] = true;
+                    }
+                }
+            }
+            // Filters: `| name`.
+            if (preg_match_all('/\|\s*([a-zA-Z_]\w*)/', $region, $flm)) {
+                foreach ($flm[1] as $fl) {
+                    $filters[$fl] = true;
+                }
+            }
+        }
+    }
+
+    return [
+        'functions' => array_keys($functions),
+        'filters'   => array_keys($filters),
+    ];
+}
+
+/**
+ * Read the core default `twig_sandbox.allowed_functions` / `allowed_filters`
+ * lists from the staged Grav 2.0 install's `system/config/security.yaml`.
+ * Reading the staged copy (rather than a hardcoded list) keeps the union we
+ * write correct as core's defaults evolve across 2.0 point releases.
+ *
+ * @param string $stageRoot Staged Grav 2.0 root (dirname of the staged user/).
+ * @return array{functions:list<string>,filters:list<string>}
+ */
+function mg_read_sandbox_baseline(string $stageRoot): array
+{
+    $out = ['functions' => [], 'filters' => []];
+    $path = $stageRoot . '/system/config/security.yaml';
+    if (!is_file($path)) {
+        return $out;
+    }
+    mg_ensure_yaml_available();
+    $yaml = '\\Symfony\\Component\\Yaml\\Yaml';
+    try {
+        $cfg = $yaml::parseFile($path);
+    } catch (\Throwable) {
+        return $out;
+    }
+    if (is_array($cfg)) {
+        $out['functions'] = mg_normalize_token_list($cfg['twig_sandbox']['allowed_functions'] ?? []);
+        $out['filters']   = mg_normalize_token_list($cfg['twig_sandbox']['allowed_filters'] ?? []);
+    }
+    return $out;
+}
+
+/**
+ * Is `$name` a PHP function Grav 2.0 refuses to expose as Twig via
+ * `safe_functions` / `safe_filters`? Defers to the staged Grav 2.0
+ * `Utils::isDangerousFunction()` for an exact match (it's a pure static method,
+ * autoloadable once the staged vendor is on the include path), with a
+ * conservative built-in fallback if that class can't be loaded.
+ */
+function mg_is_dangerous_function(string $name): bool
+{
+    // mg_ensure_yaml_available() also wires the staged vendor autoload, which
+    // maps the `Grav\` namespace, so Utils becomes loadable after it runs.
+    mg_ensure_yaml_available();
+    if (class_exists('\\Grav\\Common\\Utils')) {
+        return \Grav\Common\Utils::isDangerousFunction($name);
+    }
+    // Fallback: refuse the command/code-execution and obvious filesystem/IO
+    // offenders. Core still enforces its full list at runtime regardless.
+    static $bad = [
+        'exec', 'passthru', 'system', 'shell_exec', 'popen', 'proc_open', 'pcntl_exec',
+        'assert', 'preg_replace', 'create_function', 'include', 'include_once',
+        'require', 'require_once', 'eval', 'call_user_func', 'call_user_func_array',
+        'extract', 'parse_str', 'putenv', 'ini_set', 'mail', 'header', 'unserialize',
+        'fopen', 'file_put_contents', 'file_get_contents', 'fwrite', 'unlink',
+        'phpinfo', 'getenv',
+    ];
+    return in_array(strtolower($name), $bad, true);
+}
+
+/**
+ * Rewrite the `twig:` block of a staged system.yaml in a single atomic pass:
+ *   - strip the keys in `$stripKeys` (e.g. the dead `undefined_functions` /
+ *     `undefined_filters` Grav 2.0 removed), and
+ *   - upsert each `$upsert[<key>] => list<string>` (e.g. the merged
+ *     `safe_functions` / `safe_filters`) as a fresh block-style list inserted
+ *     at the top of the `twig:` block. The old copy of an upserted key is
+ *     removed first so we never leave a duplicate.
+ *
+ * Operates on raw text (line-based, block-aware) so unrelated keys, comments,
+ * and formatting are preserved. A multi-line FLOW value for a key we need to
+ * remove (unbalanced `{`/`[` on the key line) is left in place and flagged via
+ * `$result['system_twig_warning']` — we skip its upsert to avoid a duplicate
+ * key rather than risk a fragile flow rewrite.
+ *
+ * @param list<string>                $stripKeys Keys to remove outright.
+ * @param array<string,list<string>>  $upsert    key => full list to (re)write.
+ * @param array<string,mixed>         $result    May receive `system_twig_warning`.
+ * @return list<string> Names of the keys actually stripped (excludes upserted keys).
+ */
+function mg_rewrite_system_twig_keys(string $systemYaml, array $stripKeys, array $upsert, array &$result): array
+{
+    $stripped = [];
+    $raw = @file_get_contents($systemYaml);
+    if ($raw === false || $raw === '') {
+        return $stripped;
+    }
+
+    // Every upserted key is also removed first, then re-inserted fresh.
+    $removeKeys = array_values(array_unique(array_merge($stripKeys, array_keys($upsert))));
+    $eol = str_contains($raw, "\r\n") ? "\r\n" : "\n";
+    $lines = preg_split('/\r?\n/', $raw);
+    if (!is_array($lines)) {
+        return $stripped;
+    }
+
+    // Locate the `twig:` mapping (a bare `twig:` line) and its indent.
+    $twigStart = -1;
+    $twigIndent = 0;
+    foreach ($lines as $i => $l) {
+        if (preg_match('/^([ \t]*)twig:[ \t]*$/', $l, $m)) {
+            $twigStart = $i;
+            $twigIndent = strlen($m[1]);
+            break;
+        }
+    }
+    if ($twigStart === -1) {
+        return $stripped;
+    }
+
+    // Detect the child indent used inside the twig: block (first child line);
+    // default to twig indent + 2 spaces.
+    $childIndentStr = str_repeat(' ', $twigIndent + 2);
+    for ($j = $twigStart + 1; $j < count($lines); $j++) {
+        $cl = $lines[$j];
+        if (trim($cl) === '' || ltrim($cl)[0] === '#') {
+            continue;
+        }
+        $ci = strlen($cl) - strlen(ltrim($cl, " \t"));
+        if ($ci > $twigIndent) {
+            $childIndentStr = substr($cl, 0, $ci);
+        }
+        break;
+    }
+    $itemIndentStr = $childIndentStr . '  ';
+
+    // Build the fresh block(s) to insert right after the twig: line. A key
+    // whose list is empty is skipped (nothing to write).
+    $blocked = [];   // upsert keys we couldn't safely insert (flow conflict)
+    $insert = [];
+    foreach ($upsert as $key => $list) {
+        $list = mg_normalize_token_list($list);
+        if (!$list) {
+            continue;
+        }
+        $insert[$key] = $list;
+    }
+
+    $out = [];
+    $n = count($lines);
+    $i = 0;
+    while ($i < $n) {
+        $line = $lines[$i];
+
+        if ($i === $twigStart) {
+            $out[] = $line;
+            // Inject the upserted lists at the top of the block.
+            foreach ($insert as $key => $list) {
+                $out[] = $childIndentStr . $key . ':';
+                foreach ($list as $item) {
+                    $out[] = $itemIndentStr . '- ' . $item;
+                }
+            }
+            $i++;
+            continue;
+        }
+
+        if ($i > $twigStart) {
+            $trimmed = trim($line);
+            $indent = strlen($line) - strlen(ltrim($line, " \t"));
+            // A non-blank, non-comment line at or below the twig: indent ends
+            // the block — copy the remainder verbatim.
+            if ($trimmed !== '' && $trimmed[0] !== '#' && $indent <= $twigIndent) {
+                for (; $i < $n; $i++) {
+                    $out[] = $lines[$i];
+                }
+                break;
+            }
+            if ($trimmed !== '' && $trimmed[0] !== '#'
+                && preg_match('/^([ \t]*)([a-zA-Z_]\w*):(.*)$/', $line, $km)) {
+                $keyIndent = strlen($km[1]);
+                if ($keyIndent > $twigIndent && in_array($km[2], $removeKeys, true)) {
+                    $rest = $km[3];
+                    $opens  = substr_count($rest, '{') + substr_count($rest, '[');
+                    $closes = substr_count($rest, '}') + substr_count($rest, ']');
+                    if ($opens > $closes) {
+                        $result['system_twig_warning'] =
+                            "multi-line flow value for `twig.{$km[2]}` in system.yaml; please remove it by hand";
+                        // If this was an upsert key we just inserted, our fresh
+                        // copy would now duplicate it — drop our insertion.
+                        if (isset($insert[$km[2]])) {
+                            $blocked[$km[2]] = true;
+                        }
+                        $out[] = $line;
+                        $i++;
+                        continue;
+                    }
+                    if (in_array($km[2], $stripKeys, true)) {
+                        $stripped[] = $km[2];
+                    }
+                    $i++;
+                    // Drop deeper-indented continuation lines (list items, etc.).
+                    while ($i < $n) {
+                        $child = $lines[$i];
+                        if (trim($child) === '') {
+                            break;
+                        }
+                        $cIndent = strlen($child) - strlen(ltrim($child, " \t"));
+                        if ($cIndent > $keyIndent) {
+                            $i++;
+                            continue;
+                        }
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+        $out[] = $line;
+        $i++;
+    }
+
+    // If a flow conflict blocked an upsert, strip the duplicate fresh block we
+    // injected at the top so the file stays valid (the old flow copy remains).
+    if ($blocked) {
+        $filtered = [];
+        $skip = 0;
+        foreach ($out as $idx => $ol) {
+            if ($skip > 0) { $skip--; continue; }
+            if (preg_match('/^([ \t]*)([a-zA-Z_]\w*):\s*$/', $ol, $bm)
+                && isset($blocked[$bm[2]]) && strlen($bm[1]) === strlen($childIndentStr)) {
+                // Skip this header and its item lines.
+                for ($k = $idx + 1; $k < count($out); $k++) {
+                    if (preg_match('/^\s*- /', $out[$k])) { $skip++; } else { break; }
+                }
+                continue;
+            }
+            $filtered[] = $ol;
+        }
+        $out = $filtered;
+    }
+
+    if (!$stripped && !$insert) {
+        return $stripped;
+    }
+    // Nothing actually changed (e.g. only-flow-blocked upserts, no strips).
+    $modified = implode($eol, $out);
+    if ($modified === $raw) {
+        return $stripped;
+    }
+
+    // Atomic write: temp file + rename.
+    $tmp = $systemYaml . '.tmp.' . getmypid();
+    if (@file_put_contents($tmp, $modified) === false) {
+        $result['system_twig_warning'] = 'failed to write temp file for system.yaml twig rewrite';
+        return [];
+    }
+    if (!@rename($tmp, $systemYaml)) {
+        @unlink($tmp);
+        $result['system_twig_warning'] = 'failed to rename temp file over system.yaml';
+        return [];
+    }
+    return $stripped;
 }
 
 /**

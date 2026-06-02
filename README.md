@@ -61,6 +61,43 @@ stage_dir: 'grav-2'
 require_super_admin: true
 ```
 
+## Twig in content
+
+Grav 2.0 changed how editor-authored Twig (Twig inside page content) is secured: the
+`security.twig_content` gate is off by default, a sandbox restricts what content Twig can
+do, and the blanket `undefined_functions` escape hatch was removed — an unlisted Twig
+function or filter is now a hard error. The `safe_functions` / `safe_filters` allow-lists
+are retained (and hardened: command/code-execution functions can never be enabled). The
+migration tries to preserve your 1.x behavior:
+
+- It turns the `security.twig_content` gate back on when your source site used Twig in
+  content (per-page `process: twig: true` or the site-wide `system.yaml` opt-ins).
+- It scans your Twig-enabled page content for the functions/filters it calls. **Raw PHP
+  functions** (e.g. `strtoupper`) are added to `system.twig.safe_functions` /
+  `safe_filters` (so they're callable at all) **and** to the
+  `security.twig_sandbox.allowed_functions` / `allowed_filters` lists (so sandboxed content
+  may call them). Your existing `safe_functions` entries are preserved and merged in.
+- **Plugin-provided Twig functions** (e.g. `unite_gallery`) are added to the sandbox
+  allow-list, but the providing plugin must still register them — ideally via the
+  `onBuildTwigSandboxPolicy` event. These are listed in the migration report.
+- Functions Grav 2.0 refuses — `Utils::isDangerousFunction()` (`system`, `exec`,
+  `preg_replace`, …) and the sandbox's by-design exclusions (`constant`, `read_file`,
+  `evaluate`, …) — are never added; the report lists them so you know those usages need
+  reworking.
+
+**What it can't detect automatically:** custom **object methods and properties** used in
+content Twig (for example a plugin object's `{{ thing.render() }}`) can't be found by a
+static scan, because the object's class isn't known until runtime. Grav 2.0 already
+allowlists the common page, media, config, and user classes, so most content keeps working.
+If something still renders as raw Twig (or shows a sandbox placeholder) after migration,
+check `logs/security.log`, then either add the class/method to
+`security.twig_sandbox.allowed_methods` by hand or — better — update the providing plugin to
+a 2.0 version that registers its safe Twig members via the `onBuildTwigSandboxPolicy` event.
+
+The allowlists written to `user/config/security.yaml` are the **full** lists (core defaults
+plus your additions) on purpose: Grav merges these lists by index, so a partial override
+would corrupt the core defaults. If you prune an entry, leave the rest intact.
+
 ## Aborting
 
 If you want to start over before launching the wizard, remove:
