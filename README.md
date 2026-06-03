@@ -61,6 +61,43 @@ stage_dir: 'grav-2'
 require_super_admin: true
 ```
 
+## Twig in content
+
+Grav 2.0 changed how editor-authored Twig (Twig inside page content) is secured: the
+`security.twig_content` gate is off by default, a sandbox restricts what content Twig can
+do, and the blanket `undefined_functions` escape hatch was removed — an unlisted Twig
+function or filter is now a hard error. The `safe_functions` / `safe_filters` allow-lists
+are retained (and hardened: command/code-execution functions can never be enabled). The
+migration tries to preserve your 1.x behavior:
+
+- It turns the `security.twig_content` gate back on when your source site used Twig in
+  content (per-page `process: twig: true` or the site-wide `system.yaml` opt-ins).
+- It scans your Twig-enabled page content for the functions/filters it calls. **Raw PHP
+  functions** (e.g. `strtoupper`) are added to `system.twig.safe_functions` /
+  `safe_filters` (so they're callable at all) **and** to the
+  `security.twig_sandbox.allowed_functions` / `allowed_filters` lists (so sandboxed content
+  may call them). Your existing `safe_functions` entries are preserved and merged in.
+- **Plugin-provided Twig functions** (e.g. `unite_gallery`) are added to the sandbox
+  allow-list, but the providing plugin must still register them — ideally via the
+  `onBuildTwigSandboxPolicy` event. These are listed in the migration report.
+- Functions Grav 2.0 refuses — `Utils::isDangerousFunction()` (`system`, `exec`,
+  `preg_replace`, …) and the sandbox's by-design exclusions (`constant`, `read_file`,
+  `evaluate`, …) — are never added; the report lists them so you know those usages need
+  reworking.
+
+**What it can't detect automatically:** custom **object methods and properties** used in
+content Twig (for example a plugin object's `{{ thing.render() }}`) can't be found by a
+static scan, because the object's class isn't known until runtime. Grav 2.0 already
+allowlists the common page, media, config, and user classes, so most content keeps working.
+If something still renders as raw Twig (or shows a sandbox placeholder) after migration,
+check `logs/security.log`, then either add the class/method to
+`security.twig_sandbox.allowed_methods` by hand or — better — update the providing plugin to
+a 2.0 version that registers its safe Twig members via the `onBuildTwigSandboxPolicy` event.
+
+The allowlists written to `user/config/security.yaml` are the **full** lists (core defaults
+plus your additions) on purpose: Grav merges these lists by index, so a partial override
+would corrupt the core defaults. If you prune an entry, leave the rest intact.
+
 ## Aborting
 
 If you want to start over before launching the wizard, remove:
@@ -85,11 +122,25 @@ If Phase 2 or Phase 3 fails partway through, your live webroot may be partially 
 
 **To restore from the backup zip:**
 
-- **Windows:** in File Explorer, right-click the zip → **Extract All…** and pick your webroot. **Do not** drag entries out of File Explorer's in-place zip viewer — that view shows a flat breadcrumb list (`system·src·Grav·…`) and dragging out produces files with literal `·` separators in their names. The Extract All wizard reconstructs the directory tree correctly. 7-Zip and WinRAR also work fine.
+- **Windows:** in File Explorer, right-click the zip → **Extract All…** and pick your webroot. The Extract All wizard reconstructs the directory tree correctly. 7-Zip and WinRAR also work fine.
 - **macOS:** double-click in Finder (Archive Utility extracts a proper tree), or `unzip migration-backup-*.zip -d /path/to/webroot` from Terminal.
 - **Linux:** `unzip migration-backup-*.zip -d /path/to/webroot`.
 
 Once the webroot is restored, follow the **Aborting** steps above to clear the wizard state, then re-run the wizard from the admin.
+
+### "The zip extracts as flat files with `·` or `\` in their names"
+
+If you ran the wizard on **Windows** with a version **prior to 1.0.0-rc.3**, the backup zip it created has a separator bug — entry names use `\` (Windows path separator) instead of `/` (zip spec). Every standards-tolerant extractor (7-Zip, Archive Utility, Windows Explorer's in-place viewer) treats the backslashes as literal filename characters and dumps every file in the zip's root with names like `user\plugins\admin\file.php` (or, in some viewers, `user·plugins·admin·file.php`).
+
+To repair such a zip, copy `user/plugins/migrate-grav/wizard/mg-repair-backup.php` from this plugin to any directory and run:
+
+```
+php mg-repair-backup.php migration-backup-1.7.x--20260507111032.zip
+```
+
+It writes `migration-backup-1.7.x--20260507111032.fixed.zip` next to the original with all entry names normalized to forward slashes. Extract the fixed zip with any tool and the directory tree will be correct.
+
+The script is self-contained — no Grav, no Composer, no plugin context. It just needs PHP 8.1+ with the `zip` extension. Backup-zip writes from 1.0.0-rc.3 onward no longer have this bug regardless of OS.
 
 ## License
 
