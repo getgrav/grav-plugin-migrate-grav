@@ -3678,6 +3678,21 @@ function ensure_dir(string $path): void
     if (!is_dir($path)) @mkdir($path, 0755, true);
 }
 
+/**
+ * Is a PHP function unavailable to us — either listed in disable_functions or
+ * genuinely absent? Mirrors the disable_functions parse used by mg_gpm_update;
+ * function_exists() alone is unreliable for disabled (vs. nonexistent) funcs
+ * across PHP versions, so we check both.
+ */
+function mg_fn_disabled(string $fn): bool
+{
+    static $disabled = null;
+    if ($disabled === null) {
+        $disabled = array_map('trim', explode(',', (string) ini_get('disable_functions')));
+    }
+    return in_array($fn, $disabled, true) || !function_exists($fn);
+}
+
 function mg_stream_setup(string $title, string $subtitle): void
 {
     // Streaming steps are inherently long-running — bulk copies, downloads,
@@ -3985,6 +4000,23 @@ function render_wizard(array $flag, string $step, string $webroot, string $stage
 {
     $stageDirAbs = $webroot . '/' . ltrim($stageDir, '/');
 
+    // Each row: [label, ok, severity?, hint?]. severity defaults to 'fail'
+    // (red, blocks the Extract button). 'warn' rows render yellow and DON'T
+    // block — they flag host conditions that make the long streaming steps
+    // (bulk copy, gpm update of 50+ packages) liable to die mid-run.
+    $maxExec = (int) ini_get('max_execution_time');
+    $stlOff  = mg_fn_disabled('set_time_limit');
+
+    // A bounded max_execution_time only bites if we can't lift it. With
+    // set_time_limit available the wizard raises it to 0; disabled, the host
+    // limit stands and a long step 500s. Surface the actual number so the
+    // remedy (raise it in the host's PHP / php-fpm config) is concrete.
+    $stlHint = 'set_time_limit() is blocked by disable_functions, so the wizard cannot lift PHP\'s execution limit'
+        . ($maxExec > 0 ? ' (currently ' . $maxExec . 's)' : '')
+        . '. Long steps — the bulk copy and the gpm update of all plugins/themes — can exceed it and fail with a silent HTTP 500. '
+        . 'Remedy: raise max_execution_time (and your php-fpm request_terminate_timeout / proxy read timeout) for this site, '
+        . 'then reload this page.';
+
     $preflight = [
         ['webroot writable',           is_writable($webroot)],
         ['staged zip present',         is_file($webroot . '/' . ltrim($stagedZip, '/'))],
@@ -3992,8 +4024,16 @@ function render_wizard(array $flag, string $step, string $webroot, string $stage
         ['stage dir writable / absent', !is_dir($stageDirAbs) || is_writable($stageDirAbs)],
         ['PHP version >= 8.3',         version_compare(PHP_VERSION, '8.3.0', '>=')],
         ['zip extension loaded',       extension_loaded('zip')],
+        ['set_time_limit() available', !$stlOff, 'warn', $stlHint],
+        ['ignore_user_abort() available', !mg_fn_disabled('ignore_user_abort'), 'warn',
+            'ignore_user_abort() is blocked by disable_functions. If the connection drops or the proxy times out mid-step, '
+            . 'the migration can abort half-applied. Keep this tab open and the connection alive; if a step fails, use Reset Migration to start clean.'],
+        ['proc_open() available',      !mg_fn_disabled('proc_open'), 'warn',
+            'proc_open() is blocked by disable_functions. The plugin/theme update step shells out to the staged <code>bin/gpm</code> '
+            . 'and will be skipped — your plugins/themes get copied as-is without being upgraded to their 2.0 releases.'],
     ];
-    $preflightOk = !array_filter($preflight, static fn($c) => !$c[1]);
+    // Only hard 'fail' rows gate the Extract button; warnings never block.
+    $preflightOk = !array_filter($preflight, static fn($c) => !$c[1] && (($c[2] ?? 'fail') === 'fail'));
 
     page_header('Grav 2.0 Migration Wizard');
     echo '<div class="mg-page">';
@@ -4175,8 +4215,22 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
             echo '<div class="mg-card mg-card-active"><h3>Step 1: Extract Grav 2.0' . $verBadge . '</h3>';
             echo '<p>The Grav ' . ($stagedVersion ? '<strong>v' . htmlspecialchars($stagedVersion) . '</strong>' : '2.0') . ' zip is ready at <code>' . htmlspecialchars($flag['staged_zip'] ?? '') . '</code>. Once all pre-flight checks pass, extract it into <code>/' . htmlspecialchars($stageDir) . '/</code>.</p>';
             echo '<table class="mg-table">';
-            foreach ($preflight as [$label, $ok]) {
-                echo '<tr><th>' . htmlspecialchars($label) . '</th><td class="' . ($ok ? 'mg-ok' : 'mg-fail') . '">' . ($ok ? 'OK' : 'FAILED') . '</td></tr>';
+            foreach ($preflight as $row) {
+                [$label, $ok] = $row;
+                $severity = $row[2] ?? 'fail';
+                $hint     = $row[3] ?? '';
+                if ($ok) {
+                    $cls = 'mg-ok';   $txt = 'OK';
+                } elseif ($severity === 'warn') {
+                    $cls = 'mg-warn'; $txt = 'WARNING';
+                } else {
+                    $cls = 'mg-fail'; $txt = 'FAILED';
+                }
+                echo '<tr><th>' . htmlspecialchars($label) . '</th><td class="' . $cls . '">' . $txt;
+                // Hints are authored copy (with intentional <code> markup), not
+                // user data — emit as-is, only shown when the check isn't OK.
+                if (!$ok && $hint !== '') echo '<span class="mg-check-hint">' . $hint . '</span>';
+                echo '</td></tr>';
             }
             echo '</table>';
             echo '<form method="post" style="margin-top:16px">';
@@ -4804,6 +4858,8 @@ function page_css(): string
     .mg-table code { background: #f4f4f8; padding: 1px 6px; border-radius: 3px; font-size: 12.5px; color: #333; }
     .mg-ok   { color: #2a7f2a; font-weight: 600; }
     .mg-fail { color: #c62828; font-weight: 600; }
+    .mg-warn { color: #b26a00; font-weight: 600; }
+    .mg-table .mg-check-hint { display: block; margin-top: 3px; font-size: 11.5px; font-weight: 400; color: #8a6d3b; line-height: 1.45; }
 
     .mg-btn { display: inline-flex; align-items: center; gap: 8px; padding: 10px 18px; border: none;
         border-radius: 4px; font-weight: 600; font-size: 13px; cursor: pointer; text-decoration: none;
