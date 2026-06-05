@@ -98,6 +98,31 @@ The allowlists written to `user/config/security.yaml` are the **full** lists (co
 plus your additions) on purpose: Grav merges these lists by index, so a partial override
 would corrupt the core defaults. If you prune an entry, leave the rest intact.
 
+## URL-based image actions
+
+Grav 1.7 applied image transforms straight from the query string —
+`image.jpg?cropResize=300,200` resized on the fly with no gate. Grav 2.0 moved that behind
+the new `system.images.url_actions` toggle (**off by default**), because those actions run
+with arguments an unauthenticated visitor controls. The normal, developer-driven path is
+unaffected: a Twig/Markdown media call like `page.media['x'].cropResize(300,200)`, or a
+Markdown image whose file is the page's own media (`![](x.jpg?cropResize=300,200)`), is
+resolved through the media object at render time into a hashed cache URL with no query
+string — it never touches this toggle.
+
+The migration scans your content for the query-string form that *does* bypass the media
+object — absolute or rooted paths, `theme://`/`image://` stream paths, references to files
+that aren't the page's media, and anything hand-written in a theme template — and turns
+`system.images.url_actions` on in the staged `user/config/system.yaml` when it finds any, so
+those images keep transforming after migration. Co-located Markdown media references (the
+common case) are recognised and left alone, so the toggle is not flipped on needlessly.
+External and protocol-relative URLs (`https://cdn.example.com/x.jpg?…`, `//host/x.jpg?…`)
+are skipped too — those are served by the remote host, so a CDN's own `?format=webp` query
+can't be mistaken for a Grav image action.
+
+If a flagged transform requests an image larger than `system.images.max_pixels`
+(25,000,000px by default), Grav still refuses it even with the toggle on — the report calls
+those out so you can raise the ceiling or rework them.
+
 ## Aborting
 
 If you want to start over before launching the wizard, remove:
