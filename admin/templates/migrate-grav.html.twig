@@ -77,6 +77,24 @@
         .mg-callout .fa { color: #f7a600; font-size: 16px; margin-top: 2px; flex: 0 0 auto; }
         .mg-callout-active { background: #eef4ff; border-left-color: #3b82f6; color: #1e3a70; }
         .mg-callout-active .fa { color: #3b82f6; }
+        .mg-callout-danger { background: #fff1f1; border-left-color: #c62828; color: #6e1f1f; align-items: center; }
+        .mg-callout-danger .fa { color: #c62828; }
+        .mg-callout-ok { background: #effaf1; border-left-color: #2e9e54; color: #1d5e34; }
+        .mg-callout-ok .fa { color: #2e9e54; }
+        .mg-callout .mg-callout-body { flex: 1 1 320px; }
+        .mg-callout form { margin: 0; flex: 0 0 auto; }
+        .mg-snippet {
+            display: block;
+            margin: 8px 0 0;
+            padding: 10px 12px;
+            background: #1f1f2b;
+            color: #e9e9f0;
+            border-radius: 4px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 12.5px;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
 
         .mg-action {
             display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
@@ -147,6 +165,39 @@
     </style>
 
     <div class="mg-page">
+        {% if migrate_grav_security and not migrate_grav_security.protected %}
+            <div class="mg-callout mg-callout-danger">
+                <i class="fa fa-shield"></i>
+                <div class="mg-callout-body">
+                    <strong>Security: the <code>user/data</code>, <code>user/accounts</code>, <code>user/config</code> and <code>user/env</code> folders may be downloadable over the web.</strong>
+                    {% if migrate_grav_security.apache %}
+                        <p style="margin:6px 0 0;">On older installs these folders are only protected by file extension, so certificates, keys, tokens and databases stored under <code>user/data</code> can be fetched directly. Grav 2.0 blocks them outright — apply the same fix to this site now.</p>
+                        {% if migrate_grav_security.can_autofix %}
+                            <form method="post" action="{{ base_url_relative }}/task:migrateGravSecureHtaccess" style="margin-top:10px;">
+                                <input type="hidden" name="admin-nonce" value="{{ admin.getNonce('admin-form') }}" />
+                                <button type="submit" class="mg-btn mg-btn-danger">
+                                    <i class="fa fa-lock"></i> Secure these folders now
+                                </button>
+                            </form>
+                        {% else %}
+                            <p style="margin:6px 0 0;">The site root <code>.htaccess</code> is not writable, so this cannot be fixed automatically. Add this rule to it inside the <code>&lt;IfModule mod_rewrite.c&gt;</code> block:</p>
+                            <code class="mg-snippet">{{ migrate_grav_security.snippet }}</code>
+                        {% endif %}
+                    {% else %}
+                        <p style="margin:6px 0 0;">This site is served by <code>{{ migrate_grav_security.server ?: 'a non-Apache webserver' }}</code>, which ignores <code>.htaccess</code>. Grav cannot fix this for you — add the equivalent rule to your webserver config and reload it:</p>
+                        <code class="mg-snippet">{{ migrate_grav_security.snippet }}</code>
+                    {% endif %}
+                </div>
+            </div>
+        {% elseif migrate_grav_security and migrate_grav_security.protected %}
+            <div class="mg-callout mg-callout-ok">
+                <i class="fa fa-shield"></i>
+                <div class="mg-callout-body">
+                    <strong>The sensitive <code>user/</code> folders are protected from direct web access.</strong>
+                </div>
+            </div>
+        {% endif %}
+
         <div class="mg-hero">
             <div class="mg-hero-inner">
                 <div class="mg-hero-icon">{{ rocket_svg|raw }}</div>
