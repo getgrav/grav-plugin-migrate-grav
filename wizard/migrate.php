@@ -658,6 +658,14 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
     // ─── Phase 7: install replacements (admin2, api, etc.) ──────────────────
     $replacements = mg_install_replacements($webroot, $stageDir, $scan, $disabled, $skipped, $progress);
 
+    // ─── Phase 7.5: carry a customized admin path → admin2 ──────────────────
+    // 1.7's admin route lives in admin.yaml; admin2 reads admin2.yaml. Only
+    // runs when admin2 was actually installed (admin → admin2 supersede).
+    $adminRoute = ['migrated' => false, 'route' => null];
+    if (array_key_exists('admin2', $replacements['installed'] ?? [])) {
+        $adminRoute = mg_migrate_admin_route($stageRoot, $progress);
+    }
+
     // Derive the "actually copied" slug list per kind from the scan, minus
     // skipped. (Disabled is a subset of copied — they got the files plus the
     // enabled:false flag.)
@@ -699,6 +707,7 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
         ] : null,
         'replacements'   => $replacements,
         'force_included' => $policyResult['force_included'] ?? [],
+        'admin_route'    => $adminRoute,
     ];
     save_flag($webroot . '/.migrating', $flag);
 
@@ -710,6 +719,7 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
     if ($disabled) $msg .= "; disabled " . count($disabled);
     if ($skipped)  $msg .= "; skipped " . count($skipped);
     if (!empty($replacements['installed'])) $msg .= "; installed " . count($replacements['installed']) . " replacement(s)";
+    if (!empty($adminRoute['migrated'])) $msg .= "; carried admin route {$adminRoute['route']} → admin2";
     if ($gpmResult && !$gpmResult['ok']) $msg .= "; gpm: " . $gpmResult['msg'];
     return ['ok' => true, 'msg' => $msg . '.'];
 }
@@ -835,6 +845,101 @@ function mg_migrate_account_perms(string $src, string $dst): int
 
     @file_put_contents($dst, $out);
     return $added;
+}
+
+/**
+ * Carry a customized admin path from Grav 1.7 into the staged Grav 2.0.
+ *
+ * In 1.7 the admin route lives in `user/config/plugins/admin.yaml` (`route`),
+ * but admin2 reads its own `user/config/plugins/admin2.yaml` (`route`). The
+ * bulk user/ copy brings admin.yaml across, yet admin2 never looks at it — so
+ * a user who changed `/admin` to e.g. `/backend` as a security measure would
+ * silently lose that after migration. This mirrors a non-default 1.7 route
+ * into the staged admin2 config, normalized to admin2's `/path` style.
+ *
+ * Only a route that differs from the 1.7 default (`/admin`) is carried; the
+ * default is already admin2's default, so there's nothing to write. Any other
+ * 1.7 admin settings are intentionally left behind — admin2's config surface
+ * is just `enabled` + `route`, so nothing else has an equivalent.
+ *
+ * Returns ['migrated' => bool, 'route' => string|null].
+ */
+function mg_migrate_admin_route(string $stageRoot, ?callable $progress = null): array
+{
+    $result = ['migrated' => false, 'route' => null];
+
+    $adminCfg  = $stageRoot . '/user/config/plugins/admin.yaml';
+    $admin2Cfg = $stageRoot . '/user/config/plugins/admin2.yaml';
+    if (!is_file($adminCfg)) return $result;
+
+    mg_ensure_yaml_available();
+
+    $adminData = mg_yaml_parse_file($adminCfg);
+    if (!is_array($adminData)) return $result;
+
+    $route = $adminData['route'] ?? null;
+    if (!is_string($route) || trim($route) === '') return $result;
+
+    // Normalize to admin2's leading-slash, no-trailing-slash form (`/backend`).
+    $route = '/' . trim(trim($route), '/');
+    if ($route === '/' || $route === '/admin') return $result; // default — nothing to carry.
+
+    // Merge into any existing staged admin2 config rather than clobbering it.
+    $admin2Data = is_file($admin2Cfg) ? mg_yaml_parse_file($admin2Cfg) : [];
+    if (!is_array($admin2Data)) $admin2Data = [];
+    if (($admin2Data['route'] ?? null) === $route) {
+        // Already set (idempotent re-run) — report as migrated without rewriting.
+        return ['migrated' => true, 'route' => $route];
+    }
+    $admin2Data['route'] = $route;
+
+    if ($progress) $progress(['phase' => 'start', 'entry' => 'config/admin2.yaml (route)']);
+
+    $out = mg_yaml_dump($admin2Data);
+    if ($out === null) return $result;
+
+    ensure_dir(dirname($admin2Cfg));
+    @file_put_contents($admin2Cfg, $out);
+
+    if ($progress) $progress(['phase' => 'done-entry', 'entry' => 'config/admin2.yaml (route)', 'route' => $route]);
+
+    return ['migrated' => true, 'route' => $route];
+}
+
+/**
+ * Parse a YAML file with whichever backend is available (staged Symfony Yaml
+ * preferred, ext-yaml fallback). Returns the decoded array or null.
+ */
+function mg_yaml_parse_file(string $path): ?array
+{
+    $raw = @file_get_contents($path);
+    if ($raw === false) return null;
+
+    if (class_exists('Symfony\\Component\\Yaml\\Yaml')) {
+        try {
+            $data = \Symfony\Component\Yaml\Yaml::parse($raw);
+        } catch (\Throwable $e) { return null; }
+    } elseif (function_exists('yaml_parse')) {
+        $data = @yaml_parse($raw);
+    } else {
+        return null;
+    }
+    return is_array($data) ? $data : null;
+}
+
+/**
+ * Dump an array back to a YAML string with whichever backend is available.
+ * Returns null when neither backend can serialize.
+ */
+function mg_yaml_dump(array $data): ?string
+{
+    if (class_exists('Symfony\\Component\\Yaml\\Yaml')) {
+        return \Symfony\Component\Yaml\Yaml::dump($data, 6, 2);
+    }
+    if (function_exists('yaml_emit')) {
+        return yaml_emit($data);
+    }
+    return null;
 }
 
 /**
