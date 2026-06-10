@@ -2,6 +2,7 @@
 namespace Grav\Plugin;
 
 use Grav\Common\Plugin;
+use Grav\Plugin\MigrateGrav\HtaccessSecurity;
 use Grav\Plugin\MigrateGrav\Kickoff;
 use RocketTheme\Toolbox\Event\Event;
 use RuntimeException;
@@ -65,6 +66,35 @@ class MigrateGravPlugin extends Plugin
                 return;
             }
             $this->grav->redirect($payload['wizard_url'], 302);
+            return;
+        }
+
+        if ($task === 'taskMigrateGravSecureHtaccess') {
+            if (!$authorized) {
+                $this->grav['admin']->setMessage('Super admin required to secure the webserver config.', 'error');
+                return;
+            }
+            $result = $this->newHtaccessSecurity()->applyFix();
+            if ($result['errors']) {
+                $this->grav['admin']->setMessage(
+                    'Could not fully secure the user/ folders: ' . implode('; ', $result['errors']),
+                    'error'
+                );
+            } else {
+                $done = [];
+                if ($result['patched']) {
+                    $done[] = 'added the folder block to .htaccess';
+                }
+                if ($result['created']) {
+                    $done[] = 'created ' . implode(', ', $result['created']);
+                }
+                $this->grav['admin']->setMessage(
+                    $done ? 'Secured the sensitive user/ folders: ' . implode('; ', $done) . '.'
+                          : 'The sensitive user/ folders were already protected.',
+                    'info'
+                );
+            }
+            $this->grav->redirect($this->grav['admin']->getAdminRoute('/migrate-grav'), 302);
             return;
         }
 
@@ -146,6 +176,20 @@ class MigrateGravPlugin extends Plugin
 
         $state = $this->newKickoff()->readFlag();
         $this->grav['twig']->twig_vars['migrate_grav_state'] = $state;
+
+        $security = $this->newHtaccessSecurity();
+        $status = $security->status();
+        $status['snippet'] = $status['protected'] ? '' : $security->manualSnippet();
+        $this->grav['twig']->twig_vars['migrate_grav_security'] = $status;
+    }
+
+    private function newHtaccessSecurity(): HtaccessSecurity
+    {
+        require_once __DIR__ . '/classes/HtaccessSecurity.php';
+
+        $webroot = defined('GRAV_WEBROOT') ? GRAV_WEBROOT : GRAV_ROOT;
+
+        return new HtaccessSecurity($webroot);
     }
 
     private function newKickoff(): Kickoff

@@ -658,6 +658,14 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
     // ─── Phase 7: install replacements (admin2, api, etc.) ──────────────────
     $replacements = mg_install_replacements($webroot, $stageDir, $scan, $disabled, $skipped, $progress);
 
+    // ─── Phase 7.5: carry a customized admin path → admin2 ──────────────────
+    // 1.7's admin route lives in admin.yaml; admin2 reads admin2.yaml. Only
+    // runs when admin2 was actually installed (admin → admin2 supersede).
+    $adminRoute = ['migrated' => false, 'route' => null];
+    if (array_key_exists('admin2', $replacements['installed'] ?? [])) {
+        $adminRoute = mg_migrate_admin_route($stageRoot, $progress);
+    }
+
     // Derive the "actually copied" slug list per kind from the scan, minus
     // skipped. (Disabled is a subset of copied — they got the files plus the
     // enabled:false flag.)
@@ -699,6 +707,7 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
         ] : null,
         'replacements'   => $replacements,
         'force_included' => $policyResult['force_included'] ?? [],
+        'admin_route'    => $adminRoute,
     ];
     save_flag($webroot . '/.migrating', $flag);
 
@@ -710,6 +719,7 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
     if ($disabled) $msg .= "; disabled " . count($disabled);
     if ($skipped)  $msg .= "; skipped " . count($skipped);
     if (!empty($replacements['installed'])) $msg .= "; installed " . count($replacements['installed']) . " replacement(s)";
+    if (!empty($adminRoute['migrated'])) $msg .= "; carried admin route {$adminRoute['route']} → admin2";
     if ($gpmResult && !$gpmResult['ok']) $msg .= "; gpm: " . $gpmResult['msg'];
     return ['ok' => true, 'msg' => $msg . '.'];
 }
@@ -835,6 +845,101 @@ function mg_migrate_account_perms(string $src, string $dst): int
 
     @file_put_contents($dst, $out);
     return $added;
+}
+
+/**
+ * Carry a customized admin path from Grav 1.7 into the staged Grav 2.0.
+ *
+ * In 1.7 the admin route lives in `user/config/plugins/admin.yaml` (`route`),
+ * but admin2 reads its own `user/config/plugins/admin2.yaml` (`route`). The
+ * bulk user/ copy brings admin.yaml across, yet admin2 never looks at it — so
+ * a user who changed `/admin` to e.g. `/backend` as a security measure would
+ * silently lose that after migration. This mirrors a non-default 1.7 route
+ * into the staged admin2 config, normalized to admin2's `/path` style.
+ *
+ * Only a route that differs from the 1.7 default (`/admin`) is carried; the
+ * default is already admin2's default, so there's nothing to write. Any other
+ * 1.7 admin settings are intentionally left behind — admin2's config surface
+ * is just `enabled` + `route`, so nothing else has an equivalent.
+ *
+ * Returns ['migrated' => bool, 'route' => string|null].
+ */
+function mg_migrate_admin_route(string $stageRoot, ?callable $progress = null): array
+{
+    $result = ['migrated' => false, 'route' => null];
+
+    $adminCfg  = $stageRoot . '/user/config/plugins/admin.yaml';
+    $admin2Cfg = $stageRoot . '/user/config/plugins/admin2.yaml';
+    if (!is_file($adminCfg)) return $result;
+
+    mg_ensure_yaml_available();
+
+    $adminData = mg_yaml_parse_file($adminCfg);
+    if (!is_array($adminData)) return $result;
+
+    $route = $adminData['route'] ?? null;
+    if (!is_string($route) || trim($route) === '') return $result;
+
+    // Normalize to admin2's leading-slash, no-trailing-slash form (`/backend`).
+    $route = '/' . trim(trim($route), '/');
+    if ($route === '/' || $route === '/admin') return $result; // default — nothing to carry.
+
+    // Merge into any existing staged admin2 config rather than clobbering it.
+    $admin2Data = is_file($admin2Cfg) ? mg_yaml_parse_file($admin2Cfg) : [];
+    if (!is_array($admin2Data)) $admin2Data = [];
+    if (($admin2Data['route'] ?? null) === $route) {
+        // Already set (idempotent re-run) — report as migrated without rewriting.
+        return ['migrated' => true, 'route' => $route];
+    }
+    $admin2Data['route'] = $route;
+
+    if ($progress) $progress(['phase' => 'start', 'entry' => 'config/admin2.yaml (route)']);
+
+    $out = mg_yaml_dump($admin2Data);
+    if ($out === null) return $result;
+
+    ensure_dir(dirname($admin2Cfg));
+    @file_put_contents($admin2Cfg, $out);
+
+    if ($progress) $progress(['phase' => 'done-entry', 'entry' => 'config/admin2.yaml (route)', 'route' => $route]);
+
+    return ['migrated' => true, 'route' => $route];
+}
+
+/**
+ * Parse a YAML file with whichever backend is available (staged Symfony Yaml
+ * preferred, ext-yaml fallback). Returns the decoded array or null.
+ */
+function mg_yaml_parse_file(string $path): ?array
+{
+    $raw = @file_get_contents($path);
+    if ($raw === false) return null;
+
+    if (class_exists('Symfony\\Component\\Yaml\\Yaml')) {
+        try {
+            $data = \Symfony\Component\Yaml\Yaml::parse($raw);
+        } catch (\Throwable $e) { return null; }
+    } elseif (function_exists('yaml_parse')) {
+        $data = @yaml_parse($raw);
+    } else {
+        return null;
+    }
+    return is_array($data) ? $data : null;
+}
+
+/**
+ * Dump an array back to a YAML string with whichever backend is available.
+ * Returns null when neither backend can serialize.
+ */
+function mg_yaml_dump(array $data): ?string
+{
+    if (class_exists('Symfony\\Component\\Yaml\\Yaml')) {
+        return \Symfony\Component\Yaml\Yaml::dump($data, 6, 2);
+    }
+    if (function_exists('yaml_emit')) {
+        return yaml_emit($data);
+    }
+    return null;
 }
 
 /**
@@ -1406,11 +1511,18 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
     // after migration.
     $twigScan = mg_scan_twig_content($webroot, $dstUser);
 
+    // Scan for URL-based image transforms (e.g. `image.jpg?cropResize=300,200`)
+    // that bypass the media object. Grav 2.0 gates these behind the new
+    // system.images.url_actions toggle (off by default); 1.7 had no gate, so
+    // flip it on where the source content relied on it.
+    $mediaScan = mg_scan_media_url_actions($webroot, $dstUser);
+
     $flag['step']    = 'content_done';
     $flag['content'] = [
-        'at'        => time(),
-        'entries'   => $entries,
-        'twig_scan' => $twigScan,
+        'at'                => time(),
+        'entries'           => $entries,
+        'twig_scan'         => $twigScan,
+        'media_url_actions' => $mediaScan,
     ];
     save_flag($webroot . '/.migrating', $flag);
 
@@ -1473,6 +1585,25 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
     }
     if (!empty($twigScan['system_twig_warning'])) {
         $msg .= ' WARNING (system.yaml): ' . $twigScan['system_twig_warning'] . '.';
+    }
+
+    // URL-based image actions (system.images.url_actions).
+    if ($mediaScan['enabled']) {
+        $where = [];
+        if (!empty($mediaScan['page_hits']))     $where[] = count($mediaScan['page_hits']) . ' page(s)';
+        if (!empty($mediaScan['template_hits'])) $where[] = count($mediaScan['template_hits']) . ' template(s)';
+        $msg .= ' Enabled system.images.url_actions — found URL-based image transforms that bypass the media object (e.g. `image.jpg?'
+              . ($mediaScan['actions'][0] ?? 'cropResize') . '=…`) in ' . implode(' and ', $where)
+              . '. Grav 2.0 disables these by default; without the toggle those images would stop transforming after migration.';
+    } elseif ($mediaScan['already_on']) {
+        $msg .= ' system.images.url_actions was already on — left as-is.';
+    }
+    if (!empty($mediaScan['oversized'])) {
+        $msg .= ' NOTE: ' . count($mediaScan['oversized']) . ' of those request the image above the system.images.max_pixels ceiling ('
+              . number_format($mediaScan['max_pixels']) . 'px) and will still be refused — raise max_pixels or rework them.';
+    }
+    if (!empty($mediaScan['warning'])) {
+        $msg .= ' WARNING (system.yaml images): ' . $mediaScan['warning'] . '.';
     }
 
     return ['ok' => true, 'msg' => $msg];
@@ -2295,6 +2426,444 @@ function mg_rewrite_system_twig_keys(string $systemYaml, array $stripKeys, array
         return [];
     }
     return $stripped;
+}
+
+/**
+ * The query-string image actions Grav serves through the URL fallback handler
+ * (`Grav::fallbackUrl`) when `system.images.url_actions` is on. Mirrors
+ * `ImageMedium::$magic_actions` in Grav core — keep in sync. A request like
+ * `/blog/post/photo.jpg?cropResize=300,200` only does anything when the query
+ * key matches one of these EXACTLY (Grav does a strict `in_array`), which is
+ * why the scanner matches them case-sensitively.
+ *
+ * @return list<string>
+ */
+function mg_image_url_action_names(): array
+{
+    return [
+        'resize', 'forceResize', 'cropResize', 'crop', 'zoomCrop',
+        'negate', 'brightness', 'contrast', 'grayscale', 'emboss',
+        'smooth', 'sharp', 'edge', 'colorize', 'sepia', 'enableProgressive',
+        'rotate', 'flip', 'fixOrientation', 'gaussianBlur', 'format', 'create', 'fill', 'merge',
+    ];
+}
+
+/**
+ * Width/height argument positions for the resize-family actions. Mirrors
+ * `ImageMedium::$magic_resize_actions`; Grav reads the output width/height from
+ * the last two positions (so `crop`'s w,h are positions 2,3). Used to flag
+ * request-derived resizes that exceed the `system.images.max_pixels` ceiling —
+ * those are refused even with `url_actions` on, so they need a heads-up.
+ *
+ * @return array<string,list<int>>
+ */
+function mg_image_url_action_resize_args(): array
+{
+    return [
+        'resize'      => [0, 1],
+        'forceResize' => [0, 1],
+        'cropResize'  => [0, 1],
+        'crop'        => [0, 1, 2, 3],
+        'zoomCrop'    => [0, 1],
+    ];
+}
+
+/**
+ * Scan migrated content for URL-based image transforms that bypass Grav's
+ * media object, and turn on `system.images.url_actions` in the staged
+ * `system.yaml` when any are found.
+ *
+ * Background: in Grav 1.7 a request like `image.jpg?cropResize=300,200` always
+ * applied the transform — there was no gate. Grav 2.0 added
+ * `system.images.url_actions` (default OFF) because those actions run with
+ * request-supplied arguments from an unauthenticated visitor. The normal,
+ * developer-controlled path — Twig/Markdown media methods such as
+ * `page.media['x'].cropResize(300,200)` or a co-located Markdown image
+ * `![](x.jpg?cropResize=300,200)` whose file IS the page's media — is
+ * UNAFFECTED by the toggle: Grav resolves it through the media object at render
+ * time and emits a hashed cache URL with no query string. Only references Grav
+ * can't resolve to page media (absolute/rooted paths, `theme://`/`image://`
+ * stream paths, files that aren't co-located, and anything hand-written in a
+ * theme template) keep their literal `?action=` URL and hit the url_actions
+ * handler. Those are what break after migration unless the toggle is on.
+ *
+ * Detection therefore matches the URL query form (`…ext?action=…`) — which the
+ * media object never emits — and, for Markdown-processed page content, only
+ * counts a reference when it does NOT resolve to a co-located media file:
+ *
+ *   - Page bodies are run through Grav's Markdown Excerpt processor, which
+ *     swaps a reference for the media-object output ONLY when the referenced
+ *     file exists as that page's own media. A bare/relative path that resolves
+ *     to an existing file in the page folder is the safe media-object case and
+ *     is skipped; everything else (absolute path, stream scheme, http(s) URL,
+ *     or a missing file) keeps its literal query and is counted.
+ *   - Theme templates are NOT Excerpt-processed — they render raw — so any
+ *     literal `?action=` image URL there is always a direct request and is
+ *     counted. (Twig media method chains use `.action(` syntax, not the query
+ *     form, so they never match.)
+ *
+ * False positives only re-enable behaviour the 1.7 site already had (and are
+ * listed in the report for review); false negatives are recoverable by flipping
+ * the toggle by hand. Both are safe, matching the rest of this step.
+ *
+ * @return array{
+ *   needed:bool, already_on:bool, enabled:bool,
+ *   page_hits:array<string,list<string>>, template_hits:array<string,list<string>>,
+ *   actions:list<string>, oversized:list<string>, max_pixels:int, warning:string
+ * }
+ */
+function mg_scan_media_url_actions(string $webroot, string $dstUser): array
+{
+    $result = [
+        'needed'        => false,
+        'already_on'    => false,
+        'enabled'       => false,
+        'page_hits'     => [],   // page-rel path => list of action names (direct refs)
+        'template_hits' => [],   // theme template-rel path => list of action names
+        'actions'       => [],   // union of action names found in direct refs
+        'oversized'     => [],   // refs whose requested w*h exceeds max_pixels
+        'max_pixels'    => 25000000,
+        'warning'       => '',
+    ];
+
+    $actionSet  = array_flip(mg_image_url_action_names());
+    $resizeArgs = mg_image_url_action_resize_args();
+    // Raster image types ImageMedium can transform (svg is vector, gif animated
+    // but still served by the same handler — include it).
+    $re = '~([^\s"\'`()<>\[\]]+?\.(?:jpe?g|png|gif|webp|avif|bmp))\?([^\s"\'`()<>]+)~i';
+
+    $systemYaml = $dstUser . '/config/system.yaml';
+
+    // Read the request-derived resize ceiling so the report can flag refs that
+    // will still be refused even after the toggle is on. Default mirrors core.
+    if (is_file($systemYaml)) {
+        mg_ensure_yaml_available();
+        try {
+            $sys = ('\\Symfony\\Component\\Yaml\\Yaml')::parseFile($systemYaml);
+            if (is_array($sys)) {
+                $mp = $sys['images']['max_pixels'] ?? null;
+                if (is_numeric($mp)) {
+                    $result['max_pixels'] = (int) $mp;
+                }
+            }
+        } catch (\Throwable) {
+            // Bad YAML — keep the default ceiling.
+        }
+    }
+    $maxPixels = $result['max_pixels'];
+
+    // Collect query-string image actions from a blob of text. Returns the
+    // matched action names; appends oversized notes keyed by $label.
+    $collect = function (string $text, string $label) use ($re, $actionSet, $resizeArgs, $maxPixels, &$result): array {
+        if (!str_contains($text, '?')) {
+            return [];
+        }
+        $found = [];
+        if (!preg_match_all($re, $text, $matches, PREG_SET_ORDER)) {
+            return [];
+        }
+        foreach ($matches as $m) {
+            // External and protocol-relative references (`https://cdn/…`,
+            // `//host/…`) are served by the remote host, never by
+            // `Grav::fallbackUrl()`, so the url_actions toggle cannot affect
+            // them. Skip them so a third-party `?format=webp` / `?crop=…` on a
+            // CDN URL doesn't masquerade as a Grav image action and turn the
+            // toggle on for nothing.
+            if (mg_media_ref_is_external($m[1])) {
+                continue;
+            }
+            // HTML attributes encode the separator as &amp; — normalise first.
+            $query = str_replace('&amp;', '&', $m[2]);
+            foreach (explode('&', $query) as $pair) {
+                if ($pair === '') continue;
+                [$key, $val] = array_pad(explode('=', $pair, 2), 2, '');
+                if (!isset($actionSet[$key])) continue;          // strict, case-sensitive
+                $found[$key] = true;
+
+                // Flag request-derived resizes above the pixel ceiling — Grav
+                // refuses these even with url_actions on (RAM-exhaustion guard).
+                if ($maxPixels > 0 && isset($resizeArgs[$key])) {
+                    $args = explode(',', $val);
+                    $pos  = $resizeArgs[$key];
+                    $w = $args[$pos[count($pos) - 2]] ?? null;
+                    $h = $args[$pos[count($pos) - 1]] ?? null;
+                    if (is_numeric($w) && is_numeric($h) && (int) $w > 0 && (int) $h > 0
+                        && ((int) $w * (int) $h) > $maxPixels) {
+                        $result['oversized'][] = $label . ': ' . $key . '=' . $val;
+                    }
+                }
+            }
+        }
+        return array_keys($found);
+    };
+
+    $pagesRoot = realpath($dstUser . '/pages') ?: '';
+
+    // Pass 1: page content (Markdown-Excerpt-processed). Skip references that
+    // resolve to a co-located media file — those go through the media object.
+    if ($pagesRoot !== '' && is_dir($pagesRoot)) {
+        $rii = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($pagesRoot, \FilesystemIterator::SKIP_DOTS));
+        foreach ($rii as $file) {
+            /** @var \SplFileInfo $file */
+            if ($file->isDir() || $file->getExtension() !== 'md') continue;
+
+            $raw = @file_get_contents($file->getPathname());
+            if ($raw === false || $raw === '' || !str_contains($raw, '?')) continue;
+
+            $pageDir = dirname($file->getPathname());
+            $rel = ltrim(str_replace($pagesRoot, '', $file->getPathname()), '/\\');
+
+            $hits = [];
+            if (preg_match_all($re, $raw, $matches, PREG_SET_ORDER)) {
+                foreach ($matches as $m) {
+                    // Only the references that bypass the media object count.
+                    if (mg_media_ref_resolves_to_page_media($m[1], $pageDir, $pagesRoot)) {
+                        continue;
+                    }
+                    $acts = $collect($m[0], $rel);
+                    foreach ($acts as $a) $hits[$a] = true;
+                }
+            }
+            if ($hits) {
+                $result['page_hits'][$rel] = array_keys($hits);
+            }
+        }
+    }
+
+    // Pass 2: theme templates (rendered raw, never Excerpt-processed). Any
+    // literal action URL here is a direct request.
+    $themesRoot = realpath($dstUser . '/themes') ?: '';
+    if ($themesRoot !== '' && is_dir($themesRoot)) {
+        $rii = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($themesRoot, \FilesystemIterator::SKIP_DOTS));
+        foreach ($rii as $file) {
+            /** @var \SplFileInfo $file */
+            if ($file->isDir()) continue;
+            $ext = strtolower($file->getExtension());
+            if (!in_array($ext, ['twig', 'html', 'htm'], true)) continue;
+
+            $raw = @file_get_contents($file->getPathname());
+            if ($raw === false || $raw === '' || !str_contains($raw, '?')) continue;
+
+            $rel = ltrim(str_replace($themesRoot, '', $file->getPathname()), '/\\');
+            $acts = $collect($raw, $rel);
+            if ($acts) {
+                $result['template_hits'][$rel] = $acts;
+            }
+        }
+    }
+
+    // Union of action names found across all direct refs (for the report).
+    $allActions = [];
+    foreach ($result['page_hits'] as $acts)     foreach ($acts as $a) $allActions[$a] = true;
+    foreach ($result['template_hits'] as $acts) foreach ($acts as $a) $allActions[$a] = true;
+    $result['actions']   = array_keys($allActions);
+    $result['oversized'] = array_values(array_unique($result['oversized']));
+    $result['needed']    = !empty($result['page_hits']) || !empty($result['template_hits']);
+
+    if (!$result['needed']) {
+        return $result;
+    }
+
+    // Flip system.images.url_actions on in the staged system.yaml.
+    if (is_file($systemYaml)) {
+        mg_set_system_images_url_actions($systemYaml, $result);
+    } else {
+        $result['warning'] = 'staged system.yaml missing — set images.url_actions: true by hand';
+    }
+
+    return $result;
+}
+
+/**
+ * Decide whether an image reference written in Markdown will be resolved by
+ * Grav's Excerpt processor to the page's media object (and thus does NOT depend
+ * on `system.images.url_actions`).
+ *
+ * Returns true only for the unambiguous co-located case: a bare or relative
+ * path that resolves to an existing file inside the page's own folder (which is
+ * where Grav looks up `$page->media()`). Absolute/rooted paths, stream schemes
+ * (`theme://`, `image://`, …), http(s) URLs, and references to files that don't
+ * exist on disk all return false — Grav keeps their literal query string, so
+ * they ride the url_actions handler and must be counted. Resolving absolute
+ * Grav routes (e.g. `/blog/post` → `01.blog/post`) back to a folder is left out
+ * deliberately: over-counting only re-enables 1.7 behaviour and is reported for
+ * review, whereas a fragile route resolver could silently miss the cases that
+ * actually break.
+ */
+function mg_media_ref_resolves_to_page_media(string $path, string $pageDir, string $pagesRoot): bool
+{
+    // Any scheme (http://, https://, theme://, image://, user://, …) means the
+    // reference isn't a plain page-folder media lookup we can confirm on disk.
+    if (preg_match('~^[a-zA-Z][a-zA-Z0-9+.\-]*://~', $path)) {
+        return false;
+    }
+    // Absolute/rooted paths aren't resolved against the page folder.
+    if ($path === '' || $path[0] === '/' || $path[0] === '\\') {
+        return false;
+    }
+    // Relative to the page folder — realpath collapses ./ and ../ and returns
+    // false when the file doesn't exist, which is exactly the test we want.
+    $real = realpath($pageDir . '/' . $path);
+    if ($real === false || !is_file($real)) {
+        return false;
+    }
+    // Stay inside the pages tree (a ../ ladder must not climb out of it).
+    $rootReal = realpath($pagesRoot);
+    return $rootReal !== false && str_starts_with($real, $rootReal . DIRECTORY_SEPARATOR);
+}
+
+/**
+ * Is a media reference pointed at a remote host rather than this site?
+ *
+ * `Grav::fallbackUrl()` only serves media requested from the local site, so an
+ * absolute URL (`https://cdn.example.com/x.jpg?…`) or a protocol-relative one
+ * (`//cdn.example.com/x.jpg?…`) is fetched by the browser straight from that
+ * host and never touches the url_actions handler. Their query string is just
+ * the remote service's own API (e.g. an image CDN's `?format=webp&w=200`), so a
+ * collision with a Grav magic-action name is a false positive and must not turn
+ * the toggle on. Grav schemes (`image://`, `theme://`, `user://`) are NOT
+ * treated as external: those resolve to local files and keep their literal
+ * query, so they still ride the handler and must be counted.
+ *
+ * Same-site absolute URLs (`https://this-site/page/x.jpg?resize=…`) would hit
+ * the handler, but the staged migration has no reliable site hostname to match
+ * against, so they are skipped here and surfaced via the documented
+ * "enable manually" caveat rather than guessed at.
+ */
+function mg_media_ref_is_external(string $path): bool
+{
+    // Protocol-relative: //host/path
+    if (str_starts_with($path, '//')) {
+        return true;
+    }
+    // http(s):// (and any other transport scheme). Grav stream wrappers
+    // (image://, theme://, user://, …) are local and deliberately excluded.
+    return (bool) preg_match('~^(?:https?|ftp|ftps|wss?)://~i', $path);
+}
+
+/**
+ * Set `images.url_actions: true` in a staged `system.yaml`, operating on raw
+ * text so unrelated keys, comments, and formatting are preserved. Handles three
+ * shapes: the key already present (value flipped to true; an already-true value
+ * is a no-op recorded as `already_on`), an `images:` block without the key (key
+ * inserted as the first child), and no `images:` block at all (a fresh
+ * block-style entry appended). Flow-style `images: { … }` is detected and left
+ * for the operator with a warning rather than risking a fragile rewrite.
+ *
+ * Sets on $result: `enabled` (bool), `already_on` (bool), `warning` (string).
+ */
+function mg_set_system_images_url_actions(string $systemYaml, array &$result): void
+{
+    $raw = @file_get_contents($systemYaml);
+    if ($raw === false) {
+        $result['warning'] = 'could not read staged system.yaml';
+        return;
+    }
+
+    $eol = str_contains($raw, "\r\n") ? "\r\n" : "\n";
+    $lines = preg_split('/\r?\n/', $raw);
+    if (!is_array($lines)) {
+        $result['warning'] = 'could not parse staged system.yaml';
+        return;
+    }
+
+    // Strip an unquoted trailing comment and surrounding whitespace.
+    $valueOf = static function (string $rest): string {
+        $rest = preg_replace('/\s+#.*$/', '', $rest) ?? $rest;
+        return trim($rest);
+    };
+    $isTruthy = static fn(string $v): bool => in_array(strtolower($v), ['true', '1', 'on', 'yes'], true);
+
+    // Locate a top-level (zero-indent) `images:` block.
+    $imagesStart = -1;
+    foreach ($lines as $i => $l) {
+        if (preg_match('/^images:[ \t]*(.*)$/', $l, $m)) {
+            $rest = $valueOf($m[1]);
+            if ($rest !== '' && $rest[0] === '{') {
+                $result['warning'] = 'flow-style `images: { … }` in system.yaml; please add `url_actions: true` by hand';
+                return;
+            }
+            $imagesStart = $i;
+            break;
+        }
+    }
+
+    // No images: block — append a fresh one.
+    if ($imagesStart === -1) {
+        $prefix = '';
+        if ($raw !== '') {
+            // Close an unterminated last line, then a blank separator line.
+            if (!str_ends_with($raw, "\n") && !str_ends_with($raw, "\r")) $prefix .= $eol;
+            $prefix .= $eol;
+        }
+        $block = $prefix . 'images:' . $eol . '  url_actions: true' . $eol;
+        if (mg_atomic_append($systemYaml, $block, $result)) {
+            $result['enabled'] = true;
+        }
+        return;
+    }
+
+    // Walk the images: children looking for an existing url_actions: key.
+    $childIndent = '  ';
+    $n = count($lines);
+    for ($j = $imagesStart + 1; $j < $n; $j++) {
+        $line = $lines[$j];
+        $trimmed = trim($line);
+        if ($trimmed === '' || $trimmed[0] === '#') continue;
+        $indent = strlen($line) - strlen(ltrim($line, " \t"));
+        if ($indent === 0) break;                       // left the images: block
+        $childIndent = substr($line, 0, $indent);
+        if (preg_match('/^([ \t]+)url_actions:[ \t]*(.*)$/', $line, $km)) {
+            if ($isTruthy($valueOf($km[2]))) {
+                $result['already_on'] = true;           // nothing to do
+                return;
+            }
+            $lines[$j] = $km[1] . 'url_actions: true';
+            if (mg_atomic_write($systemYaml, implode($eol, $lines), $result)) {
+                $result['enabled'] = true;
+            }
+            return;
+        }
+    }
+
+    // images: block exists but no url_actions key — insert as first child.
+    array_splice($lines, $imagesStart + 1, 0, [$childIndent . 'url_actions: true']);
+    if (mg_atomic_write($systemYaml, implode($eol, $lines), $result)) {
+        $result['enabled'] = true;
+    }
+}
+
+/**
+ * Atomic full-file write (temp + rename). On failure sets `$result['warning']`
+ * and returns false.
+ */
+function mg_atomic_write(string $path, string $contents, array &$result): bool
+{
+    $tmp = $path . '.tmp.' . getmypid();
+    if (@file_put_contents($tmp, $contents) === false) {
+        $result['warning'] = 'failed to write temp file for system.yaml images rewrite';
+        return false;
+    }
+    if (!@rename($tmp, $path)) {
+        @unlink($tmp);
+        $result['warning'] = 'failed to rename temp file over system.yaml';
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Append to a file by reading, concatenating, and atomically rewriting so the
+ * write stays crash-safe. On failure sets `$result['warning']`, returns false.
+ */
+function mg_atomic_append(string $path, string $append, array &$result): bool
+{
+    $raw = @file_get_contents($path);
+    if ($raw === false) {
+        $result['warning'] = 'could not read staged system.yaml for append';
+        return false;
+    }
+    return mg_atomic_write($path, $raw . $append, $result);
 }
 
 /**
