@@ -1,5 +1,5 @@
 # v1.0.0-rc.5
-## 06-05-2026
+## 06-10-2026
 
 1. [](#new)
     * A customized admin path now carries across the migration. Grav 1.7 stores the admin route in `admin.yaml`, but Admin 2.0 reads its own `admin2.yaml`, so a site that changed `/admin` to e.g. `/backend` as a security measure would otherwise revert to the default after migrating. When the source route differs from the `/admin` default, the migration now writes it into the staged `admin2.yaml` (normalized to Admin 2.0's `/path` form), merging into any existing admin2 config rather than overwriting it. Only the route is carried — it's the one 1.7 admin setting Admin 2.0 has an equivalent for. [#6]
