@@ -255,7 +255,15 @@ function do_extract(string $webroot, array $flag, ?callable $progress = null): a
 
     $zip = new ZipArchive();
     if (($open = $zip->open($zipPath)) !== true) {
-        return ['ok' => false, 'msg' => "Could not open zip (code {$open}): {$zipPath}"];
+        $msg = "Could not open zip (code {$open}): {$zipPath}";
+        // 19 = not a zip, 21 = inconsistent, 35 = truncated (libzip >= 1.10,
+        // which has no ZipArchive constant yet): the staged download is
+        // damaged — extraction itself didn't break.
+        if (in_array($open, [ZipArchive::ER_NOZIP, ZipArchive::ER_INCONS, 35], true)) {
+            $msg .= ' — the staged zip is truncated or corrupt, usually from an interrupted download. '
+                . 'Use Reset Migration on the Migrate Grav admin page, then stage again to re-download it.';
+        }
+        return ['ok' => false, 'msg' => $msg];
     }
 
     $prefix = detect_common_prefix($zip);
