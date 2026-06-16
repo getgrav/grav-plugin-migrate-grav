@@ -1,5 +1,5 @@
 # v1.0.0-rc.6
-## 06-12-2026
+## 06-16-2026
 
 1. [](#bugfix)
     * **A truncated Grav 2.0 download can no longer be staged.** PHP's HTTP stream reports end-of-file when the server, a proxy, or a flaky connection drops mid-transfer, so the kickoff's download loop exited cleanly on a partial file, and the only validation afterward was a 1KB minimum-size check — a release zip cut off at any point past that sailed through and got marked as staged. The wizard then failed at the extract step with the unhelpful `Could not open zip (code 35)` (libzip's "truncated zip archive"). The kickoff now cross-checks the bytes received against the response's `Content-Length`, verifies the file actually opens as a zip archive (with at least one entry) before the `.migrating` flag is written, deletes the partial file on any failure, and reports what went wrong — including how many bytes arrived versus how many were expected — along with the remedy (retry, or download the release manually and point `source_local_zip` at it).
