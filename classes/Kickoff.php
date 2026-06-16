@@ -123,6 +123,7 @@ class Kickoff
             if (!is_file($local)) {
                 throw new RuntimeException("source_local_zip not found: {$local}");
             }
+            $this->assertValidZip($local, false);
             return $local;
         }
 
@@ -148,6 +149,7 @@ class Kickoff
         if (!is_file($dest) || filesize($dest) < 1024) {
             throw new RuntimeException("Downloaded zip looks invalid: {$dest}");
         }
+        $this->assertValidZip($dest, true);
 
         return $dest;
     }
@@ -169,18 +171,111 @@ class Kickoff
             fclose($in);
             throw new RuntimeException("Failed to open destination for write: {$dest}");
         }
+        $ok = false;
+        $written = 0;
         try {
             while (!feof($in)) {
                 $chunk = fread($in, 1 << 16);
                 if ($chunk === false) {
                     throw new RuntimeException("Read error during download from {$url}");
                 }
-                fwrite($out, $chunk);
+                if ($chunk === '') {
+                    continue;
+                }
+                if (fwrite($out, $chunk) !== strlen($chunk)) {
+                    throw new RuntimeException("Write error while saving {$dest} — is the disk full?");
+                }
+                $written += strlen($chunk);
             }
+
+            // feof() also reports true when the server, a proxy, or a flaky
+            // connection drops mid-transfer, so a clean loop exit does NOT
+            // mean a complete file. Cross-check bytes received against the
+            // response's Content-Length before trusting the download.
+            $meta = stream_get_meta_data($in);
+            if (!empty($meta['timed_out'])) {
+                throw new RuntimeException(
+                    "Download timed out after {$written} bytes from {$url}. Try again, " .
+                    "or download the release manually and set source_local_zip in the plugin configuration."
+                );
+            }
+            $expected = self::contentLengthFromHeaders($meta['wrapper_data'] ?? []);
+            if ($expected !== null && $written !== $expected) {
+                throw new RuntimeException(
+                    "Incomplete download from {$url}: received {$written} of {$expected} bytes. " .
+                    "The connection was interrupted — try again, or download the release manually " .
+                    "and set source_local_zip in the plugin configuration."
+                );
+            }
+            $ok = true;
         } finally {
             fclose($in);
             fclose($out);
+            if (!$ok) {
+                // Never leave a partial file behind: a later retry must not
+                // be able to stage it, and (on failure paths that don't
+                // throw past obtainZip) neither must the wizard.
+                @unlink($dest);
+            }
         }
+    }
+
+    /**
+     * Effective Content-Length from the HTTP wrapper's header list. Across
+     * redirects the wrapper appends every hop's headers to one flat array,
+     * so reset on each new status line and keep the last value seen — that
+     * is the body actually streamed. Returns null when the final response
+     * carried no Content-Length (e.g. chunked encoding); the caller then
+     * relies on the zip integrity check instead.
+     */
+    private static function contentLengthFromHeaders(array $headers): ?int
+    {
+        $length = null;
+        foreach ($headers as $header) {
+            if (!is_string($header)) {
+                continue;
+            }
+            if (preg_match('~^HTTP/~i', $header)) {
+                $length = null;
+            } elseif (preg_match('~^Content-Length:\s*(\d+)\s*$~i', $header, $m)) {
+                $length = (int) $m[1];
+            }
+        }
+        return $length;
+    }
+
+    /**
+     * Reject a zip that isn't a readable archive. The end-of-central-directory
+     * record lives at the TAIL of a zip, so a truncated transfer passes any
+     * size check yet fails to open (libzip: ER_NOZIP 19, ER_INCONS 21, or
+     * ER_TRUNCATED_ZIP 35 on libzip >= 1.10). Catching it here, before the
+     * .migrating flag is written, beats failing later in the wizard's extract
+     * step where the remedy (Reset Migration, re-stage) is less obvious.
+     */
+    private function assertValidZip(string $path, bool $deleteOnFailure): void
+    {
+        if (!class_exists(\ZipArchive::class)) {
+            return; // no zip extension in this SAPI; the wizard reports it on extract
+        }
+        $zip = new \ZipArchive();
+        $rc = $zip->open($path);
+        if ($rc === true && $zip->numFiles > 0) {
+            $zip->close();
+            return;
+        }
+        if ($rc === true) {
+            $zip->close();
+        }
+        if ($deleteOnFailure) {
+            @unlink($path);
+        }
+        $detail = $rc === true ? 'archive contains no entries' : "ZipArchive error code {$rc}";
+        throw new RuntimeException(
+            "Zip is corrupt or truncated ({$detail}): {$path}. " .
+            ($deleteOnFailure
+                ? 'The download was likely interrupted — try staging again, or download the release manually and set source_local_zip in the plugin configuration.'
+                : 'Re-download the file configured as source_local_zip and verify it with `unzip -t`.')
+        );
     }
 
     /**
