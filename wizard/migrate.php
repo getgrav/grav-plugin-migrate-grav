@@ -804,17 +804,10 @@ function mg_migrate_account_perms(string $src, string $dst): int
     $raw = @file_get_contents($src);
     if ($raw === false) { @copy($src, $dst); return 0; }
 
-    if (class_exists('Symfony\\Component\\Yaml\\Yaml')) {
-        try {
-            $data = \Symfony\Component\Yaml\Yaml::parse($raw);
-        } catch (\Throwable $e) { @copy($src, $dst); return 0; }
-    } elseif (function_exists('yaml_parse')) {
-        $data = @yaml_parse($raw);
-    } else {
-        // Can't safely edit; just copy.
-        @copy($src, $dst);
-        return 0;
-    }
+    if (!class_exists('Symfony\\Component\\Yaml\\Yaml')) { @copy($src, $dst); return 0; }
+    try {
+        $data = \Symfony\Component\Yaml\Yaml::parse($raw);
+    } catch (\Throwable) { @copy($src, $dst); return 0; }
     if (!is_array($data)) { @copy($src, $dst); return 0; }
 
     $added = 0;
@@ -842,14 +835,7 @@ function mg_migrate_account_perms(string $src, string $dst): int
         }
     }
 
-    if (class_exists('Symfony\\Component\\Yaml\\Yaml')) {
-        $out = \Symfony\Component\Yaml\Yaml::dump($data, 6, 2);
-    } elseif (function_exists('yaml_emit')) {
-        $out = yaml_emit($data);
-    } else {
-        @copy($src, $dst);
-        return 0;
-    }
+    $out = \Symfony\Component\Yaml\Yaml::dump($data, 6, 2);
 
     @file_put_contents($dst, $out);
     return $added;
@@ -915,54 +901,56 @@ function mg_migrate_admin_route(string $stageRoot, ?callable $progress = null): 
 }
 
 /**
- * Parse a YAML file with whichever backend is available (staged Symfony Yaml
- * preferred, ext-yaml fallback). Returns the decoded array or null.
+ * Parse a YAML file with Symfony Yaml — the single parser the wizard uses, so
+ * results are consistent everywhere. mg_ensure_yaml_available() loads it from
+ * the existing install's vendor/ (always present beside migrate.php). Returns
+ * the decoded array, or null if the file is unreadable or not a YAML mapping.
  */
 function mg_yaml_parse_file(string $path): ?array
 {
+    mg_ensure_yaml_available();
     $raw = @file_get_contents($path);
-    if ($raw === false) return null;
+    if ($raw === false || !class_exists('Symfony\\Component\\Yaml\\Yaml')) return null;
 
-    if (class_exists('Symfony\\Component\\Yaml\\Yaml')) {
-        try {
-            $data = \Symfony\Component\Yaml\Yaml::parse($raw);
-        } catch (\Throwable $e) { return null; }
-    } elseif (function_exists('yaml_parse')) {
-        $data = @yaml_parse($raw);
-    } else {
+    try {
+        $data = \Symfony\Component\Yaml\Yaml::parse($raw);
+    } catch (\Throwable) {
         return null;
     }
     return is_array($data) ? $data : null;
 }
 
 /**
- * Dump an array back to a YAML string with whichever backend is available.
- * Returns null when neither backend can serialize.
+ * Dump an array back to a YAML string with Symfony Yaml. Returns null only if
+ * the parser somehow isn't loadable (vendor/ missing — should never happen).
  */
 function mg_yaml_dump(array $data): ?string
 {
-    if (class_exists('Symfony\\Component\\Yaml\\Yaml')) {
-        return \Symfony\Component\Yaml\Yaml::dump($data, 6, 2);
-    }
-    if (function_exists('yaml_emit')) {
-        return yaml_emit($data);
-    }
-    return null;
+    mg_ensure_yaml_available();
+    if (!class_exists('Symfony\\Component\\Yaml\\Yaml')) return null;
+
+    return \Symfony\Component\Yaml\Yaml::dump($data, 6, 2);
 }
 
 /**
- * Ensure Symfony\Component\Yaml\Yaml is loadable. After Step 1 extracts the
- * 2.0 release, the staged vendor/ has it. Pulling in autoload is OK — we
- * only reach here inside POST handlers where the extra class load is fine.
+ * Ensure Symfony\Component\Yaml\Yaml is loadable. Pulling in an autoload here
+ * is OK — it registers Composer's lazy autoloader, it does not boot Grav.
+ *
+ * Prefer the EXISTING install's vendor/: migrate.php is copied to the webroot,
+ * so the source install sits right beside it at __DIR__/vendor — a fixed,
+ * known location that's guaranteed present and whose Symfony Yaml is proven to
+ * work (it parses every request Grav serves). The staged 2.0 tree is only a
+ * fallback: its directory name is config-driven (stage_dir, default 'grav-2'),
+ * so we can't be sure of its path, and it only exists after Step 1 extracts.
+ * Either Yaml version parses blueprints identically.
  */
 function mg_ensure_yaml_available(): void
 {
     if (class_exists('Symfony\\Component\\Yaml\\Yaml')) return;
 
-    // Try the staged 2.0 vendor first (always present after extract).
     foreach ([
-        __DIR__ . '/grav-2/vendor/autoload.php',
-        __DIR__ . '/vendor/autoload.php',
+        __DIR__ . '/vendor/autoload.php',          // existing install (reliable)
+        __DIR__ . '/grav-2/vendor/autoload.php',    // staged 2.0 (default stage_dir)
     ] as $candidate) {
         if (is_file($candidate)) {
             require_once $candidate;
@@ -4162,41 +4150,19 @@ function mg_infer_compat_from_deps(array $dependencies): array
 }
 
 /**
- * Read a plugin/theme blueprints.yaml into the small array structure we need.
- * Uses ext-yaml when available; falls back to a narrow hand parser that
- * only understands: version, slug, compatibility.grav, dependencies (list
- * of {name, version} maps). Sufficient for all core Grav blueprints.
+ * Read a plugin/theme blueprints.yaml via the wizard's single YAML parser
+ * (Symfony Yaml, loaded from the existing install's vendor/). Returns the full
+ * decoded blueprint, or [] when the file is missing or unparseable. Callers
+ * read version, slug, name, compatibility.grav and dependencies off it — a
+ * real parser handles every YAML shape those keys can take (block, flow and
+ * scalar lists alike), so a plugin that declares 2.0 support in any valid form
+ * is read correctly.
  */
 function mg_read_blueprint(string $path): array
 {
     if (!is_file($path)) return [];
 
-    if (function_exists('yaml_parse_file')) {
-        $data = @yaml_parse_file($path);
-        if (is_array($data)) return $data;
-    }
-
-    $raw = @file_get_contents($path);
-    if ($raw === false) return [];
-
-    $out = [];
-    if (preg_match('/^version:\s*["\']?([\w.\-+]+)["\']?/m', $raw, $m))  $out['version']  = $m[1];
-    if (preg_match('/^slug:\s*["\']?([\w.\-]+)["\']?/m', $raw, $m))      $out['slug']     = $m[1];
-
-    // compatibility.grav: ['1.7','2.0'] — one-line flow style
-    if (preg_match('/^compatibility:\s*\n(?:\s+\S.*\n)*?\s+grav:\s*\[([^\]]+)\]/m', $raw, $m)) {
-        $out['compatibility']['grav'] = array_map(static fn($s) => trim($s, " \t\"'"), explode(',', $m[1]));
-    }
-
-    // dependencies: - { name: grav, version: '>=1.7.0' }
-    if (preg_match_all('/-\s*\{\s*name:\s*([\w.\-]+)\s*,\s*version:\s*["\']?([^"\'}\s]+)["\']?\s*\}/m', $raw, $ms, PREG_SET_ORDER)) {
-        $out['dependencies'] = [];
-        foreach ($ms as $dep) {
-            $out['dependencies'][] = ['name' => $dep[1], 'version' => $dep[2]];
-        }
-    }
-
-    return $out;
+    return mg_yaml_parse_file($path) ?? [];
 }
 
 /**
