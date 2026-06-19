@@ -1,3 +1,11 @@
+# v1.0.0-rc.7
+## 06-19-2026
+
+1. [](#bugfix)
+    * **A plugin or theme that declares Grav 2.0 support in its own `blueprints.yaml` is now trusted when it isn't in the curated registry.** The compatibility scan already preferred the curated registry and fell back to the blueprint, but the blueprint reader parsed YAML with a narrow hand-rolled regex whenever PHP's `ext-yaml` was absent (the common case), and that regex only matched the inline flow style `grav: ['1.7', '2.0']` — it silently ignored the standard block-list style. A one-off or private plugin that had been tested and marked compatible with the conventional `compatibility:` / `grav:` block list was therefore reported as "Assumed 1.7-only (no explicit 2.0 compatibility)". [#7]
+2. [](#improved)
+    * The wizard now reads every YAML file through one parser — Symfony Yaml, loaded from the existing install's `vendor/` that sits right beside `migrate.php` — instead of falling back to `ext-yaml` or a hand-rolled regex. The regex understood only a subset of YAML and produced different results than the real parser; routing everything through the same proven parser gives consistent results regardless of the host's PHP extensions. The existing install's `vendor/` is preferred over the staged 2.0 tree because its location is fixed and known (the staged directory name is configurable) and it is guaranteed present.
+
 # v1.0.0-rc.6
 ## 06-16-2026
 
