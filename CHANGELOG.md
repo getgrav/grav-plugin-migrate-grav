@@ -1,3 +1,9 @@
+# v1.0.0
+## 06-20-2026
+
+1. [](#new)
+    * Version 1.0 stable release for Grav 2.x
+
 # v1.0.0-rc.7
 ## 06-19-2026
 
