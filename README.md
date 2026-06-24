@@ -71,8 +71,12 @@ are retained (and hardened: command/code-execution functions can never be enable
 migration tries to preserve your 1.x behavior:
 
 - It turns the `security.twig_content` gate back on when your source site used Twig in
-  content (per-page `process: twig: true` or the site-wide `system.yaml` opt-ins).
-- It scans your Twig-enabled page content for the functions/filters it calls. **Raw PHP
+  content (per-page `process: twig: true` or the site-wide `system.yaml` opt-ins). The
+  site-wide opt-ins are honored whether they live in `user/config/system.yaml` or in an
+  environment override under `user/env/<host>/config/system.yaml`.
+- It scans your Twig-enabled page content for the functions/filters it calls — every page
+  body when Twig was enabled site-wide, or just the per-page `process: twig: true` pages
+  otherwise. **Raw PHP
   functions** (e.g. `strtoupper`) are added to `system.twig.safe_functions` /
   `safe_filters` (so they're callable at all) **and** to the
   `security.twig_sandbox.allowed_functions` / `allowed_filters` lists (so sandboxed content
@@ -95,8 +99,10 @@ check `logs/security.log`, then either add the class/method to
 a 2.0 version that registers its safe Twig members via the `onBuildTwigSandboxPolicy` event.
 
 The allowlists written to `user/config/security.yaml` are the **full** lists (core defaults
-plus your additions) on purpose: Grav merges these lists by index, so a partial override
-would corrupt the core defaults. If you prune an entry, leave the rest intact.
+plus your additions) on purpose: the flat lists (`allowed_functions`/`allowed_filters`/
+`allowed_tags`) are replaced wholesale and the per-class lists (`allowed_methods`/
+`allowed_properties`) merge by position, so a partial override would drop core defaults. If
+you prune an entry, leave the rest intact.
 
 ## URL-based image actions
 
