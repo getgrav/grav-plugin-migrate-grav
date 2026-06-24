@@ -984,6 +984,20 @@ function do_promote(string $webroot, array $flag, ?callable $progress = null): a
         return ['ok' => false, 'msg' => "Stage dir missing or invalid: {$stagePath}"];
     }
 
+    // Restore the system.custom_base_url that do_content() blanked for the
+    // staged preview. After promote the install lives at the original webroot,
+    // so the original value is correct again. Done before the stage tree is
+    // renamed up (below) — the staged system.yaml becomes the live one as-is.
+    // Only restores when the staged value is still empty, so an operator who
+    // deliberately re-set it during preview is never clobbered.
+    $cbRestore = null;
+    if (!empty($flag['custom_base_url_stash'])) {
+        $cbResult = [];
+        if (mg_restore_custom_base_url($stagePath . '/user/config/system.yaml', (string) $flag['custom_base_url_stash'], $cbResult)) {
+            $cbRestore = $cbResult['restored'] ?? (string) $flag['custom_base_url_stash'];
+        }
+    }
+
     // Version comes from the CURRENT install's defines.php (the one we're
     // about to back up — not the staged one).
     $currentVersion = mg_read_defines_version($webroot . '/system/defines.php')
@@ -1092,9 +1106,14 @@ function do_promote(string $webroot, array $flag, ?callable $progress = null): a
 
     if ($progress) $progress(['phase' => 'done-entry', 'entry' => 'promote', 'copied' => count($promoted)]);
 
+    $msg = "Backed up {$added} files to backup/{$zipName}; promoted " . count($promoted) . ' entries to webroot.';
+    if ($cbRestore !== null) {
+        $msg .= ' Restored system.custom_base_url (' . $cbRestore . ') now that the site is back at the original webroot.';
+    }
+
     return [
         'ok'     => true,
-        'msg'    => "Backed up {$added} files to backup/{$zipName}; promoted " . count($promoted) . ' entries to webroot.',
+        'msg'    => $msg,
         'backup' => $zipName,
     ];
 }
@@ -1513,12 +1532,26 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
     // flip it on where the source content relied on it.
     $mediaScan = mg_scan_media_url_actions($webroot, $dstUser);
 
+    // A non-empty system.custom_base_url breaks the staged preview. The staged
+    // install runs under a subpath (stage_dir, default /grav-2/), but a custom
+    // base url like `https://site.test` forces Grav's root_path to '' (Uri.php
+    // strips the subdir), so the home/canonical redirect loops →
+    // ERR_TOO_MANY_REDIRECTS. Blank it in the staged system.yaml so the preview
+    // loads, and stash the original so do_promote() can write it back once the
+    // install is swapped to the original webroot (where it's correct again).
+    $cbResult  = [];
+    mg_neutralize_custom_base_url($dstUser . '/config/system.yaml', $cbResult);
+    if (!empty($cbResult['stash'])) {
+        $flag['custom_base_url_stash'] = $cbResult['stash'];
+    }
+
     $flag['step']    = 'content_done';
     $flag['content'] = [
         'at'                => time(),
         'entries'           => $entries,
         'twig_scan'         => $twigScan,
         'media_url_actions' => $mediaScan,
+        'custom_base_url'   => $cbResult,
     ];
     save_flag($webroot . '/.migrating', $flag);
 
@@ -1602,6 +1635,16 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
         $msg .= ' WARNING (system.yaml images): ' . $mediaScan['warning'] . '.';
     }
 
+    // Custom base URL handling for the staged preview.
+    if (!empty($cbResult['stash'])) {
+        $msg .= ' Temporarily cleared system.custom_base_url (' . $cbResult['was']
+              . ') so the staged preview at /' . $stageDir . '/ loads without a redirect loop;'
+              . ' it will be restored automatically when you promote to the live webroot.';
+    }
+    if (!empty($cbResult['warning'])) {
+        $msg .= ' WARNING (system.yaml custom_base_url): ' . $cbResult['warning'] . '.';
+    }
+
     return ['ok' => true, 'msg' => $msg];
 }
 
@@ -1642,6 +1685,7 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
         'config_pages'            => [],
         'frontmatter_twig'        => false,
         'system_process_twig'     => false,
+        'system_process_twig_files' => [],  // system.yaml files (top-level + env) that carried the legacy flag
         // Twig function/filter seeding (Grav 2.0).
         'sandbox_safe_functions'  => [],   // existing source system.twig.safe_functions
         'sandbox_safe_filters'    => [],   // existing source system.twig.safe_filters
@@ -1658,7 +1702,79 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
         'system_twig_undefined_stripped' => [],
     ];
 
-    // Pass 1: scan pages.
+    // Pass 1: scan system.yaml for the site-wide Twig opt-ins — in BOTH the
+    // top-level config AND every environment override. Grav 1.x lets these
+    // opt-ins live in user/config/system.yaml OR user/env/<host>/config/
+    // system.yaml; an opt-in in EITHER means the operator deliberately enabled
+    // editor-authored Twig site-wide, so honour it. Scanning only the
+    // top-level file silently lost env-scoped opt-ins (and with them the gate
+    // and the sandbox seeding) — the #1 "Twig in content stopped working after
+    // migrating" failure.
+    $systemYaml = $dstUser . '/config/system.yaml';   // primary: also the strip/rewrite target
+    $systemYamlFiles = array_values(array_filter(array_merge(
+        [$systemYaml],
+        glob($dstUser . '/env/*/config/system.yaml') ?: []
+    ), 'is_file'));
+    foreach ($systemYamlFiles as $sysFile) {
+        try {
+            $sys = $yaml::parseFile($sysFile);
+        } catch (\Throwable) {
+            continue; // bad YAML in one file shouldn't abort the rest
+        }
+        if (!is_array($sys)) continue;
+
+        $isPrimary = ($sysFile === $systemYaml);
+
+        // Site-wide opt-ins from Grav 1.x. Both were dropped from the 2.0 admin
+        // UI: pages.process.twig (the per-page default — now only settable per
+        // page) and pages.frontmatter.process_twig (Twig in frontmatter
+        // values). Either being true in ANY scanned file means the operator
+        // deliberately enabled editor-authored Twig, so re-open the 2.0 gate to
+        // match. Accept the same truthy set as the per-page scanner so a source
+        // `twig: "true"` (quoted string) or `twig: 1` is promoted to the gate —
+        // otherwise the 2.0 site silently loses Twig in content after migration.
+        $sysTwig = $sys['pages']['process']['twig'] ?? null;
+        if ($sysTwig === true || $sysTwig === 'true' || $sysTwig === 1 || $sysTwig === '1') {
+            $result['system_process_twig'] = true;
+            $result['system_process_twig_files'][] = $sysFile;   // strip the legacy flag from each below
+        }
+        $sysFrontTwig = $sys['pages']['frontmatter']['process_twig'] ?? null;
+        if ($sysFrontTwig === true || $sysFrontTwig === 'true' || $sysFrontTwig === 1 || $sysFrontTwig === '1') {
+            $result['frontmatter_twig'] = true;
+        }
+
+        // 1.x `system.twig.safe_functions` / `safe_filters` are the operator's
+        // curated allowlist of custom functions/filters for content Twig — the
+        // authoritative source for seeding the 2.0 sandbox below. Union them
+        // across every file so an env-scoped allowlist isn't dropped.
+        $result['sandbox_safe_functions'] = array_values(array_unique(array_merge(
+            $result['sandbox_safe_functions'], mg_normalize_token_list($sys['twig']['safe_functions'] ?? [])
+        )));
+        $result['sandbox_safe_filters'] = array_values(array_unique(array_merge(
+            $result['sandbox_safe_filters'], mg_normalize_token_list($sys['twig']['safe_filters'] ?? [])
+        )));
+
+        // `undefined_functions` (default ON in 1.x) was the escape hatch 2.0
+        // removed (GHSA-9wg2-prc3-vx89); track it so the report can warn that
+        // undeclared functions in content will now hard-fail. The primary file
+        // carries the 1.x default-on semantics (unset = on); an env override
+        // only contributes when it EXPLICITLY sets a truthy value, so a stock
+        // env file (which never mentions the key) doesn't force the warning on.
+        $undef = $sys['twig']['undefined_functions'] ?? null;
+        $undefTruthy = $undef === true || $undef === 'true' || $undef === 1 || $undef === '1';
+        if (($isPrimary && $undef === null) || $undefTruthy) {
+            $result['undefined_functions_was_on'] = true;
+        }
+    }
+
+    // Whether the source enabled content Twig SITE-WIDE (vs per-page). When it
+    // did, every page body can run Twig under 2.0, so the page scan below must
+    // collect sandbox tokens from ALL pages — not just ones carrying their own
+    // process.twig flag — or globally-enabled sites seed zero functions and
+    // lose unite_gallery() et al even after the gate is opened.
+    $globalTwig = $result['system_process_twig'] || $result['frontmatter_twig'];
+
+    // Pass 2: scan pages.
     $pagesDir = $dstUser . '/pages';
     // Custom Twig function/filter tokens seen in twig-enabled page bodies,
     // mapped to the pages they appear in (for the migration report).
@@ -1684,9 +1800,17 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
             if (!is_array($parsed)) continue;
 
             $twig = $parsed['process']['twig'] ?? null;
-            if ($twig !== true && $twig !== 'true' && $twig !== 1 && $twig !== '1') continue;
+            $pageTwig = ($twig === true || $twig === 'true' || $twig === 1 || $twig === '1');
+            if ($pageTwig) {
+                $result['pages_with_twig']++;
+            }
+            // Collect config-usage + sandbox tokens from any page that will
+            // actually run content Twig under 2.0: a page with its own
+            // process.twig flag, OR every page when the source enabled Twig
+            // site-wide. Over-collecting on a global-twig site is safe — the
+            // sandbox allowlist only PERMITS these names, it never forces them.
+            if (!$pageTwig && !$globalTwig) continue;
 
-            $result['pages_with_twig']++;
             $rel = ltrim(str_replace($pagesDir, '', $file->getPathname()), '/\\');
 
             // Heuristic config-usage scan against the markdown body. False
@@ -1705,52 +1829,6 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
             foreach ($tokens['filters'] as $fl) {
                 $bodyFilterPages[$fl][] = $rel;
             }
-        }
-    }
-
-    // Pass 2: scan system.yaml for the frontmatter-Twig opt-in. Operator
-    // already accepted the risk site-wide there, so honour it.
-    $systemYaml = $dstUser . '/config/system.yaml';
-    if (is_file($systemYaml)) {
-        try {
-            $sys = $yaml::parseFile($systemYaml);
-            if (is_array($sys)) {
-                // Site-wide opt-ins from Grav 1.x. Both were dropped from the
-                // 2.0 admin UI: pages.process.twig (the per-page default — now
-                // only settable per page) and pages.frontmatter.process_twig
-                // (Twig in frontmatter values). Either being true on the
-                // source site means the operator deliberately enabled
-                // editor-authored Twig, so re-open the 2.0 gate to match.
-                // Accept the same truthy set as the per-page scanner so a
-                // source `twig: "true"` (quoted string) or `twig: 1` is
-                // promoted to the gate — otherwise the 2.0 site silently
-                // loses Twig in content after migration.
-                $sysTwig = $sys['pages']['process']['twig'] ?? null;
-                if ($sysTwig === true || $sysTwig === 'true' || $sysTwig === 1 || $sysTwig === '1') {
-                    $result['system_process_twig'] = true;
-                }
-                $sysFrontTwig = $sys['pages']['frontmatter']['process_twig'] ?? null;
-                if ($sysFrontTwig === true || $sysFrontTwig === 'true' || $sysFrontTwig === 1 || $sysFrontTwig === '1') {
-                    $result['frontmatter_twig'] = true;
-                }
-
-                // 1.x `system.twig.safe_functions` / `safe_filters` are the
-                // operator's curated allowlist of custom functions/filters for
-                // content Twig — the authoritative source for seeding the 2.0
-                // sandbox below. `undefined_functions` (default ON in 1.x) was
-                // the escape hatch 2.0 removed (GHSA-9wg2-prc3-vx89); track it
-                // so the report can warn that undeclared functions in content
-                // will now hard-fail. All four keys are dead in 2.0 and get
-                // stripped from the staged system.yaml further down.
-                $result['sandbox_safe_functions'] = mg_normalize_token_list($sys['twig']['safe_functions'] ?? []);
-                $result['sandbox_safe_filters']   = mg_normalize_token_list($sys['twig']['safe_filters'] ?? []);
-                $undef = $sys['twig']['undefined_functions'] ?? null;
-                // Unset means the 1.x default (true), which is the risky case.
-                $result['undefined_functions_was_on'] =
-                    $undef === null || $undef === true || $undef === 'true' || $undef === 1 || $undef === '1';
-            }
-        } catch (\Throwable) {
-            // Bad YAML in source — leave defaults.
         }
     }
 
@@ -1883,9 +1961,10 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
             "#\n"
           . "# Widened the Twig sandbox allowlist (security.twig_sandbox) to keep\n"
           . "# custom functions/filters from your 1.x content working. These are\n"
-          . "# the FULL lists (core defaults + additions): the sandbox lists have\n"
-          . "# no blueprint, so Grav merges them by index — a partial list here\n"
-          . "# would corrupt the core defaults. Keep them complete.\n"
+          . "# the FULL lists (core defaults + additions): the flat lists\n"
+          . "# (allowed_functions/filters/tags) are replaced wholesale and the\n"
+          . "# per-class lists (allowed_methods/properties) merge by position, so a\n"
+          . "# partial list here would drop core defaults. Keep them complete.\n"
           . "# Raw PHP functions are also added to system.twig.safe_functions so\n"
           . "# they're callable at all. Durable fix for plugin-provided functions:\n"
           . "# update the plugin to register them via the onBuildTwigSandboxPolicy\n"
@@ -1928,8 +2007,17 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
     // we still write security.yaml so the gate is on and behavior is
     // preserved (both keys end up true, functionally equivalent), and the
     // warning is surfaced so the operator can hand-edit.
-    if ($result['system_process_twig'] && is_file($systemYaml)) {
-        $result['system_process_twig_stripped'] = mg_strip_system_pages_process_twig($systemYaml, $result);
+    // Strip the legacy flag from EVERY file that carried it (top-level config
+    // and any env override), so the 2.0 gate is the single source of truth
+    // rather than two settings doing the same job.
+    if ($result['system_process_twig'] && !empty($result['system_process_twig_files'])) {
+        $stripped = false;
+        foreach ($result['system_process_twig_files'] as $sysFile) {
+            if (is_file($sysFile)) {
+                $stripped = mg_strip_system_pages_process_twig($sysFile, $result) || $stripped;
+            }
+        }
+        $result['system_process_twig_stripped'] = $stripped;
     }
 
     return $result;
@@ -1994,7 +2082,8 @@ function mg_strip_system_pages_process_twig(string $systemYaml, array &$result):
     // flow mapping or in a form we can't safely auto-edit. Warn so the
     // operator knows to remove it manually.
     if ($modified === $raw && preg_match('/process:[ \t]*\{[^}]*\btwig[ \t]*:[ \t]*["\']?(?:true|yes|on|1)["\']?/i', $raw)) {
-        $result['system_process_twig_warning'] = 'flow-style `process: { twig: true }` detected; please remove the twig key from user/config/system.yaml manually';
+        $where = preg_replace('#^.*/(user/.*)$#', '$1', $systemYaml) ?: $systemYaml;
+        $result['system_process_twig_warning'] = 'flow-style `process: { twig: true }` detected; please remove the twig key from ' . $where . ' manually';
         return false;
     }
 
@@ -2014,6 +2103,138 @@ function mg_strip_system_pages_process_twig(string $systemYaml, array &$result):
         $result['system_process_twig_warning'] = 'failed to rename temp file over system.yaml';
         return false;
     }
+    return true;
+}
+
+/**
+ * Match the top-level `custom_base_url:` line of a system.yaml, splitting it
+ * into key, value token, and any trailing inline comment. `custom_base_url` is
+ * a flat scalar at column 0 in Grav's system.yaml, so a line-anchored match is
+ * safe. An inline `#` comment only counts when preceded by whitespace (YAML
+ * rule), so a `#` inside an unquoted URL stays part of the value.
+ *
+ * Returns [full, key, value, comment] (the four capture groups) or null when
+ * the file has no custom_base_url line.
+ *
+ * @return array{0:string,1:string,2:string,3:string,4:int}|null
+ */
+function mg_match_custom_base_url(string $raw): ?array
+{
+    if (preg_match('/^(custom_base_url:[ \t]*)(.*?)((?:[ \t]+#.*)?)[ \t]*$/m', $raw, $m, PREG_OFFSET_CAPTURE)) {
+        return [$m[0][0], $m[1][0], $m[2][0], $m[3][0], $m[0][1]];
+    }
+    return null;
+}
+
+/**
+ * Blank a non-empty `system.custom_base_url` in a staged system.yaml so the
+ * staged preview (served under a subpath like /grav-2/) doesn't redirect-loop,
+ * and report the original value so the caller can stash it for restore on
+ * promote. Operates on raw text so comments and formatting survive.
+ *
+ * On a real value found, sets on $result:
+ *   - stash (string): the original raw value token, to write back verbatim
+ *   - was   (string): the value with surrounding quotes stripped, for display
+ * On failure sets $result['warning']. A value that is already empty/null is a
+ * no-op (no stash, no warning).
+ *
+ * @param array<string,mixed> $result
+ * @return bool true when the file was modified.
+ */
+function mg_neutralize_custom_base_url(string $systemYaml, array &$result): bool
+{
+    $raw = @file_get_contents($systemYaml);
+    if ($raw === false) {
+        $result['warning'] = 'could not read staged system.yaml';
+        return false;
+    }
+    if ($raw === '') {
+        return false;
+    }
+
+    $match = mg_match_custom_base_url($raw);
+    if ($match === null) {
+        return false;
+    }
+    [$full, $key, $value, $comment, $offset] = $match;
+
+    // Treat empty/null/`~`/empty-quotes as "not set" — nothing to neutralize.
+    $trimmed = trim($value);
+    $unquoted = trim($trimmed, "'\"");
+    if ($unquoted === '' || $trimmed === 'null' || $trimmed === '~') {
+        return false;
+    }
+
+    $replacement = $key . "''" . $comment;
+    $modified = substr($raw, 0, $offset) . $replacement . substr($raw, $offset + strlen($full));
+
+    $tmp = $systemYaml . '.tmp.' . getmypid();
+    if (@file_put_contents($tmp, $modified) === false) {
+        $result['warning'] = 'failed to write temp file for custom_base_url neutralize';
+        return false;
+    }
+    if (!@rename($tmp, $systemYaml)) {
+        @unlink($tmp);
+        $result['warning'] = 'failed to rename temp file over system.yaml';
+        return false;
+    }
+
+    $result['stash'] = $value;
+    $result['was']   = $unquoted;
+    return true;
+}
+
+/**
+ * Restore a previously stashed `custom_base_url` value into a staged
+ * system.yaml. Counterpart to mg_neutralize_custom_base_url(), run from
+ * do_promote() once the install is back at the original webroot.
+ *
+ * Only writes when the current value is still empty, so an operator who
+ * deliberately re-set custom_base_url during the staged preview is never
+ * overwritten. Sets $result['restored'] (unquoted) on success, or
+ * $result['warning'] on failure / skip.
+ *
+ * @param array<string,mixed> $result
+ * @return bool true when the file was modified.
+ */
+function mg_restore_custom_base_url(string $systemYaml, string $stash, array &$result): bool
+{
+    if (trim(trim($stash), "'\"") === '') {
+        return false;
+    }
+    $raw = @file_get_contents($systemYaml);
+    if ($raw === false) {
+        $result['warning'] = 'could not read promoted system.yaml — set custom_base_url by hand';
+        return false;
+    }
+
+    $match = mg_match_custom_base_url($raw);
+    if ($match === null) {
+        $result['warning'] = 'no custom_base_url line in promoted system.yaml — set it by hand';
+        return false;
+    }
+    [$full, $key, $value, $comment, $offset] = $match;
+
+    // Operator re-set it during preview — leave their value alone.
+    if (trim(trim($value), "'\"") !== '') {
+        return false;
+    }
+
+    $replacement = $key . $stash . $comment;
+    $modified = substr($raw, 0, $offset) . $replacement . substr($raw, $offset + strlen($full));
+
+    $tmp = $systemYaml . '.tmp.' . getmypid();
+    if (@file_put_contents($tmp, $modified) === false) {
+        $result['warning'] = 'failed to write temp file for custom_base_url restore — set it by hand';
+        return false;
+    }
+    if (!@rename($tmp, $systemYaml)) {
+        @unlink($tmp);
+        $result['warning'] = 'failed to rename temp file over system.yaml — set custom_base_url by hand';
+        return false;
+    }
+
+    $result['restored'] = trim(trim($stash), "'\"");
     return true;
 }
 
