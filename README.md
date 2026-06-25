@@ -96,10 +96,12 @@ migration tries to preserve your 1.x behavior:
   `onBuildTwigSandboxPolicy` event. These are listed in the migration report.
 - **Object method calls** (e.g. the image idiom
   `{{ page.media['x.jpg'].lightbox().cropResize(…).html()|raw }}`) are scanned too. The
-  common image-manipulation chain (`lightbox`, `cropResize`, `cropZoom`, `resize`,
-  `quality`, `grayscale`, …) routes through `ImageMedium`, so those methods are seeded into
-  `security.twig_sandbox.allowed_methods` under the right class. Method tokens that can't be
-  mapped to a known class are listed in the report for you to allowlist by hand.
+  documented media chain (`lightbox`, `cropResize`, `cropZoom`, `resize`, `quality`,
+  `grayscale`, …) is allow-listed by Grav 2.0 core out of the box (getgrav/grav#4164), so
+  the migrator recognises it as already covered and does **not** re-add it. Only media or
+  object methods your content uses that 2.0 defaults don't already permit are seeded into
+  `security.twig_sandbox.allowed_methods`; method tokens that can't be mapped to a known
+  class are listed in the report for you to allowlist by hand.
 - Functions Grav 2.0 refuses — `Utils::isDangerousFunction()` (`system`, `exec`,
   `preg_replace`, …) and the sandbox's by-design exclusions (`constant`, `read_file`,
   `evaluate`, …) — are never added; the report lists them so you know those usages need
@@ -108,12 +110,14 @@ migration tries to preserve your 1.x behavior:
 **What it can't always detect automatically:** custom **object methods and properties** on
 classes the migrator doesn't know about (for example a plugin object's `{{ thing.render() }}`)
 can't be mapped by a static scan, because the object's class isn't known until runtime. Grav
-2.0 already allowlists the common page, media, config, and user classes, and the migrator
-seeds the image-method chain, so most content keeps working. If something still renders as
-raw Twig (or shows a sandbox placeholder) after migration, check `logs/security.log`, then
-either add the class/method to `security.twig_sandbox.allowed_methods` by hand or — better —
-update the providing plugin to a 2.0 version that registers its safe Twig members via the
-`onBuildTwigSandboxPolicy` event.
+2.0 already allowlists the common page, media, config, and user classes (the full documented
+media chain included), so most content keeps working. If something still renders as raw Twig
+(or shows a sandbox placeholder) after migration, open **Tools → Reports → "Twig in Content"**
+in Admin: it lists every page still leaking raw Twig and every sandbox block with a one-click
+**Add to allowlist**, and its **Scan content** action finds anything not yet exercised. (The
+same events are still written to `logs/security.log`.) For plugin-provided members, the
+durable fix is to update the providing plugin to a 2.0 version that registers its safe Twig
+members via the `onBuildTwigSandboxPolicy` event.
 
 The allowlists written to `user/config/security.yaml` are the **full** lists (core defaults
 plus your additions) on purpose: the flat lists (`allowed_functions`/`allowed_filters`/
