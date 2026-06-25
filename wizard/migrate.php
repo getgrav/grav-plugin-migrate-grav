@@ -1912,8 +1912,11 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
     }
     $addedMethods = $twigScan['sandbox_methods_added'] ?? [];
     if ($addedMethods) {
-        $msg .= ' Added ' . count($addedMethods) . ' object method(s) to security.twig_sandbox.allowed_methods ('
-              . implode(', ', $addedMethods) . ') — e.g. the image manipulation chain used in your content.';
+        // The standard documented media chain is allow-listed by Grav 2.0 core
+        // (getgrav/grav#4164) and is skipped here; what remains are object
+        // methods your content used that 2.0 defaults do not already permit.
+        $msg .= ' Added ' . count($addedMethods) . ' object method(s) not already covered by 2.0 defaults to security.twig_sandbox.allowed_methods ('
+              . implode(', ', $addedMethods) . ').';
     }
     $unresolvedMethods = $twigScan['sandbox_methods_unresolved'] ?? [];
     if ($unresolvedMethods) {
@@ -1948,6 +1951,14 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
     }
     if (!empty($twigScan['system_twig_warning'])) {
         $msg .= ' WARNING (system.yaml): ' . $twigScan['system_twig_warning'] . '.';
+    }
+
+    // Point the operator at the Grav 2.0 Admin report for follow-up. It lists any
+    // page still leaking raw Twig, the exact sandbox blocks with one-click
+    // "Add to allowlist", and a content scan — the precise, render-time view that
+    // supersedes this migration-time heuristic for anything left to resolve.
+    if ($twigScan['process_enabled']) {
+        $msg .= ' Follow up in Admin under Tools → Reports → "Twig in Content": it shows any pages still leaking raw Twig and lets you allow-list blocked members in one click.';
     }
 
     // URL-based image actions (system.images.url_actions).
@@ -2746,6 +2757,22 @@ function mg_extract_twig_tokens(string $body): array
         return ['functions' => [], 'filters' => [], 'methods' => []];
     }
 
+    // Prefer the canonical core extractor so the migrator's allowlist
+    // suggestions are byte-for-byte what the Admin "scan content" action
+    // (Grav\Common\Security::scanContentTwigUsage) produces on the live 2.0
+    // site. mg_ensure_yaml_available() wires the staged vendor autoload, which
+    // maps the Grav\ namespace, so Security becomes loadable. The local regex
+    // below is kept as a fallback for a staged core predating the shared helper.
+    mg_ensure_yaml_available();
+    if (method_exists('\\Grav\\Common\\Security', 'extractTwigTokens')) {
+        $t = \Grav\Common\Security::extractTwigTokens($body);
+        return [
+            'functions' => array_values($t['functions'] ?? []),
+            'filters'   => array_values($t['filters'] ?? []),
+            'methods'   => array_values($t['methods'] ?? []),
+        ];
+    }
+
     // Macro names declared in this body — excluded from the function set.
     $macros = [];
     if (preg_match_all('/\{%-?\s*macro\s+([a-zA-Z_]\w*)\s*\(/', $body, $mm)) {
@@ -2819,36 +2846,33 @@ function mg_extract_twig_tokens(string $body): array
  */
 function mg_twig_sandbox_method_map(): array
 {
-    $imageMedium = 'Grav\\Common\\Page\\Medium\\ImageMedium';
-    // The image manipulation / responsive chain. All invoked on an ImageMedium.
-    $imageMethods = [
-        'lightbox', 'lazy', 'srcset', 'sizes', 'autoSizes', 'sizesViewports',
+    // Grav 2.0 (getgrav/grav#4164) allow-lists the entire documented media chain
+    // on the concrete base class `Grav\Common\Page\Medium\Medium`. The sandbox
+    // matches by `instanceof`, so a method allowed on Medium is allowed on every
+    // media type that extends it (ImageMedium, VideoMedium, AudioMedium,
+    // StaticImageMedium). So we map ALL media methods to that one class: the ones
+    // core already ships (the cropResize/lightbox/etc. chain) resolve to the
+    // Medium baseline and are skipped as already-covered, while any legacy or
+    // non-core media method a 1.x site used (e.g. a responsive-image helper not
+    // in 2.0 defaults) is appended to the same Medium row. Mapping to the old
+    // ImageMedium / MediumInterface keys is wrong post-#4164: core never
+    // allow-lists those, so entries written under them would never match.
+    $medium = 'Grav\\Common\\Page\\Medium\\Medium';
+    $mediaMethods = [
+        // Markup / link / metadata entry points.
+        'url', 'html', 'link', 'lightbox', 'display', 'thumbnail', 'parsedownElement',
+        // Image manipulation / responsive chain.
+        'lazy', 'srcset', 'sizes', 'autoSizes', 'sizesViewports',
         'resize', 'forceResize', 'cropResize', 'crop', 'cropZoom', 'cropResizeZoom',
         'quality', 'format', 'negate', 'brightness', 'contrast', 'grayscale',
         'rotate', 'flip', 'fixOrientation', 'gaussianBlur', 'sharp', 'emboss',
         'sepia', 'sepiaColor', 'edge', 'colorize', 'pixelate', 'merge',
         'enableResponsiveImages', 'derivatives', 'watermark', 'fixDirRotation',
     ];
-    // Methods on the base Medium / MediumInterface (links, markup, metadata).
-    // Core defaults already allow-list MediumInterface for url/html, but
-    // include the common chain entry points so a baseline gap is covered too.
-    $mediumInterface = 'Grav\\Common\\Page\\Medium\\MediumInterface';
-    $mediumMethods = [
-        'url', 'html', 'link', 'lightbox', 'display', 'thumbnail', 'parsedownElement',
-    ];
 
     $map = [];
-    foreach ($imageMethods as $m) {
-        $map[strtolower($m)] = ['name' => $m, 'class' => $imageMedium];
-    }
-    // Medium-level methods win for names that exist on both (url/html/link are
-    // base-Medium concerns); only set ones not already mapped to ImageMedium
-    // by an image-specific name above, except the genuinely shared link/display.
-    foreach ($mediumMethods as $m) {
-        $lc = strtolower($m);
-        if (!isset($map[$lc]) || in_array($lc, ['url', 'html', 'display', 'thumbnail', 'parsedownelement'], true)) {
-            $map[$lc] = ['name' => $m, 'class' => $mediumInterface];
-        }
+    foreach ($mediaMethods as $m) {
+        $map[strtolower($m)] = ['name' => $m, 'class' => $medium];
     }
     return $map;
 }
