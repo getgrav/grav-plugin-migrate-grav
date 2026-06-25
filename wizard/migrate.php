@@ -137,6 +137,19 @@ if ($method === 'POST') {
             redirect_self($token, ['flash' => 'test_done', 'msg' => 'Ready to promote.']);
 
         case 'promote':
+            // Operator-selected root files/folders to carry forward (issue #9).
+            // do_promote() re-validates each name against a live scan, so we can
+            // pass the raw POST list straight through.
+            $selectedExtras = $_POST['root_extras'] ?? [];
+            $flagForAuth['root_extras'] = is_array($selectedExtras)
+                ? array_values(array_filter(array_map('strval', $selectedExtras)))
+                : [];
+            // Operator-approved custom .htaccess rules to splice in (issue #10).
+            // Only carried when the opt-in box is ticked; the textarea holds the
+            // reviewed/edited text. mg_splice_htaccess_custom() wraps it safely.
+            $flagForAuth['htaccess_custom'] = isset($_POST['htaccess_carry'])
+                ? trim((string) ($_POST['htaccess_custom'] ?? ''))
+                : '';
             stream_promote_page($webroot, $flagForAuth, $token);
             exit(0);
 
@@ -962,6 +975,258 @@ function mg_ensure_yaml_available(): void
 // ─── Step 6: Promote ────────────────────────────────────────────────────────
 
 /**
+ * Top-level webroot entries an operator may want to carry forward into the new
+ * 2.0 install but that the migration doesn't otherwise touch (issue #9):
+ * `robots.txt`, a custom `favicon.ico`, `.well-known/`, ownership-verification
+ * files, custom upload folders, etc. Grav-managed structural entries are never
+ * offered — carrying them would clobber the fresh 2.0 install — and neither are
+ * the wizard's own artifacts, VCS data, prior backups, or `.htaccess` (that has
+ * its own dedicated migration). Everything else at the live root is offered for
+ * the operator to pick from on the promote screen.
+ *
+ * @return list<array{name:string,dir:bool,size:int|null}> dirs first, then files, alpha
+ */
+function mg_scan_root_extras(string $webroot, string $stageDir): array
+{
+    // Grav 2.0 ships / manages these at the webroot root. Carrying a 1.x copy
+    // forward would overwrite the fresh install, so they're never on the menu.
+    $never = array_flip([
+        'system', 'vendor', 'bin', 'cache', 'logs', 'tmp', 'backup', 'user',
+        'index.php', '.htaccess', 'webserver-configs',
+        // composer.json / .lock define the install's PHP dependencies; a 1.x
+        // copy would clobber 2.0's and break the install, so never offer them.
+        'composer.json', 'composer.lock',
+        // .htaccess is handled by its own migration (issue #10), not here.
+        '.htaccess.migrate-grav-backup',
+        // Wizard / migration artifacts.
+        '.migrating', 'migrate.php', '.migration-complete',
+        // VCS metadata and the stage dir itself.
+        '.git', '.gitignore', trim($stageDir, '/'),
+    ]);
+
+    $out = [];
+    foreach (scandir($webroot) ?: [] as $entry) {
+        if ($entry === '.' || $entry === '..') continue;
+        if (isset($never[$entry])) continue;
+        // Skip backup zips / dirs left by Grav or by prior migration runs.
+        if (preg_match('/^migration-backup-.*\.zip$/', $entry)) continue;
+        if (preg_match('/--\d+\.zip$/', $entry)) continue;
+        if (str_starts_with($entry, 'backup-pre-2.0-')) continue;
+
+        $path  = $webroot . '/' . $entry;
+        $isDir = is_dir($path) && !is_link($path);
+        $out[] = [
+            'name' => $entry,
+            'dir'  => $isDir,
+            'size' => (!$isDir && is_file($path)) ? (int) filesize($path) : null,
+        ];
+    }
+
+    usort($out, static function ($a, $b) {
+        if ($a['dir'] !== $b['dir']) return $a['dir'] ? -1 : 1;
+        return strcasecmp($a['name'], $b['name']);
+    });
+    return $out;
+}
+
+/**
+ * Does a single `.htaccess` line match one of Grav's OWN stock rules? Used to
+ * keep the custom-rule detector (issue #10) from misreporting Grav-authored
+ * rules as operator customizations when the live `.htaccess` and the stock
+ * `webserver-configs/htaccess.txt` template drifted across Grav point releases
+ * (e.g. the security blocks grew their file-extension lists over 1.7.x). These
+ * patterns are anchored on Grav's known folder/file names so a genuine custom
+ * rule isn't swallowed. Wizard-injected lines (stage exclusion, the security
+ * folder block) are matched here too so a re-run never re-carries them.
+ */
+function mg_htaccess_is_stock_rule(string $line): bool
+{
+    $l = trim($line);
+    if ($l === '') return true;
+    static $patterns = [
+        // Grav security folder/extension blocks, anchored on Grav's own names.
+        '~^RewriteRule\s+\^\((\\\\\.git|cache|bin|logs|backup|webserver-configs|tests|system|vendor|user)[)\\\\|].*error\s+\[F\]~i',
+        '~^RewriteRule\s+\^\(user\)/\(accounts\|config\|data\|env\)~i', // HtaccessSecurity inject
+        '~^RewriteRule\s+\^\(LICENSE\\\\\.txt\|composer~i',
+        '~^RewriteRule\s+\\\\\.md\$\s+error~i',
+        '~^RewriteRule\s+\(\^\|/\)\\\\\.~i',
+        // Grav Index / Exploit catch-alls.
+        '~^RewriteRule\s+\.\*\s+index\.php~i',
+        '~^RewriteCond\s+%\{REQUEST_(URI|FILENAME)\}\s+!~i',
+        '~^RewriteCond\s+%\{QUERY_STRING\}.*(base64_encode|GLOBALS|_REQUEST|cript|\{\{|%25)~i',
+        '~^RewriteCond\s+%\{REQUEST_URI\}\s+\(\{\{~i',
+        // Structural / boilerplate. (IfModule open/close is handled by the
+        // detector's nesting logic, not here — a custom mod_headers/mod_expires
+        // guard and everything inside it must be kept as one block.)
+        '~^RewriteEngine\s+On~i',
+        '~^Options\s+-Indexes~i',
+        '~^DirectoryIndex\s+~i',
+        // Wizard stage-exclusion patch (mg_patch_htaccess).
+        '~migrate-grav stage exclusion~i',
+        '~^RewriteCond\s+%\{REQUEST_URI\}\s+!/.+/\s*(#.*)?$~i',
+    ];
+    foreach ($patterns as $re) {
+        if (preg_match($re, $l)) return true;
+    }
+    return false;
+}
+
+/**
+ * Detect operator-authored rules in the live `.htaccess` that aren't part of
+ * Grav's stock file, so the promote step can offer to carry them into the new
+ * 2.0 `.htaccess` (issue #10). Heuristic: any non-blank line in the live
+ * `.htaccess` that (a) isn't present verbatim in the stock template(s) and
+ * (b) doesn't match a known Grav stock-rule pattern is a candidate. The result
+ * is presented in an editable textarea for the operator to review and trim —
+ * the detection only needs to be a good first draft, not perfect.
+ *
+ * Stock reference = the pristine `webserver-configs/htaccess.txt` template Grav
+ * ships (operators edit `.htaccess`, never the template), unioned with the
+ * staged 2.0 stock for good measure. When no reference is available we report
+ * that we can't reliably diff rather than guessing.
+ *
+ * @return array{supported:bool,reason:string,text:string,count:int}
+ */
+function mg_detect_htaccess_custom(string $webroot, string $stageDir): array
+{
+    $out = ['supported' => false, 'reason' => '', 'text' => '', 'count' => 0];
+
+    $live = $webroot . '/.htaccess';
+    if (!is_file($live)) {
+        $out['reason'] = 'No .htaccess at the webroot — nothing to migrate.';
+        return $out;
+    }
+
+    $stagePath = $webroot . '/' . trim($stageDir, '/');
+    $refFiles = array_filter([
+        $webroot . '/webserver-configs/htaccess.txt',   // 1.x stock template (version-matched)
+        $stagePath . '/webserver-configs/htaccess.txt',  // 2.0 stock template
+        $stagePath . '/.htaccess',                       // 2.0 stock .htaccess
+    ], 'is_file');
+
+    if ($refFiles === []) {
+        $out['reason'] = 'No stock Grav .htaccess template found to compare against — review your .htaccess by hand after migrating.';
+        return $out;
+    }
+
+    // Normalized stock line set (trimmed, blanks dropped).
+    $stock = [];
+    foreach ($refFiles as $f) {
+        foreach (preg_split('/\R/', (string) @file_get_contents($f)) ?: [] as $ln) {
+            $n = trim($ln);
+            if ($n !== '') $stock[$n] = true;
+        }
+    }
+
+    $liveLines = preg_split('/\R/', (string) @file_get_contents($live)) ?: [];
+    $custom = [];
+    $blankRun = false;
+    // IfModule nesting: each open pushes whether it's a CUSTOM guard (kept) or
+    // a stock one (skipped). Inside a custom guard, every line is kept verbatim
+    // so an operator's `<IfModule mod_headers.c>` block survives intact with its
+    // matching close tag — a line-by-line set diff would otherwise orphan one.
+    $ifStack = [];
+    foreach ($liveLines as $ln) {
+        $n = trim($ln);
+
+        // Closing tag: pop the stack; keep the close only if its open was custom.
+        if (preg_match('~^</IfModule>~i', $n)) {
+            $wasCustom = array_pop($ifStack);
+            if ($wasCustom) { $custom[] = rtrim($ln); $blankRun = false; }
+            continue;
+        }
+        // Opening tag: custom when not part of the stock template.
+        if (preg_match('~^<IfModule\b~i', $n)) {
+            $isCustom = !isset($stock[$n]);
+            // A custom guard nested inside a custom guard stays custom.
+            if (!$isCustom && in_array(true, $ifStack, true)) { $isCustom = true; }
+            $ifStack[] = $isCustom;
+            if ($isCustom) { $custom[] = rtrim($ln); $blankRun = false; }
+            continue;
+        }
+        // Inside a custom guard → keep everything verbatim.
+        if (in_array(true, $ifStack, true)) {
+            $custom[] = rtrim($ln);
+            $blankRun = ($n === '');
+            continue;
+        }
+
+        if ($n === '') {
+            // Collapse blank runs; keep a single separator between kept hunks.
+            if ($custom !== [] && !$blankRun) { $custom[] = ''; $blankRun = true; }
+            continue;
+        }
+        if (isset($stock[$n]) || mg_htaccess_is_stock_rule($ln)) {
+            continue;
+        }
+        $custom[] = rtrim($ln);
+        $blankRun = false;
+    }
+
+    // Trim a trailing separator.
+    while ($custom !== [] && end($custom) === '') array_pop($custom);
+
+    $text  = implode("\n", $custom);
+    $count = count(array_filter($custom, static fn($l) => trim($l) !== '' && $l[0] !== '#'));
+
+    $out['supported'] = true;
+    $out['text']      = $text;
+    $out['count']     = $count;
+    if ($text === '') {
+        $out['reason'] = 'Your .htaccess matches the stock Grav template — no custom rules to carry over.';
+    }
+    return $out;
+}
+
+/**
+ * Splice operator-approved custom rules into the staged 2.0 `.htaccess` inside
+ * a clearly marked block (issue #10). Inserted right after `RewriteEngine On`
+ * so RewriteRules run before Grav's catch-all; falls back to just inside the
+ * mod_rewrite block, then to the top of the file. Idempotent — re-running
+ * replaces any existing migrate-grav block rather than stacking a second one.
+ *
+ * @return bool true if the file was written with the block present
+ */
+function mg_splice_htaccess_custom(string $stageHtaccess, string $customText): bool
+{
+    $customText = trim($customText);
+    if ($customText === '') return false;
+
+    $begin = '# BEGIN migrate-grav: custom rules carried over from your Grav 1.x .htaccess';
+    $end   = '# END migrate-grav';
+    $block = $begin . "\n" . $customText . "\n" . $end;
+
+    $current = is_file($stageHtaccess) ? (string) @file_get_contents($stageHtaccess) : '';
+
+    // Replace an existing block if present (idempotent re-runs).
+    $existing = '~' . preg_quote($begin, '~') . '.*?' . preg_quote($end, '~') . '~s';
+    if (preg_match($existing, $current)) {
+        $new = preg_replace($existing, $block, $current, 1);
+        return is_string($new) && @file_put_contents($stageHtaccess, $new) !== false;
+    }
+
+    if ($current === '') {
+        // No staged .htaccess at all — write a standalone file with the block.
+        return @file_put_contents($stageHtaccess, $block . "\n") !== false;
+    }
+
+    // Insert after the first `RewriteEngine On`, else after `<IfModule mod_rewrite.c>`, else prepend.
+    $insertAfter = null;
+    if (preg_match('~^.*RewriteEngine\s+On.*$~mi', $current, $m, PREG_OFFSET_CAPTURE)) {
+        $insertAfter = $m[0][1] + strlen($m[0][0]);
+    } elseif (preg_match('~^.*<IfModule\s+mod_rewrite\.c>.*$~mi', $current, $m, PREG_OFFSET_CAPTURE)) {
+        $insertAfter = $m[0][1] + strlen($m[0][0]);
+    }
+
+    if ($insertAfter === null) {
+        $new = $block . "\n\n" . $current;
+    } else {
+        $new = substr($current, 0, $insertAfter) . "\n\n" . $block . "\n" . substr($current, $insertAfter);
+    }
+    return @file_put_contents($stageHtaccess, $new) !== false;
+}
+
+/**
  * Promote the staged Grav 2.0 install to the webroot:
  *   1. Create {webroot}/backup-pre-2.0-{YYYYMMDD-HHMMSS}/
  *   2. Move every top-level entry at the webroot EXCEPT the stage dir and
@@ -1015,6 +1280,57 @@ function do_promote(string $webroot, array $flag, ?callable $progress = null): a
     ensure_dir($zipDir);
     $zipPath = $zipDir . '/' . $zipName;
     if (is_file($zipPath)) @unlink($zipPath);
+
+    // ─── Phase 0: carry over operator-selected root files/folders ──────────
+    // The promote screen lets the operator pick top-level entries to bring
+    // forward (issue #9). Copy them from the live webroot INTO the stage now,
+    // so Phase 3 promotes them up alongside 2.0. They stay at the old webroot
+    // too, so Phase 1's backup zip still captures them. The selection is
+    // re-validated against a fresh scan here, so a stale or tampered flag value
+    // can never copy an arbitrary path — only currently-offered entries pass.
+    $rootCopied = [];
+    $rootExtras = $flag['root_extras'] ?? [];
+    if (is_array($rootExtras) && $rootExtras !== []) {
+        $allowed = [];
+        foreach (mg_scan_root_extras($webroot, $stageDir) as $e) {
+            $allowed[$e['name']] = true;
+        }
+        foreach ($rootExtras as $name) {
+            $name = basename((string) $name); // defense in depth: no traversal
+            if ($name === '' || !isset($allowed[$name])) continue;
+            $src = $webroot . '/' . $name;
+            $dst = $stagePath . '/' . $name;
+            if ($progress) $progress(['phase' => 'copy', 'entry' => 'root-extra', 'file' => $name, 'copied' => 0]);
+            // Replace any 2.0 default of the same name — the operator chose to
+            // keep their version (e.g. a customized robots.txt).
+            if (is_dir($dst) && !is_link($dst)) {
+                $tmpFail = null;
+                mg_rm_tree($dst, $tmpFail);
+            } elseif (is_file($dst) || is_link($dst)) {
+                @unlink($dst);
+            }
+            if (is_dir($src) && !is_link($src)) {
+                if (copy_tree($src, $dst, static function () {}) === null) {
+                    $rootCopied[] = $name;
+                }
+            } elseif (is_file($src)) {
+                if (@copy($src, $dst)) {
+                    $rootCopied[] = $name;
+                }
+            }
+        }
+    }
+
+    // Carry over operator-approved custom .htaccess rules (issue #10). The
+    // promote screen detects them and lets the operator review/edit; the
+    // approved text is spliced into the staged 2.0 .htaccess inside a marked
+    // block so Phase 3 promotes it up with the rest of the install.
+    $htaccessSpliced = false;
+    $htaccessCustom  = trim((string) ($flag['htaccess_custom'] ?? ''));
+    if ($htaccessCustom !== '') {
+        if ($progress) $progress(['phase' => 'copy', 'entry' => 'htaccess', 'file' => '.htaccess custom rules', 'copied' => 0]);
+        $htaccessSpliced = mg_splice_htaccess_custom($stagePath . '/.htaccess', $htaccessCustom);
+    }
 
     // ─── Phase 1: zip the 1.x install ──────────────────────────────────────
     $zip = new ZipArchive();
@@ -1107,6 +1423,13 @@ function do_promote(string $webroot, array $flag, ?callable $progress = null): a
     if ($progress) $progress(['phase' => 'done-entry', 'entry' => 'promote', 'copied' => count($promoted)]);
 
     $msg = "Backed up {$added} files to backup/{$zipName}; promoted " . count($promoted) . ' entries to webroot.';
+    if ($rootCopied !== []) {
+        $msg .= ' Carried over ' . count($rootCopied) . ' root entr' . (count($rootCopied) === 1 ? 'y' : 'ies')
+              . ' from the 1.x install (' . implode(', ', $rootCopied) . ').';
+    }
+    if ($htaccessSpliced) {
+        $msg .= ' Spliced your custom .htaccess rules into the new .htaccess (in a marked migrate-grav block).';
+    }
     if ($cbRestore !== null) {
         $msg .= ' Restored system.custom_base_url (' . $cbRestore . ') now that the site is back at the original webroot.';
     }
@@ -1587,6 +1910,17 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
         if ($addedFls) $bits[] = count($addedFls) . ' filter(s)';
         $msg .= ' Widened security.twig_sandbox allowlist (' . implode(', ', $bits) . ') so page content can use them.';
     }
+    $addedMethods = $twigScan['sandbox_methods_added'] ?? [];
+    if ($addedMethods) {
+        $msg .= ' Added ' . count($addedMethods) . ' object method(s) to security.twig_sandbox.allowed_methods ('
+              . implode(', ', $addedMethods) . ') — e.g. the image manipulation chain used in your content.';
+    }
+    $unresolvedMethods = $twigScan['sandbox_methods_unresolved'] ?? [];
+    if ($unresolvedMethods) {
+        $msg .= ' NOTE: ' . count($unresolvedMethods) . ' method call(s) in content could not be mapped to a sandbox class ('
+              . implode(', ', $unresolvedMethods) . '). If these are on custom objects, add them to'
+              . ' security.twig_sandbox.allowed_methods under the right class by hand, or they will fail after migration.';
+    }
     $plugin = $twigScan['sandbox_plugin_funcs'] ?? [];
     if ($plugin) {
         $msg .= ' NOTE: ' . count($plugin) . ' name(s) in content are not PHP functions (' . implode(', ', $plugin)
@@ -1665,6 +1999,8 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
  *   - safe_filters_added      (list): PHP functions added to system.twig.safe_filters
  *   - sandbox_functions_added (list): names added to security.twig_sandbox.allowed_functions
  *   - sandbox_filters_added   (list): names added to security.twig_sandbox.allowed_filters
+ *   - sandbox_methods_added   (list): "Class::method" entries added to security.twig_sandbox.allowed_methods
+ *   - sandbox_methods_unresolved (list): method tokens in content that couldn't be mapped to a class (review)
  *   - sandbox_plugin_funcs    (list): content names that aren't PHP functions (need plugin registration)
  *   - sandbox_from_content    (list): names used in content but not in source safe_functions (escape-hatch category)
  *   - sandbox_blocked         (list): sandbox-denylisted names found but NOT added (blocked by 2.0 design)
@@ -1693,6 +2029,8 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
         'safe_filters_added'      => [],   // PHP functions added to system.twig.safe_filters
         'sandbox_functions_added' => [],   // names added to security.twig_sandbox.allowed_functions
         'sandbox_filters_added'   => [],   // names added to security.twig_sandbox.allowed_filters
+        'sandbox_methods_added'   => [],   // "Class::method" entries added to security.twig_sandbox.allowed_methods
+        'sandbox_methods_unresolved' => [], // method tokens seen in content but not mappable to a class
         'sandbox_from_content'    => [],   // subset discovered in page bodies (escape-hatch category)
         'sandbox_plugin_funcs'    => [],   // content funcs that aren't PHP functions (need plugin registration)
         'sandbox_blocked'         => [],   // sandbox-denylisted names found but NOT added (blocked by design)
@@ -1780,6 +2118,7 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
     // mapped to the pages they appear in (for the migration report).
     $bodyFuncPages = [];
     $bodyFilterPages = [];
+    $bodyMethodPages = [];
     if (is_dir($pagesDir)) {
         $rii = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($pagesDir, \FilesystemIterator::SKIP_DOTS));
         foreach ($rii as $file) {
@@ -1828,6 +2167,9 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
             }
             foreach ($tokens['filters'] as $fl) {
                 $bodyFilterPages[$fl][] = $rel;
+            }
+            foreach ($tokens['methods'] as $m) {
+                $bodyMethodPages[$m][] = $rel;
             }
         }
     }
@@ -1927,6 +2269,46 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
         }
     }
 
+    // Resolve content method tokens (`obj.method()`) onto sandbox classes so
+    // `security.twig_sandbox.allowed_methods` can be seeded. Method-to-class
+    // resolution isn't statically knowable in general, so we map the known
+    // common cases (the ImageMedium image chain dominates) and report the rest
+    // as unresolved for the operator to review — same pattern as functions.
+    $methodMap     = mg_twig_sandbox_method_map();
+    $baselineMeth  = $baseline['methods'];          // class => [methods] (core defaults)
+    // allowed_methods merges BY INDEX (it's a list of {class, methods} maps), so
+    // we can only write it safely as the COMPLETE core list plus additions. If
+    // the core baseline couldn't be read, writing a partial list would corrupt
+    // core's entries — so fall back to reporting the methods as unresolved
+    // (operator adds them by hand) rather than risk a broken sandbox.
+    $canSeedMethods = $baselineMeth !== [];
+    $allowMethAdd  = [];                             // class => [canonicalMethod => true]
+    $unresolvedMeth = [];
+    foreach ($bodyMethodPages as $m => $pages) {
+        $lc = strtolower((string) $m);
+        if (!isset($methodMap[$lc]) || !$canSeedMethods) {
+            $unresolvedMeth[(string) $m] = true;
+            continue;
+        }
+        $class = $methodMap[$lc]['class'];
+        $name  = $methodMap[$lc]['name'];
+        // Already permitted by core defaults for this class → nothing to add.
+        // Baseline methods are lowercased, so compare case-insensitively.
+        if (in_array(strtolower($name), $baselineMeth[$class] ?? [], true)) {
+            continue;
+        }
+        $allowMethAdd[$class][$name] = true;
+    }
+    // Build "Class::method" report entries and the unresolved list.
+    $methodsAddedReport = [];
+    foreach ($allowMethAdd as $class => $names) {
+        foreach (array_keys($names) as $name) {
+            $methodsAddedReport[] = $class . '::' . $name;
+        }
+    }
+    $result['sandbox_methods_added']      = $methodsAddedReport;
+    $result['sandbox_methods_unresolved'] = array_keys($unresolvedMeth);
+
     // Merged safe_* lists for system.yaml = existing (preserved) + new PHP funcs.
     $unionSafeFns = array_values(array_unique(array_merge($result['sandbox_safe_functions'], array_keys($safeFnAdd))));
     $unionSafeFls = array_values(array_unique(array_merge($result['sandbox_safe_filters'], array_keys($safeFlAdd))));
@@ -1944,7 +2326,7 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
     $result['sandbox_token_pages']       = array_map(static fn($p) => $p[0] ?? null, $contentTokens);
 
     $sandboxComment = '';
-    if ($allowFnAdd || $allowFlAdd) {
+    if ($allowFnAdd || $allowFlAdd || $allowMethAdd) {
         // Write the FULL union (core defaults first, then additions). The
         // sandbox lists have no blueprint, so Grav merges them BY INDEX — a
         // partial list here would corrupt the core defaults. Keep them whole.
@@ -1954,6 +2336,24 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
         }
         if ($allowFlAdd) {
             $sandbox['allowed_filters'] = array_values(array_unique(array_merge($baseline['filters'], array_keys($allowFlAdd))));
+        }
+        if ($allowMethAdd) {
+            // allowed_methods is core's list-of-maps (`- {class, methods: 'a,b'}`)
+            // and merges BY INDEX, so write the COMPLETE list: every core class
+            // in its original order (methods lowercased, comma-joined to match
+            // core's style) with our additions merged into the matching class,
+            // and any new class (e.g. ImageMedium) appended. $canSeedMethods
+            // guaranteed $baselineMeth is non-empty before we got here.
+            $merged = $baselineMeth;   // class => [methods] (ordered as core)
+            foreach ($allowMethAdd as $class => $names) {
+                $add = array_map('strtolower', array_map('strval', array_keys($names)));
+                $merged[$class] = array_values(array_unique(array_merge($merged[$class] ?? [], $add)));
+            }
+            $list = [];
+            foreach ($merged as $class => $mlist) {
+                $list[] = ['class' => $class, 'methods' => implode(', ', $mlist)];
+            }
+            $sandbox['allowed_methods'] = $list;
         }
         $current['twig_sandbox'] = $sandbox;
 
@@ -2327,22 +2727,23 @@ function mg_twig_sandbox_denylist(): array
 }
 
 /**
- * Extract the Twig function-call and filter names used inside `{{ … }}` /
- * `{% … %}` regions of a page body. Prose parentheses and `|` characters
- * outside Twig delimiters are ignored. Method calls (`obj.method()`) and
- * piped filters are excluded from the function set, and macros declared in the
- * same body are not mistaken for custom functions.
+ * Extract the Twig function-call, filter, and method-call names used inside
+ * `{{ … }}` / `{% … %}` regions of a page body. Prose parentheses and `|`
+ * characters outside Twig delimiters are ignored. Method calls (`obj.method()`)
+ * are captured SEPARATELY from functions (they seed allowed_methods, not
+ * allowed_functions), and macros declared in the same body are not mistaken for
+ * custom functions.
  *
  * Over-inclusion is safe here — a stray name only widens an allowlist that the
  * operator is told to review. Under-inclusion is safe too (operator can add it
  * by hand). So the heuristics favour simplicity over a full Twig lexer.
  *
- * @return array{functions:list<string>,filters:list<string>}
+ * @return array{functions:list<string>,filters:list<string>,methods:list<string>}
  */
 function mg_extract_twig_tokens(string $body): array
 {
     if ($body === '' || (!str_contains($body, '{{') && !str_contains($body, '{%'))) {
-        return ['functions' => [], 'filters' => []];
+        return ['functions' => [], 'filters' => [], 'methods' => []];
     }
 
     // Macro names declared in this body — excluded from the function set.
@@ -2366,6 +2767,7 @@ function mg_extract_twig_tokens(string $body): array
 
     $functions = [];
     $filters = [];
+    $methods = [];
     if (preg_match_all('/\{\{.*?\}\}|\{%.*?%\}/s', $body, $regions)) {
         foreach ($regions[0] as $region) {
             // Function calls: `name(` not preceded by a word char, `.` (method
@@ -2383,27 +2785,93 @@ function mg_extract_twig_tokens(string $body): array
                     $filters[$fl] = true;
                 }
             }
+            // Method calls: `.name(` — the object-method idiom the function
+            // capture above deliberately skips (its lookbehind excludes `.`).
+            // These seed security.twig_sandbox.allowed_methods. The image
+            // manipulation chain (`.cropResize()`, `.lightbox()`, …) is by far
+            // the most common case and breaks otherwise-clean migrations.
+            if (preg_match_all('/\.([a-zA-Z_]\w*)\s*\(/', $region, $mm2)) {
+                foreach ($mm2[1] as $m) {
+                    $methods[$m] = true;
+                }
+            }
         }
     }
 
     return [
         'functions' => array_keys($functions),
         'filters'   => array_keys($filters),
+        'methods'   => array_keys($methods),
     ];
 }
 
 /**
- * Read the core default `twig_sandbox.allowed_functions` / `allowed_filters`
- * lists from the staged Grav 2.0 install's `system/config/security.yaml`.
- * Reading the staged copy (rather than a hardcoded list) keeps the union we
- * write correct as core's defaults evolve across 2.0 point releases.
+ * Maps the common object-method tokens found in 1.x content to the sandbox
+ * class that must allow-list them under Grav 2.0. Method-to-class resolution
+ * isn't statically knowable in general, so this covers the cases that actually
+ * break migrations in practice — overwhelmingly the ImageMedium image-handling
+ * chain routed through `ImageMedium::__call()`. Keys are lowercased method
+ * names (matched case-insensitively against content); each value carries the
+ * canonical method name to write and the fully-qualified class to write it
+ * under. Tokens not in this map are reported as unresolved for the operator.
+ *
+ * @return array<string,array{name:string,class:string}>
+ */
+function mg_twig_sandbox_method_map(): array
+{
+    $imageMedium = 'Grav\\Common\\Page\\Medium\\ImageMedium';
+    // The image manipulation / responsive chain. All invoked on an ImageMedium.
+    $imageMethods = [
+        'lightbox', 'lazy', 'srcset', 'sizes', 'autoSizes', 'sizesViewports',
+        'resize', 'forceResize', 'cropResize', 'crop', 'cropZoom', 'cropResizeZoom',
+        'quality', 'format', 'negate', 'brightness', 'contrast', 'grayscale',
+        'rotate', 'flip', 'fixOrientation', 'gaussianBlur', 'sharp', 'emboss',
+        'sepia', 'sepiaColor', 'edge', 'colorize', 'pixelate', 'merge',
+        'enableResponsiveImages', 'derivatives', 'watermark', 'fixDirRotation',
+    ];
+    // Methods on the base Medium / MediumInterface (links, markup, metadata).
+    // Core defaults already allow-list MediumInterface for url/html, but
+    // include the common chain entry points so a baseline gap is covered too.
+    $mediumInterface = 'Grav\\Common\\Page\\Medium\\MediumInterface';
+    $mediumMethods = [
+        'url', 'html', 'link', 'lightbox', 'display', 'thumbnail', 'parsedownElement',
+    ];
+
+    $map = [];
+    foreach ($imageMethods as $m) {
+        $map[strtolower($m)] = ['name' => $m, 'class' => $imageMedium];
+    }
+    // Medium-level methods win for names that exist on both (url/html/link are
+    // base-Medium concerns); only set ones not already mapped to ImageMedium
+    // by an image-specific name above, except the genuinely shared link/display.
+    foreach ($mediumMethods as $m) {
+        $lc = strtolower($m);
+        if (!isset($map[$lc]) || in_array($lc, ['url', 'html', 'display', 'thumbnail', 'parsedownelement'], true)) {
+            $map[$lc] = ['name' => $m, 'class' => $mediumInterface];
+        }
+    }
+    return $map;
+}
+
+/**
+ * Read the core default `twig_sandbox.allowed_functions` / `allowed_filters` /
+ * `allowed_methods` lists from the staged Grav 2.0 install's
+ * `system/config/security.yaml`. Reading the staged copy (rather than a
+ * hardcoded list) keeps the union we write correct as core's defaults evolve
+ * across 2.0 point releases.
+ *
+ * `allowed_methods` is core's list-of-maps shape — each entry is
+ * `{class: 'Fully\\Qualified\\Name', methods: 'a, b, c'}` with a comma-joined,
+ * lowercase method string — so it's flattened here to an ordered
+ * `class => [method,…]` map (insertion order preserved, methods lowercased to
+ * match how the sandbox compares them).
  *
  * @param string $stageRoot Staged Grav 2.0 root (dirname of the staged user/).
- * @return array{functions:list<string>,filters:list<string>}
+ * @return array{functions:list<string>,filters:list<string>,methods:array<string,list<string>>}
  */
 function mg_read_sandbox_baseline(string $stageRoot): array
 {
-    $out = ['functions' => [], 'filters' => []];
+    $out = ['functions' => [], 'filters' => [], 'methods' => []];
     $path = $stageRoot . '/system/config/security.yaml';
     if (!is_file($path)) {
         return $out;
@@ -2418,6 +2886,19 @@ function mg_read_sandbox_baseline(string $stageRoot): array
     if (is_array($cfg)) {
         $out['functions'] = mg_normalize_token_list($cfg['twig_sandbox']['allowed_functions'] ?? []);
         $out['filters']   = mg_normalize_token_list($cfg['twig_sandbox']['allowed_filters'] ?? []);
+        $methods = $cfg['twig_sandbox']['allowed_methods'] ?? [];
+        if (is_array($methods)) {
+            foreach ($methods as $entry) {
+                if (!is_array($entry)) continue;
+                $class = (string) ($entry['class'] ?? '');
+                if ($class === '') continue;
+                $raw = $entry['methods'] ?? '';
+                $parts = is_string($raw)
+                    ? array_filter(array_map('trim', explode(',', $raw)))
+                    : mg_normalize_token_list($raw);
+                $out['methods'][$class] = array_values(array_unique(array_map('strtolower', $parts)));
+            }
+        }
     }
     return $out;
 }
@@ -5233,7 +5714,53 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
             echo '<form method="post" onsubmit="return confirm(\'Promote Grav 2.0 to live? Existing install will be zipped up to backup/ and then removed from the webroot. Revert requires manually extracting the backup zip.\');">';
             echo '<input type="hidden" name="action" value="promote">';
             echo '<input type="hidden" name="token"  value="' . htmlspecialchars($token) . '">';
-            echo '<button type="submit" class="mg-btn mg-btn-primary">Promote to live →</button>';
+
+            // Optional: carry forward operator-authored root files/folders that
+            // the migration doesn't otherwise touch (issue #9). Grav-managed
+            // entries (system/, vendor/, user/, index.php, .htaccess, …) are
+            // never listed — only the extras found at the live root.
+            $rootExtras = mg_scan_root_extras($webroot, $stageDir);
+            if ($rootExtras !== []) {
+                $fmtSize = static function (?int $b): string {
+                    if ($b === null) return '';
+                    if ($b < 1024) return $b . ' B';
+                    if ($b < 1048576) return round($b / 1024, 1) . ' KB';
+                    return round($b / 1048576, 1) . ' MB';
+                };
+                echo '<div class="mg-card" style="margin:18px 0 0;background:#fafbff">';
+                echo '<h3 style="margin-top:0">Carry over root files &amp; folders <span class="mg-btn-note">(optional)</span></h3>';
+                echo '<p style="font-size:13.5px;color:#555">These top-level entries exist in your 1.x install but aren\'t part of Grav itself, so a fresh 2.0 install won\'t have them. Tick any you want copied into the new install during promote (e.g. a custom <code>robots.txt</code>, <code>favicon.ico</code>, <code>.well-known/</code>, or verification files). A ticked entry <strong>replaces</strong> any 2.0 default of the same name. <code>.htaccess</code> is migrated separately.</p>';
+                foreach ($rootExtras as $e) {
+                    $label = htmlspecialchars($e['name']) . ($e['dir'] ? '/' : '');
+                    $meta  = $e['dir'] ? 'folder' : ('file' . ($e['size'] !== null ? ', ' . $fmtSize($e['size']) : ''));
+                    echo '<label class="mg-check mg-check-block">'
+                       . '<input type="checkbox" name="root_extras[]" value="' . htmlspecialchars($e['name']) . '"> '
+                       . '<strong>' . $label . '</strong> '
+                       . '<span class="mg-btn-note">(' . $meta . ')</span>'
+                       . '</label>';
+                }
+                echo '</div>';
+            }
+
+            // Optional: carry forward custom .htaccess rules (issue #10).
+            $htDetect = mg_detect_htaccess_custom($webroot, $stageDir);
+            if ($htDetect['supported'] && $htDetect['text'] !== '') {
+                echo '<div class="mg-card" style="margin:18px 0 0;background:#fafbff">';
+                echo '<h3 style="margin-top:0">Carry over custom <code>.htaccess</code> rules <span class="mg-btn-note">(optional)</span></h3>';
+                echo '<p style="font-size:13.5px;color:#555">We found ' . (int) $htDetect['count'] . ' line(s) in your <code>.htaccess</code> that aren\'t part of Grav\'s stock file — likely your own redirects, headers, or rewrite rules. Review them below (edit freely — anything you leave here is spliced verbatim into the new <code>.htaccess</code> inside a marked block). <strong>Some lines may be Grav\'s own rules from a different version rather than your customizations</strong>, so remove anything that isn\'t yours before carrying it over.</p>';
+                echo '<label class="mg-check mg-check-block">'
+                   . '<input type="checkbox" name="htaccess_carry" value="1"> '
+                   . '<strong>Splice these rules into the new <code>.htaccess</code></strong> '
+                   . '<span class="mg-btn-note">(off by default — review first)</span>'
+                   . '</label>';
+                echo '<textarea name="htaccess_custom" rows="' . max(4, min(20, substr_count($htDetect['text'], "\n") + 2)) . '" '
+                   . 'style="width:100%;margin-top:10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;padding:10px;border:1px solid #d8d2ec;border-radius:4px;box-sizing:border-box;white-space:pre">'
+                   . htmlspecialchars($htDetect['text'])
+                   . '</textarea>';
+                echo '</div>';
+            }
+
+            echo '<div style="margin-top:18px"><button type="submit" class="mg-btn mg-btn-primary">Promote to live →</button></div>';
             echo '</form>';
             echo '</div>';
             break;

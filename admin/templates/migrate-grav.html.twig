@@ -246,13 +246,28 @@
                 </div>
             </div>
 
+            {% if migrate_grav_readiness and not migrate_grav_readiness.ready %}
+                <div class="mg-callout mg-callout-danger">
+                    <i class="fa fa-exclamation-triangle"></i>
+                    <div class="mg-callout-body">
+                        <strong>This host can't download the Grav 2.0 release.</strong>
+                        <p style="margin:6px 0 0;">PHP's <code>allow_url_fopen</code> is disabled{% if not migrate_grav_readiness.curl %} and the <code>cURL</code> extension is unavailable{% endif %} — common on locked-down shared hosting. Download the Grav 2.0 release zip manually, then set <code>source_local_zip</code> (an absolute path to the zip) in the Migrate Grav plugin configuration and reload this page.</p>
+                    </div>
+                </div>
+            {% endif %}
+
             <div class="mg-action">
                 <div class="mg-action-label">
                     <strong>Stage Grav 2.0 in <code>/{{ config.plugins['migrate-grav'].stage_dir }}/</code></strong> and open the migration wizard in a fresh PHP process.
+                    {% if migrate_grav_readiness and migrate_grav_readiness.local_zip %}
+                        <span style="display:block;margin-top:4px;color:#1d5e34;">Using the configured <code>source_local_zip</code> — no download needed.</span>
+                    {% elseif migrate_grav_readiness and not migrate_grav_readiness.allow_url_fopen and migrate_grav_readiness.curl %}
+                        <span style="display:block;margin-top:4px;color:#5a4a1f;"><code>allow_url_fopen</code> is off; the download will use cURL.</span>
+                    {% endif %}
                 </div>
                 <form method="post" action="{{ base_url_relative }}/task:migrateGravInit" style="margin:0">
                     <input type="hidden" name="admin-nonce" value="{{ admin.getNonce('admin-form') }}" />
-                    <button type="submit" class="mg-btn mg-btn-primary">
+                    <button type="submit" class="mg-btn mg-btn-primary"{% if migrate_grav_readiness and not migrate_grav_readiness.ready %} disabled style="opacity:.55;cursor:not-allowed;"{% endif %}>
                         <i class="fa fa-play"></i> Stage &amp; start wizard
                     </button>
                 </form>

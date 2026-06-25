@@ -56,10 +56,20 @@ bin/plugin migrate-grav status
 ```yaml
 enabled: true
 source_url: 'https://getgrav.org/download/core/grav-update/2.0.0-beta.1?testing'
-source_local_zip: ''        # absolute path to a local 2.0 zip (dev only)
+source_local_zip: ''        # absolute path to a manually-downloaded 2.0 zip
 stage_dir: 'grav-2'
 require_super_admin: true
 ```
+
+### Shared hosting / blocked downloads
+
+The kickoff downloads the Grav 2.0 zip from `source_url`. It uses PHP's URL stream
+wrapper when `allow_url_fopen` is enabled and falls back to **cURL** when it isn't — so
+most shared hosts work out of the box. If a host disables *both* `allow_url_fopen` and the
+cURL extension, or blocks outbound HTTPS to `getgrav.org` entirely, the admin page will say
+so before you stage and the download will fail with a clear message. The fix: download the
+Grav 2.0 release zip yourself, upload it to the server, and set `source_local_zip` to its
+absolute path. When `source_local_zip` is set the kickoff skips the download completely.
 
 ## Twig in content
 
@@ -84,19 +94,26 @@ migration tries to preserve your 1.x behavior:
 - **Plugin-provided Twig functions** (e.g. `unite_gallery`) are added to the sandbox
   allow-list, but the providing plugin must still register them — ideally via the
   `onBuildTwigSandboxPolicy` event. These are listed in the migration report.
+- **Object method calls** (e.g. the image idiom
+  `{{ page.media['x.jpg'].lightbox().cropResize(…).html()|raw }}`) are scanned too. The
+  common image-manipulation chain (`lightbox`, `cropResize`, `cropZoom`, `resize`,
+  `quality`, `grayscale`, …) routes through `ImageMedium`, so those methods are seeded into
+  `security.twig_sandbox.allowed_methods` under the right class. Method tokens that can't be
+  mapped to a known class are listed in the report for you to allowlist by hand.
 - Functions Grav 2.0 refuses — `Utils::isDangerousFunction()` (`system`, `exec`,
   `preg_replace`, …) and the sandbox's by-design exclusions (`constant`, `read_file`,
   `evaluate`, …) — are never added; the report lists them so you know those usages need
   reworking.
 
-**What it can't detect automatically:** custom **object methods and properties** used in
-content Twig (for example a plugin object's `{{ thing.render() }}`) can't be found by a
-static scan, because the object's class isn't known until runtime. Grav 2.0 already
-allowlists the common page, media, config, and user classes, so most content keeps working.
-If something still renders as raw Twig (or shows a sandbox placeholder) after migration,
-check `logs/security.log`, then either add the class/method to
-`security.twig_sandbox.allowed_methods` by hand or — better — update the providing plugin to
-a 2.0 version that registers its safe Twig members via the `onBuildTwigSandboxPolicy` event.
+**What it can't always detect automatically:** custom **object methods and properties** on
+classes the migrator doesn't know about (for example a plugin object's `{{ thing.render() }}`)
+can't be mapped by a static scan, because the object's class isn't known until runtime. Grav
+2.0 already allowlists the common page, media, config, and user classes, and the migrator
+seeds the image-method chain, so most content keeps working. If something still renders as
+raw Twig (or shows a sandbox placeholder) after migration, check `logs/security.log`, then
+either add the class/method to `security.twig_sandbox.allowed_methods` by hand or — better —
+update the providing plugin to a 2.0 version that registers its safe Twig members via the
+`onBuildTwigSandboxPolicy` event.
 
 The allowlists written to `user/config/security.yaml` are the **full** lists (core defaults
 plus your additions) on purpose: the flat lists (`allowed_functions`/`allowed_filters`/
@@ -128,6 +145,13 @@ can't be mistaken for a Grav image action.
 If a flagged transform requests an image larger than `system.images.max_pixels`
 (25,000,000px by default), Grav still refuses it even with the toggle on — the report calls
 those out so you can raise the ceiling or rework them.
+
+## Carrying over root files and custom .htaccess rules
+
+A fresh Grav 2.0 install ships its own webroot — it won't have files you added at the root of your 1.x site. The **promote** step (Step 6) detects these and lets you opt in to carrying them forward:
+
+- **Root files & folders.** Any top-level entry that isn't part of Grav itself (a custom `robots.txt`, `favicon.ico`, `.well-known/`, ownership-verification files, custom upload folders, …) is offered as a checklist. Grav-managed entries (`system/`, `vendor/`, `user/`, `index.php`, `composer.json`, …) are never offered, since carrying them would clobber the new install. A ticked entry replaces any 2.0 default of the same name. Everything is also captured in the backup zip regardless.
+- **Custom `.htaccess` rules.** The wizard diffs your live `.htaccess` against the stock Grav template (`webserver-configs/htaccess.txt`) and shows the lines that look like your own additions — custom redirects, `Header` directives, an uncommented `RewriteBase`, `ErrorDocument`, caching blocks, etc. Review and edit them in the textarea (some lines may be Grav's own rules from a different point release rather than your customizations — remove anything that isn't yours), tick the box, and they're spliced into the new `.htaccess` inside a clearly marked `# BEGIN/END migrate-grav` block, placed right after `RewriteEngine On`. Both are off by default — nothing is carried unless you opt in.
 
 ## Aborting
 

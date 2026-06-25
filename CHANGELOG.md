@@ -1,3 +1,14 @@
+# v1.0.2
+## 06-25-2026
+
+1. [](#new)
+    * **The image-manipulation chain in page content now keeps working after migration, with the Twig sandbox left enabled.** The content scan that widens `security.twig_sandbox` only looked at function and filter calls, never object **method** calls, so the standard media idiom `{{ page.media['x.jpg'].lightbox().cropResize(…).html()|raw }}` broke after an otherwise-clean migration (`[TwigSandbox] blocked rule=method token=lightbox class=…ImageMedium`). The scanner now also captures `obj.method()` tokens and seeds `security.twig_sandbox.allowed_methods`, mapping the common image chain (`lightbox`, `cropResize`, `cropZoom`, `resize`, `quality`, `grayscale`, `rotate`, …) onto `ImageMedium`. The full per-class lists are written (core defaults + additions) so the by-position merge never drops a default, and any method token that can't be mapped to a class is flagged in the report. [#11]
+    * **Custom root files and folders can be carried into the new install.** A fresh Grav 2.0 webroot doesn't include files you added at the root of your 1.x site (a custom `robots.txt`, `favicon.ico`, `.well-known/`, verification files, custom folders). The promote step now lists the top-level entries that aren't part of Grav itself and lets you tick the ones to bring forward; Grav-managed entries (`system/`, `vendor/`, `user/`, `index.php`, `composer.json`/`.lock`, …) are never offered, and a ticked entry replaces any 2.0 default of the same name. Off by default. [#9]
+    * **Custom `.htaccess` rules can be carried into the new install.** The promote step diffs your live `.htaccess` against the stock Grav template, recognises Grav's own rules (so version drift in the security blocks isn't mistaken for your edits) and keeps custom `<IfModule>` guards intact, then shows the detected custom lines in an editable textarea for review. When you opt in, they're spliced into the new `.htaccess` inside a marked `# BEGIN/END migrate-grav` block placed right after `RewriteEngine On`. Off by default. [#10]
+
+2. [](#bugfix)
+    * **Staging no longer fails with "Failed to open source URL" on shared hosting.** The kickoff downloaded the Grav 2.0 zip with PHP's URL stream wrapper, which fails outright when `allow_url_fopen` is disabled — common on locked-down shared hosting — producing only a generic error. The download now falls back to cURL when `allow_url_fopen` is off, the Migrate Grav admin page checks up front whether the host can fetch the release at all (and disables staging with a clear explanation when it can't), and the failure messages point at the `source_local_zip` escape hatch (download the zip manually, set its path, and the download is skipped entirely). [#12]
+
 # v1.0.1
 ## 06-24-2026
 

@@ -154,8 +154,58 @@ class Kickoff
         return $dest;
     }
 
+    /**
+     * Whether this host can fetch the Grav 2.0 zip over the network, and via
+     * which mechanism. Shared hosting frequently disables allow_url_fopen; when
+     * the cURL extension is also unavailable the kickoff cannot download at all
+     * and the operator must point source_local_zip at a manually-downloaded zip.
+     * Surfaced on the admin page before staging so the failure is caught up
+     * front rather than mid-kickoff. Static so callers don't need a Kickoff
+     * instance (the admin builds one anyway, but this keeps it cheap).
+     *
+     * @param string $localZip Value of the source_local_zip config (may be empty).
+     * @return array{can_fetch: bool, allow_url_fopen: bool, curl: bool, local_zip: bool, ready: bool}
+     */
+    public static function downloadReadiness(string $localZip = ''): array
+    {
+        $allowUrlFopen = filter_var(ini_get('allow_url_fopen'), FILTER_VALIDATE_BOOLEAN);
+        $curl          = function_exists('curl_init');
+        $canFetch      = $allowUrlFopen || $curl;
+        $hasLocalZip   = trim($localZip) !== '' && is_file(trim($localZip));
+
+        return [
+            'can_fetch'       => $canFetch,
+            'allow_url_fopen' => $allowUrlFopen,
+            'curl'            => $curl,
+            'local_zip'       => $hasLocalZip,
+            // Ready to stage when we can fetch over the wire OR a valid local
+            // zip is already configured to bypass the download entirely.
+            'ready'           => $canFetch || $hasLocalZip,
+        ];
+    }
+
     private function downloadTo(string $url, string $dest): void
     {
+        // Shared hosting very commonly disables allow_url_fopen, which makes
+        // fopen() on an http(s) URL fail outright — the historical cause of
+        // the generic "Failed to open source URL" kickoff failure. When the
+        // URL wrapper is unavailable, fall back to cURL (almost always present
+        // even where allow_url_fopen is off). If neither path can fetch over
+        // the network, fail with an actionable message pointing at the
+        // source_local_zip escape hatch.
+        if (!filter_var(ini_get('allow_url_fopen'), FILTER_VALIDATE_BOOLEAN)) {
+            if (function_exists('curl_init')) {
+                $this->downloadViaCurl($url, $dest);
+                return;
+            }
+            throw new RuntimeException(
+                "Cannot download {$url}: PHP's allow_url_fopen is disabled and the cURL " .
+                "extension is not available (common on locked-down shared hosting). " .
+                "Download the Grav 2.0 release zip manually and set source_local_zip in the " .
+                "Migrate Grav plugin configuration, then re-run the wizard."
+            );
+        }
+
         // Build a stream context that honors Grav's proxy config. Without
         // this, sites behind a corporate proxy can't fetch the Grav 2.0 zip
         // and the kickoff fails with a generic "Failed to open source URL".
@@ -164,7 +214,11 @@ class Kickoff
             ? @fopen($url, 'rb', false, $ctx)
             : @fopen($url, 'rb');
         if (!$in) {
-            throw new RuntimeException("Failed to open source URL: {$url}");
+            throw new RuntimeException(
+                "Failed to open source URL: {$url}. The host may block outbound HTTPS to " .
+                "getgrav.org, or the connection was refused. Download the release zip manually " .
+                "and set source_local_zip in the Migrate Grav plugin configuration, then re-run."
+            );
         }
         $out = @fopen($dest, 'wb');
         if (!$out) {
@@ -217,6 +271,78 @@ class Kickoff
                 // throw past obtainZip) neither must the wizard.
                 @unlink($dest);
             }
+        }
+    }
+
+    /**
+     * cURL download path for hosts where allow_url_fopen is disabled. Mirrors
+     * the proxy/cafile handling of buildHttpContext() and streams straight to
+     * disk so a large zip never has to fit in memory. cURL follows redirects
+     * and verifies the byte count via the reported Content-Length, matching the
+     * integrity guarantees of the stream path.
+     */
+    private function downloadViaCurl(string $url, string $dest): void
+    {
+        $out = @fopen($dest, 'wb');
+        if (!$out) {
+            throw new RuntimeException("Failed to open destination for write: {$dest}");
+        }
+
+        $ch = curl_init($url);
+        if ($ch === false) {
+            fclose($out);
+            @unlink($dest);
+            throw new RuntimeException("Could not initialize cURL for download from {$url}");
+        }
+
+        curl_setopt_array($ch, [
+            CURLOPT_FILE           => $out,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS      => 5,
+            CURLOPT_CONNECTTIMEOUT => 30,
+            CURLOPT_TIMEOUT        => 300, // zip can be large; be generous
+            CURLOPT_FAILONERROR    => true, // turn 4xx/5xx into a cURL error
+            CURLOPT_USERAGENT      => 'grav-migrate-kickoff/1.0',
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+        ]);
+
+        // Honor Grav's proxy config (forwarded into $this->config), the same
+        // settings buildHttpContext() applies to the stream path.
+        $proxyUrl = (string) ($this->config['proxy_url'] ?? '');
+        if ($proxyUrl !== '') {
+            curl_setopt($ch, CURLOPT_PROXY, $proxyUrl);
+            $certPath = (string) ($this->config['proxy_cert_path'] ?? '');
+            if ($certPath !== '') {
+                if (is_file($certPath))    curl_setopt($ch, CURLOPT_CAINFO, $certPath);
+                elseif (is_dir($certPath)) curl_setopt($ch, CURLOPT_CAPATH, $certPath);
+            }
+        }
+
+        $ok       = curl_exec($ch);
+        $err      = curl_error($ch);
+        $expected = (int) curl_getinfo($ch, CURLINFO_CONTENT_LENGTH_DOWNLOAD);
+        curl_close($ch);
+        fclose($out);
+
+        if ($ok === false) {
+            @unlink($dest);
+            throw new RuntimeException(
+                "Download failed from {$url}: {$err}. Try again, or download the release " .
+                "manually and set source_local_zip in the Migrate Grav plugin configuration."
+            );
+        }
+
+        // CURLINFO_CONTENT_LENGTH_DOWNLOAD is -1 when the server sent no
+        // Content-Length (chunked); only cross-check when it's a real size.
+        $written = is_file($dest) ? (int) filesize($dest) : 0;
+        if ($expected > 0 && $written !== $expected) {
+            @unlink($dest);
+            throw new RuntimeException(
+                "Incomplete download from {$url}: received {$written} of {$expected} bytes. " .
+                "The connection was interrupted — try again, or download the release manually " .
+                "and set source_local_zip in the plugin configuration."
+            );
         }
     }
 

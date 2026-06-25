@@ -181,6 +181,13 @@ class MigrateGravPlugin extends Plugin
         $status = $security->status();
         $status['snippet'] = $status['protected'] ? '' : $security->manualSnippet();
         $this->grav['twig']->twig_vars['migrate_grav_security'] = $status;
+
+        // Whether this host can actually download the Grav 2.0 zip. Caught here
+        // so the operator sees the problem before clicking "Stage & start
+        // wizard" rather than hitting a generic kickoff failure (issue #12).
+        require_once __DIR__ . '/classes/Kickoff.php';
+        $localZip = (string) $this->config->get('plugins.migrate-grav.source_local_zip', '');
+        $this->grav['twig']->twig_vars['migrate_grav_readiness'] = Kickoff::downloadReadiness($localZip);
     }
 
     private function newHtaccessSecurity(): HtaccessSecurity
