@@ -1,7 +1,7 @@
 name: Migrate Grav
 type: plugin
 slug: migrate-grav
-version: 1.0.1
+version: 1.0.2
 testing: false
 description: "Stages a new major Grav release alongside an existing site and hands off to a standalone migration wizard."
 icon: rocket
@@ -41,9 +41,9 @@ form:
 
     source_local_zip:
       type: text
-      label: Local 2.0 zip (dev only)
+      label: Local 2.0 zip
       default: ""
-      help: Absolute path to a local grav-2.0.zip. When set, overrides source_url.
+      help: Absolute path to a manually-downloaded Grav 2.0 zip. When set, overrides source_url and skips the download entirely. Use this on hosts that block outbound HTTPS or disable allow_url_fopen and cURL (common on shared hosting), or for local dev testing.
 
     stage_dir:
       type: text
