@@ -50,6 +50,19 @@ const MG_MODE_PERMISSIVE = 'permissive';
 const MG_MODE_TEST       = 'test';
 const MG_MODES_ALL       = [MG_MODE_STRICT, MG_MODE_PERMISSIVE, MG_MODE_TEST];
 
+// Plugins the policy step must NEVER disable or remove. These are stock
+// dependencies a working Grav 2.0 site (and its admin) relies on, so silently
+// disabling one because its 1.x version didn't read as 2.0-compatible is how a
+// migration locks the operator out. When one of these can't be brought to its
+// 2.0 release it's reported as a blocking problem, not quietly disabled.
+const MG_PROTECTED_PLUGINS = ['flex-objects', 'form', 'login', 'email', 'problems'];
+
+// The subset of required plugins that, if missing or disabled in the staged
+// tree, leaves the operator unable to log into admin. The promote step hard-
+// blocks on these (plus the admin2/api replacements) rather than swapping a
+// broken install over the working 1.7 one. See mg_validate_staged_critical().
+const MG_CRITICAL_PLUGINS = ['api', 'admin2', 'flex-objects', 'login'];
+
 // Inline rocket SVG (bootstrap-icons rocket-takeoff). Used in the hero so the
 // wizard matches the admin migrate-grav page (which uses the same asset).
 // Kept inline because the wizard is standalone — no asset pipeline available.
@@ -150,6 +163,9 @@ if ($method === 'POST') {
             $flagForAuth['htaccess_custom'] = isset($_POST['htaccess_carry'])
                 ? trim((string) ($_POST['htaccess_custom'] ?? ''))
                 : '';
+            // Operator override for the critical-readiness gate (do_promote).
+            // Only honored when explicitly ticked on the blocked-promote screen.
+            $flagForAuth['force_promote'] = isset($_POST['force_promote']);
             stream_promote_page($webroot, $flagForAuth, $token);
             exit(0);
 
@@ -629,6 +645,18 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
                 $from = (string) ($scan['plugins'][$slug]['installed_version'] ?? '');
                 $upgraded["plugins/{$slug}"] = ['to' => $version, 'from' => $from];
             }
+        } else {
+            // gpm couldn't run — almost always proc_open()/shell disabled on
+            // shared hosting. Fall back to the same per-slug zip path themes use:
+            // download each plugin's resolved 2.0 release and extract it in
+            // process. No dependency resolution like gpm, but for the installed
+            // set every plugin already has its own resolved download URL, and
+            // the protected safety net below backstops the required ones.
+            if ($progress) $progress(['phase' => 'log', 'entry' => 'update/plugins', 'reason' => 'gpm unavailable (' . ($gpmResult['msg'] ?? 'unknown') . ') — using in-process installer']);
+            $zipFallback = mg_zip_update_plugins($webroot, $stageDir, $dstUser, $scan, $gpmExclude, $progress);
+            foreach ($zipFallback as $slug => $info) {
+                $upgraded["plugins/{$slug}"] = $info;
+            }
         }
 
         // Themes — existing per-slug path, skipping symlinked slugs.
@@ -651,6 +679,17 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
                 if ($progress) $progress(['phase' => 'skip', 'entry' => "update/themes/{$slug}", 'reason' => $res['msg']]);
             }
         }
+    }
+
+    // ─── Phase 4.6: backstop the protected (required) plugins ───────────────
+    // Runs regardless of the auto-update choice or whether gpm ran. For each
+    // protected slug present in the staged tree but not yet at its 2.0 release,
+    // force-install from the baseline registry's github_repo. This is what keeps
+    // flex-objects (and login/form/email) from being left at a 1.x version that
+    // the policy step would then disable — the exact lockout in issue #13.
+    $protectedResult = mg_ensure_protected_upgraded($webroot, $stageDir, $dstUser, $scan, $progress);
+    foreach ($protectedResult['upgraded'] as $slug => $info) {
+        $upgraded["plugins/{$slug}"] = $info;
     }
 
     // ─── Phase 4.5: delete superseded plugin dirs ───────────────────────────
@@ -728,6 +767,8 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
         ] : null,
         'replacements'   => $replacements,
         'force_included' => $policyResult['force_included'] ?? [],
+        'protected'      => $protectedResult,
+        'needs_manual'   => $policyResult['needs_manual'] ?? [],
         'admin_route'    => $adminRoute,
     ];
     save_flag($webroot . '/.migrating', $flag);
@@ -1227,6 +1268,97 @@ function mg_splice_htaccess_custom(string $stageHtaccess, string $customText): b
 }
 
 /**
+ * Pre-promote safety gate. Inspects the STAGED tree (the source of truth, not
+ * whatever the import step thought happened) and blocks the promote when a
+ * critical plugin a working admin needs is missing or disabled — the lockout in
+ * issue #13, where a failed admin2/api download or a disabled flex-objects gets
+ * swapped live over the working 1.7 install. Because everything is staged, the
+ * live site is untouched until promote, so blocking here costs nothing and turns
+ * a lockout into a recoverable "fix downloads and retry".
+ *
+ * @return array{ok: bool, problems: array<int, string>}
+ */
+function mg_validate_staged_critical(string $webroot, string $stageDir, array $flag): array
+{
+    $problems  = [];
+    $stageUser = $webroot . '/' . $stageDir . '/user';
+    $pt        = $flag['plugins_themes'] ?? [];
+
+    // Is a staged plugin present, and is it left enabled?
+    $state = static function (string $slug) use ($stageUser): array {
+        $dir = $stageUser . '/plugins/' . $slug;
+        if (!is_dir($dir) && !is_link($dir)) return ['present' => false, 'enabled' => false];
+        $cfg     = $stageUser . '/config/plugins/' . $slug . '.yaml';
+        $enabled = true;
+        if (is_file($cfg) && preg_match('/^enabled:\s*(false|0)\s*$/m', (string) @file_get_contents($cfg))) {
+            $enabled = false;
+        }
+        return ['present' => true, 'enabled' => $enabled];
+    };
+
+    // admin2 + api are required whenever the source had the 1.x admin (it gets
+    // superseded). Detect that from the recorded copy/replacement bookkeeping.
+    $sourcePlugins = $pt['copied']['plugins'] ?? [];
+    $replInstalled = $pt['replacements']['installed'] ?? [];
+    $replFailed    = $pt['replacements']['failed'] ?? [];
+    $failedSlugs   = array_map(static fn($f) => is_array($f) ? ($f[0] ?? '') : '', $replFailed);
+    $hadAdmin = in_array('admin', $sourcePlugins, true)
+        || array_key_exists('admin2', $replInstalled)
+        || in_array('admin2', $failedSlugs, true);
+
+    if ($hadAdmin) {
+        foreach (['admin2', 'api'] as $slug) {
+            $st = $state($slug);
+            if (!$st['present']) {
+                $problems[] = "Required plugin '{$slug}' is not installed in the staged site (its download likely failed). Promoting now would lock you out of admin.";
+            } elseif (!$st['enabled']) {
+                $problems[] = "Required plugin '{$slug}' is installed but disabled in the staged site.";
+            }
+        }
+    }
+
+    // Protected/required plugins the policy step refused to disable, or that the
+    // backstop couldn't bring to their 2.0 release — block only for the critical
+    // subset (the ones that actually gate admin login).
+    foreach (($pt['needs_manual'] ?? []) as $nm) {
+        $slug = is_array($nm) ? (string) ($nm['slug'] ?? '') : (string) $nm;
+        if (in_array($slug, MG_CRITICAL_PLUGINS, true)) {
+            $problems[] = "Required plugin '{$slug}' could not be upgraded to a Grav 2.0-compatible release. Update it manually before promoting.";
+        }
+    }
+    foreach (($pt['protected']['failed'] ?? []) as $f) {
+        $slug = is_array($f) ? (string) ($f[0] ?? '') : '';
+        if (in_array($slug, MG_CRITICAL_PLUGINS, true)) {
+            $problems[] = "Required plugin '{$slug}' could not be installed: " . (is_array($f) ? (string) ($f[1] ?? 'unknown') : 'unknown') . '.';
+        }
+    }
+
+    // Final truth check straight off the staged tree: a critical plugin that is
+    // present but disabled, or still below its 2.0 floor, is a lockout regardless
+    // of how it got that way (e.g. a needs_update slug the upgrade couldn't fix,
+    // which the policy step intentionally leaves enabled rather than disabling).
+    foreach (MG_CRITICAL_PLUGINS as $slug) {
+        if (in_array($slug, ['admin2', 'api'], true)) continue; // covered above
+        $st = $state($slug);
+        if (!$st['present']) continue; // not installed here => operator didn't use it
+        if (!$st['enabled']) {
+            $problems[] = "Required plugin '{$slug}' is disabled in the staged site.";
+            continue;
+        }
+        $entry = mg_lookup_registry_entry($slug);
+        $min   = is_array($entry) ? (string) ($entry['minimum_version'] ?? '') : '';
+        if ($min === '') continue;
+        $staged = (string) (mg_read_blueprint($stageUser . '/plugins/' . $slug . '/blueprints.yaml')['version'] ?? '');
+        if ($staged !== '' && version_compare($staged, $min, '<')) {
+            $problems[] = "Required plugin '{$slug}' is at v{$staged} but Grav 2.0 needs v{$min}+ — it couldn't be upgraded (likely a failed download).";
+        }
+    }
+
+    $problems = array_values(array_unique($problems));
+    return ['ok' => empty($problems), 'problems' => $problems];
+}
+
+/**
  * Promote the staged Grav 2.0 install to the webroot:
  *   1. Create {webroot}/backup-pre-2.0-{YYYYMMDD-HHMMSS}/
  *   2. Move every top-level entry at the webroot EXCEPT the stage dir and
@@ -1247,6 +1379,23 @@ function do_promote(string $webroot, array $flag, ?callable $progress = null): a
 
     if ($stageDir === '' || !is_dir($stagePath)) {
         return ['ok' => false, 'msg' => "Stage dir missing or invalid: {$stagePath}"];
+    }
+
+    // Critical-readiness gate. Refuse to swap a broken staged install over the
+    // working 1.7 one unless the operator explicitly overrides (force_promote).
+    // The live site stays put on a block, so this is always recoverable.
+    if (empty($flag['force_promote'])) {
+        $critical = mg_validate_staged_critical($webroot, $stageDir, $flag);
+        if (!$critical['ok']) {
+            return [
+                'ok'       => false,
+                'blocked'  => true,
+                'problems' => $critical['problems'],
+                'msg'      => 'Promote blocked — the staged Grav 2.0 site is missing required plugins, '
+                            . 'so swapping it in would lock you out. Your live 1.7 site has not been touched. '
+                            . 'Fix the downloads and re-run Step 2, or promote anyway to override.',
+            ];
+        }
     }
 
     // Restore the system.custom_base_url that do_content() blanked for the
@@ -3823,6 +3972,31 @@ function mg_http_context(array $http = [], array $ssl = []): mixed
 }
 
 /**
+ * Download a URL into memory with a few retries. Shared hosts routinely hit a
+ * transient TLS reset / GPM hiccup on the first try, and a single-shot
+ * file_get_contents() turns that into a failed plugin install (and, downstream,
+ * a disabled required plugin). Treats a body under $minBytes as a failure too —
+ * a 404/HTML error page is short and would otherwise be written out as a "zip".
+ *
+ * @return string|false The body on success, false after exhausting attempts.
+ */
+function mg_download_retry(string $url, $ctx, int $minBytes = 1024, int $attempts = 3)
+{
+    $delay = 1;
+    for ($i = 1; $i <= $attempts; $i++) {
+        $bytes = @file_get_contents($url, false, $ctx);
+        if ($bytes !== false && strlen($bytes) >= $minBytes) {
+            return $bytes;
+        }
+        if ($i < $attempts) {
+            sleep($delay);
+            $delay *= 2; // 1s, 2s back-off
+        }
+    }
+    return false;
+}
+
+/**
  * Download a zip of the default branch of <owner>/<repo> from GitHub and
  * extract its single top-level directory's contents into
  * {webroot}/{stageDir}/user/plugins/{slug}/.
@@ -3843,9 +4017,9 @@ function mg_fetch_and_install_github(string $webroot, string $stageDir, string $
         'header'        => "User-Agent: grav-migrate-wizard/1.0\r\nAccept: application/vnd.github+json\r\n",
         'ignore_errors' => false,
     ]);
-    $bytes = @file_get_contents($resolved['zipball'], false, $ctx);
-    if ($bytes === false || strlen($bytes) < 1024) {
-        return ['ok' => false, 'msg' => "Could not download {$repo} ({$resolved['source']})"];
+    $bytes = mg_download_retry($resolved['zipball'], $ctx);
+    if ($bytes === false) {
+        return ['ok' => false, 'msg' => "Could not download {$repo} ({$resolved['source']}) after retries"];
     }
     @file_put_contents($zipPath, $bytes);
 
@@ -3913,9 +4087,9 @@ function mg_install_zip_url(string $webroot, string $stageDir, string $kind, str
         'header'        => "User-Agent: grav-migrate-wizard/1.0\r\n",
         'ignore_errors' => false,
     ]);
-    $bytes = @file_get_contents($url, false, $ctx);
-    if ($bytes === false || strlen($bytes) < 1024) {
-        return ['ok' => false, 'msg' => "Could not download {$slug} from {$url}"];
+    $bytes = mg_download_retry($url, $ctx);
+    if ($bytes === false) {
+        return ['ok' => false, 'msg' => "Could not download {$slug} from {$url} after retries"];
     }
     @file_put_contents($zipPath, $bytes);
 
@@ -4297,13 +4471,131 @@ function mg_bulk_copy_user(string $srcUser, string $dstUser, int &$copied, ?call
  * ['skipped' => [...], 'disabled' => [...]] (bare slug names; caller
  * prefixes with "plugins/" for summary).
  */
+
+/**
+ * In-process plugin upgrade fallback for when `bin/gpm update` can't run
+ * (proc_open/shell disabled — the common shared-hosting case). Mirrors the
+ * themes path: for each installed plugin with a resolved 2.0 download URL,
+ * fetch the release zip and extract it into the staged tree. Skips symlinked
+ * and excluded (superseded) slugs.
+ *
+ * @return array<string, array{to: string, from: string}> upgraded, keyed by slug
+ */
+function mg_zip_update_plugins(string $webroot, string $stageDir, string $dstUser, array $scan, array $excludeSlugs, ?callable $progress): array
+{
+    $upgraded   = [];
+    $excludeSet = array_flip($excludeSlugs);
+
+    foreach (($scan['plugins'] ?? []) as $slug => $verdict) {
+        if (isset($excludeSet[$slug])) continue;
+
+        $update = $verdict['update'] ?? null;
+        if (!$update || empty($update['download']) || empty($update['to'])) continue;
+
+        $dst = $dstUser . '/plugins/' . $slug;
+        if (!is_dir($dst) || is_link($dst)) continue;
+
+        if ($progress) $progress(['phase' => 'start', 'entry' => "update/plugins/{$slug}"]);
+
+        $res = mg_install_zip_url($webroot, $stageDir, 'plugins', $slug, (string) $update['download']);
+        if ($res['ok']) {
+            $upgraded[$slug] = ['to' => (string) $update['to'], 'from' => (string) ($verdict['installed_version'] ?? '')];
+            if ($progress) $progress(['phase' => 'done-entry', 'entry' => "update/plugins/{$slug}"]);
+        } else {
+            if ($progress) $progress(['phase' => 'skip', 'entry' => "update/plugins/{$slug}", 'reason' => $res['msg']]);
+        }
+    }
+
+    return $upgraded;
+}
+
+/**
+ * Backstop the protected (required) plugins so a required dependency is never
+ * left at a 1.x version that the policy step would then disable — the lockout
+ * in issue #13. For each MG_PROTECTED_PLUGINS slug present in the staged tree,
+ * check its staged blueprint version against the baseline registry's
+ * minimum_version; if it's missing or below the floor, force-install from the
+ * registry's github_repo (which the retrying downloader makes resilient).
+ *
+ * Runs even when auto-update was declined and even when gpm DID run, because
+ * neither guarantees a required plugin actually reached its 2.0 release.
+ *
+ * @return array{upgraded: array<string, array{to: string, from: string}>, failed: array<int, array{0: string, 1: string}>}
+ */
+function mg_ensure_protected_upgraded(string $webroot, string $stageDir, string $dstUser, array $scan, ?callable $progress): array
+{
+    $upgraded = [];
+    $failed   = [];
+
+    foreach (MG_PROTECTED_PLUGINS as $slug) {
+        $dst = $dstUser . '/plugins/' . $slug;
+        // Only act on plugins the operator actually has staged. A symlinked
+        // slug is a dev clone — never touch it.
+        if (!is_dir($dst) || is_link($dst)) continue;
+
+        $entry = mg_lookup_registry_entry($slug);
+        $min   = is_array($entry) ? (string) ($entry['minimum_version'] ?? '') : '';
+        $repo  = is_array($entry) ? (string) ($entry['github_repo'] ?? '') : '';
+
+        $staged = (string) (mg_read_blueprint($dst . '/blueprints.yaml')['version'] ?? '');
+
+        // Already at/above the 2.0 floor (or no floor to enforce) — nothing to do.
+        if ($min === '' || ($staged !== '' && version_compare($staged, $min, '>='))) {
+            continue;
+        }
+        if ($repo === '') {
+            $failed[] = [$slug, "no github_repo in registry to reach v{$min}+"];
+            continue;
+        }
+
+        if ($progress) $progress(['phase' => 'start', 'entry' => "required/{$slug}"]);
+
+        // Prefer the GPM release zip if we have a resolved download, else the repo.
+        $update = $scan['plugins'][$slug]['update'] ?? null;
+        if (is_array($update) && !empty($update['download'])) {
+            $res = mg_install_zip_url($webroot, $stageDir, 'plugins', $slug, (string) $update['download']);
+            if ($res['ok']) $res['version'] = (string) ($update['to'] ?? '?');
+        } else {
+            $res = mg_fetch_and_install_github($webroot, $stageDir, $slug, $repo);
+        }
+
+        if ($res['ok']) {
+            $upgraded[$slug] = ['to' => (string) ($res['version'] ?? '?'), 'from' => $staged];
+            // Make sure the backstopped plugin is enabled — a 1.x disable flag
+            // carried over in the bulk copy would otherwise leave it dormant.
+            mg_write_plugin_enable($stageDir === '' ? $webroot : ($webroot . '/' . $stageDir), $slug);
+            if ($progress) $progress(['phase' => 'done-entry', 'entry' => "required/{$slug}", 'reason' => "ensured v{$min}+"]);
+        } else {
+            $failed[] = [$slug, (string) ($res['msg'] ?? 'install failed')];
+            if ($progress) $progress(['phase' => 'skip', 'entry' => "required/{$slug}", 'reason' => $res['msg'] ?? 'install failed']);
+        }
+    }
+
+    return ['upgraded' => $upgraded, 'failed' => $failed];
+}
+
+/**
+ * Flip a staged plugin's config to enabled: true (mirror of
+ * mg_write_plugin_disable). Used by the protected backstop so a required
+ * plugin a 1.x config disabled doesn't stay dormant after we reinstall it.
+ */
+function mg_write_plugin_enable(string $stageRoot, string $slug): void
+{
+    $file = $stageRoot . '/user/config/plugins/' . $slug . '.yaml';
+    if (!is_file($file)) return;
+    $raw = (string) @file_get_contents($file);
+    if (preg_match('/^enabled:\s*(false|0)\s*$/m', $raw)) {
+        @file_put_contents($file, preg_replace('/^enabled:\s*(false|0)\s*$/m', 'enabled: true', $raw, 1));
+    }
+}
+
 /**
  * Apply the chosen compat policy to staged plugins, using POST-UPGRADE
  * verdicts (mg_rescan_staged result). Symlinked dirs are left alone —
  * dev environments choose their own versions and we don't second-guess
  * them. Supersedes are handled in their own phase before this runs.
  *
- * Returns ['skipped', 'disabled', 'force_included'].
+ * Returns ['skipped', 'disabled', 'force_included', 'needs_manual'].
  */
 function mg_apply_plugin_policy(string $stageRoot, array $postScan, string $policy, string $mode, ?callable $progress): array
 {
@@ -4311,9 +4603,11 @@ function mg_apply_plugin_policy(string $stageRoot, array $postScan, string $poli
     $disabled      = [];
     $forceIncluded = []; // slugs that strict would have flagged as incompatible
                          // but the chosen mode promoted to compatible
+    $needsManual   = []; // protected/required slugs we refused to disable even
+                         // though they still read incompatible — reported, not killed
     $pluginDir     = $stageRoot . '/user/plugins';
     if (!is_dir($pluginDir)) {
-        return ['skipped' => $skipped, 'disabled' => $disabled, 'force_included' => $forceIncluded];
+        return ['skipped' => $skipped, 'disabled' => $disabled, 'force_included' => $forceIncluded, 'needs_manual' => $needsManual];
     }
 
     $verdicts = $postScan['plugins'] ?? [];
@@ -4345,6 +4639,20 @@ function mg_apply_plugin_policy(string $stageRoot, array $postScan, string $poli
 
         if ($effective === 'compatible' || $effective === 'needs_update') continue;
 
+        // Never disable or remove a protected/required plugin. The backstop
+        // (mg_ensure_protected_upgraded) already tried to bring it to its 2.0
+        // release; if it STILL reads incompatible here, disabling it is exactly
+        // the lockout from issue #13. Leave it enabled and flag it so the test
+        // and promote steps can warn the operator instead.
+        if (in_array($slug, MG_PROTECTED_PLUGINS, true)) {
+            $needsManual[] = [
+                'slug'   => $slug,
+                'reason' => (string) ($rawVerdict['reason'] ?? 'could not be upgraded to a 2.0-compatible release'),
+            ];
+            if ($progress) $progress(['phase' => 'log', 'entry' => $label, 'reason' => 'required plugin left enabled (needs manual update)']);
+            continue;
+        }
+
         if ($policy === 'skip') {
             remove_dir($slugDir);
             $skipped[] = $slug;
@@ -4356,7 +4664,7 @@ function mg_apply_plugin_policy(string $stageRoot, array $postScan, string $poli
         }
     }
 
-    return ['skipped' => $skipped, 'disabled' => $disabled, 'force_included' => $forceIncluded];
+    return ['skipped' => $skipped, 'disabled' => $disabled, 'force_included' => $forceIncluded, 'needs_manual' => $needsManual];
 }
 
 /**
@@ -4708,6 +5016,33 @@ function mg_baseline_registry(): array
             'api' => [
                 'grav'        => ['2.0'],
                 'github_repo' => 'getgrav/grav-plugin-api',
+            ],
+            // Stock plugins with a dedicated 2.0 line. Baked in so a failed
+            // curated-registry fetch (offline / shared-host TLS flakiness) can't
+            // make them read as 1.x-only and disable them. flex-objects is the
+            // important one — it's required by admin2/the Flex framework and
+            // only its 1.4.x+ line runs on Grav 2.0.
+            'flex-objects' => [
+                'grav'            => ['2.0'],
+                'minimum_version' => '1.4.0',
+                'github_repo'     => 'getgrav/grav-plugin-flex-objects',
+                'notes'           => 'Requires v1.4.0+ for Grav 2.0',
+            ],
+            'form' => [
+                'grav'        => ['2.0'],
+                'github_repo' => 'getgrav/grav-plugin-form',
+            ],
+            'login' => [
+                'grav'        => ['2.0'],
+                'github_repo' => 'getgrav/grav-plugin-login',
+            ],
+            'email' => [
+                'grav'        => ['2.0'],
+                'github_repo' => 'getgrav/grav-plugin-email',
+            ],
+            'problems' => [
+                'grav'        => ['2.0'],
+                'github_repo' => 'getgrav/grav-plugin-problems',
             ],
         ],
         'themes' => [],
@@ -5064,6 +5399,37 @@ function stream_promote_page(string $webroot, array $flag, string $token): void
         echo '<div class="mg-callout mg-callout-ok"><i class="mg-i-info"></i><div><strong>Migration complete.</strong> ' . htmlspecialchars($result['msg']) . ' &mdash; redirecting to the new install…</div></div>';
         echo '<script>window.location.replace(' . json_encode($base) . ');</script>';
         echo '<noscript><p><a href="' . htmlspecialchars($base) . '">Open the new Grav 2.0 install</a></p></noscript>';
+    } elseif (!empty($result['blocked'])) {
+        // Critical-readiness gate fired BEFORE any destructive work — the live
+        // 1.x site is fully intact. Show the specific problems, a path back
+        // (re-run Step 2 to retry downloads), and an explicit override.
+        echo '<div class="mg-callout mg-callout-warn"><i class="mg-i-warn"></i><div><strong>Promote blocked &mdash; your site is unchanged.</strong><br>'
+            . nl2br(htmlspecialchars((string) $result['msg'])) . '</div></div>';
+
+        if (!empty($result['problems'])) {
+            echo '<div class="mg-callout mg-callout-error"><i class="mg-i-warn"></i><div><strong>What needs fixing:</strong><ul style="margin:6px 0 0;padding-left:18px">';
+            foreach ((array) $result['problems'] as $p) {
+                echo '<li>' . htmlspecialchars((string) $p) . '</li>';
+            }
+            echo '</ul></div></div>';
+        }
+
+        echo '<div class="mg-callout mg-callout-info"><i class="mg-i-info"></i><div><strong>Recommended:</strong> re-run <em>Step 2: Copy &amp; Migrate</em> to retry the plugin downloads (a transient network error is the usual cause). On a host where this keeps failing, install the missing plugin(s) into the staged <code>'
+            . htmlspecialchars(trim((string) ($flag['stage_dir'] ?? 'grav-2'), '/'))
+            . '/user/plugins/</code> by hand, then promote.</div></div>';
+
+        // Explicit, deliberate override — re-submit promote with force_promote.
+        $extras = array_map('strval', (array) ($flag['root_extras'] ?? []));
+        echo '<form method="post" class="mg-form" style="margin-top:12px">';
+        echo '<input type="hidden" name="csrf_token" value="' . htmlspecialchars($token) . '">';
+        echo '<input type="hidden" name="action" value="promote">';
+        foreach ($extras as $ex) {
+            echo '<input type="hidden" name="root_extras[]" value="' . htmlspecialchars($ex) . '">';
+        }
+        echo '<input type="hidden" name="force_promote" value="1">';
+        echo '<button type="submit" class="mg-btn mg-btn-danger" onclick="return confirm(\'Promote the staged site anyway? You may be locked out of admin until you reinstall the missing plugins.\')">Promote anyway (override)</button>';
+        echo '<span class="mg-btn-note">Swaps the staged 2.0 site in despite the missing plugins. Only do this if you understand the risk.</span>';
+        echo '</form>';
     } else {
         // Render the failure message with newlines preserved so a multi-line
         // lock list (one path per row) reads cleanly. nl2br only inserts <br>
@@ -5298,8 +5664,9 @@ function render_wizard(array $flag, string $step, string $webroot, string $stage
             'ignore_user_abort() is blocked by disable_functions. If the connection drops or the proxy times out mid-step, '
             . 'the migration can abort half-applied. Keep this tab open and the connection alive; if a step fails, use Reset Migration to start clean.'],
         ['proc_open() available',      !mg_fn_disabled('proc_open'), 'warn',
-            'proc_open() is blocked by disable_functions. The plugin/theme update step shells out to the staged <code>bin/gpm</code> '
-            . 'and will be skipped — your plugins/themes get copied as-is without being upgraded to their 2.0 releases.'],
+            'proc_open() is blocked by disable_functions, so the staged <code>bin/gpm update</code> can\'t run. '
+            . 'The wizard falls back to an in-process installer that downloads each plugin\'s 2.0 release directly — '
+            . 'required plugins (flex-objects, login, …) are always upgraded this way, so this is a soft warning, not a blocker.'],
     ];
     // Only hard 'fail' rows gate the Extract button; warnings never block.
     $preflightOk = !array_filter($preflight, static fn($c) => !$c[1] && (($c[2] ?? 'fail') === 'fail'));

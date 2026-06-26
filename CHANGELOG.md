@@ -1,3 +1,12 @@
+# v1.0.3
+## 06-26-2026
+
+1. [](#bugfix)
+    * **Plugins now upgrade to their Grav 2.0 versions even when `proc_open()` is disabled.** On shared hosts that block shell access the wizard falls back to an in-process installer that downloads each plugin's 2.0 release directly, instead of skipping the upgrade. [#13]
+    * **Required plugins like Flex Objects are no longer disabled during migration.** Stock dependencies a working admin needs are force-upgraded to their 2.0 release and never disabled, so the site stays usable after promoting. [#13]
+    * **The promote step now refuses to swap in a broken site.** If a required plugin is missing or disabled in the staged install (usually a failed download), the wizard blocks the promote with a clear list of what to fix and leaves your live 1.x site untouched, with an explicit override available. [#13]
+    * **Plugin and theme downloads now retry on transient network errors.** A single dropped connection no longer turns into a failed plugin install. [#13]
+
 # v1.0.2
 ## 06-25-2026
 
