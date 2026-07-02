@@ -25,6 +25,13 @@ const MG_STEPS = ['staged', 'extracted', 'plugins_done', 'accounts_done', 'conte
 // top-level `const` statements execute in order, unlike function definitions.)
 const MG_IMPORT_DEFAULT  = ['pages', 'accounts', 'data', 'config', 'env', 'languages'];
 const MG_IMPORT_OPTIONAL = ['plugins', 'themes'];
+// Version-control metadata directories that belong to the deployment/webroot,
+// not to the Grav install. The promote must leave these in place (never back
+// them up, never delete them) so a version-controlled webroot keeps its repo
+// across the 1.x → 2.0 swap — otherwise the migration would wipe the user's
+// history (issue #15). Top-level only; a `.git` nested inside a plugin is part
+// of that plugin's tree and handled normally.
+const MG_PRESERVE_IN_PLACE = ['.git', '.svn', '.hg'];
 const MG_COMPAT_URL      = 'https://getgrav.org/gpm/compatibility/v1/_all';
 const MG_COMPAT_TARGET   = '2.0';
 const MG_COMPAT_TTL      = 900;
@@ -1425,7 +1432,9 @@ function mg_validate_staged_critical(string $webroot, string $stageDir, array $f
  *   1. Create {webroot}/backup-pre-2.0-{YYYYMMDD-HHMMSS}/
  *   2. Move every top-level entry at the webroot EXCEPT the stage dir and
  *      the new backup dir into the backup (this includes migrate.php itself,
- *      .migrating, .htaccess, system/, vendor/, user/, tmp/, logs/, etc.)
+ *      .migrating, .htaccess, system/, vendor/, user/, tmp/, logs/, etc.).
+ *      Version-control metadata (.git/.svn/.hg) is left in place, not deleted,
+ *      so a version-controlled webroot keeps its repo across the swap (#15).
  *   3. Move every top-level entry from the stage dir up to the webroot.
  *   4. Remove the empty stage dir.
  *
@@ -1582,10 +1591,18 @@ function do_promote(string $webroot, array $flag, ?callable $progress = null): a
         return ['ok' => false, 'msg' => $msg, 'locked' => $locked];
     }
 
-    $deleted = [];
+    $deleted   = [];
+    $preserved = [];
     foreach (scandir($webroot) ?: [] as $entry) {
         if ($entry === '.' || $entry === '..') continue;
         if ($entry === $stageDir) continue;
+        // Leave version-control metadata untouched so a git-managed webroot
+        // keeps its repo across the swap (issue #15). The staged 2.0 tree has
+        // no .git of its own, so Phase 3 never collides with what we keep here.
+        if (in_array($entry, MG_PRESERVE_IN_PLACE, true)) {
+            $preserved[] = $entry;
+            continue;
+        }
 
         if ($progress) $progress(['phase' => 'copy', 'entry' => 'clear', 'file' => $entry, 'copied' => $added]);
         $path = $webroot . '/' . $entry;
@@ -1643,6 +1660,9 @@ function do_promote(string $webroot, array $flag, ?callable $progress = null): a
     }
     if ($cbRestore !== null) {
         $msg .= ' Restored system.custom_base_url (' . $cbRestore . ') now that the site is back at the original webroot.';
+    }
+    if ($preserved !== []) {
+        $msg .= ' Left version control in place (' . implode(', ', $preserved) . ') — your webroot repo is intact.';
     }
 
     return [
@@ -1732,6 +1752,15 @@ function mg_zip_webroot(ZipArchive $zip, string $webroot, string $skipTop, int &
                     if (strpos($path, $webroot . DIRECTORY_SEPARATOR . $skipTop . DIRECTORY_SEPARATOR) === 0
                         || $path === $webroot . DIRECTORY_SEPARATOR . $skipTop) {
                         return false;
+                    }
+                    // Skip top-level VCS metadata — it's preserved in place across
+                    // the promote (issue #15), so there's no reason to also fold a
+                    // potentially huge repo into the backup zip.
+                    foreach (MG_PRESERVE_IN_PLACE as $vcs) {
+                        if ($path === $webroot . DIRECTORY_SEPARATOR . $vcs
+                            || strpos($path, $webroot . DIRECTORY_SEPARATOR . $vcs . DIRECTORY_SEPARATOR) === 0) {
+                            return false;
+                        }
                     }
                     return true;
                 }
@@ -6262,6 +6291,20 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
             echo '<form method="post" onsubmit="return confirm(\'Promote Grav 2.0 to live? Existing install will be zipped up to backup/ and then removed from the webroot. Revert requires manually extracting the backup zip.\');">';
             echo '<input type="hidden" name="action" value="promote">';
             echo '<input type="hidden" name="token"  value="' . htmlspecialchars($token) . '">';
+
+            // If the webroot is under version control, reassure the operator it
+            // survives the swap (issue #15) — it's preserved in place, not backed
+            // up and deleted, so it isn't in the carry-forward list below.
+            $vcsPresent = array_values(array_filter(
+                MG_PRESERVE_IN_PLACE,
+                static fn($v) => is_dir($webroot . '/' . $v)
+            ));
+            if ($vcsPresent !== []) {
+                echo '<div class="mg-callout mg-callout-info"><i class="mg-i-info"></i><div>'
+                   . 'Your webroot is under version control (<code>' . htmlspecialchars(implode('</code>, <code>', $vcsPresent)) . '</code>). '
+                   . 'It stays in place during promote, so your repo and its history are kept — the new Grav 2.0 files will simply show up as changes to review and commit.'
+                   . '</div></div>';
+            }
 
             // Optional: carry forward operator-authored root files/folders that
             // the migration doesn't otherwise touch (issue #9). Grav-managed

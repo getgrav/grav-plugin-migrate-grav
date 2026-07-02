@@ -3,6 +3,7 @@
 
 1. [](#bugfix)
     * **Migrated accounts keep the admin language they were using before.** Classic admin stored each user's language on their account, but Admin 2.0 reads it from a different place, so the accounts step now copies that preference across instead of letting everyone fall back to the site default. [grav-plugin-admin2#98]
+    * **A version-controlled webroot keeps its `.git` repo through the migration.** The promote step deleted every top-level entry except the staged install when swapping Grav 2.0 in, which wiped a `.git` (or `.svn`/`.hg`) directory at the webroot root — so a site deployed via git lost its repository and history, with no way to opt out since VCS folders were never shown in the carry-forward list. Promote now leaves version-control metadata in place (neither backed up nor deleted), so your repo survives and the new 2.0 files simply show up as changes to review and commit; the promote screen also notes when it detects a repo. [#15]
 
 # v1.0.4
 ## 07-02-2026
