@@ -1,3 +1,9 @@
+# v1.0.5
+## 07-02-2026
+
+1. [](#bugfix)
+    * **Migrated accounts keep the admin language they were using before.** Classic admin stored each user's language on their account, but Admin 2.0 reads it from a different place, so the accounts step now copies that preference across instead of letting everyone fall back to the site default. [grav-plugin-admin2#98]
+
 # v1.0.4
 ## 07-02-2026
 
