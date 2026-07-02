@@ -806,6 +806,7 @@ function do_accounts(string $webroot, array $flag, array $options, ?callable $pr
     $migratePerms = !empty($options['migrate_perms']);
     $count = 0;
     $mirrored = 0;
+    $langsMigrated = 0;
     $details = [];
 
     foreach (scandir($dst) ?: [] as $entry) {
@@ -824,6 +825,16 @@ function do_accounts(string $webroot, array $flag, array $options, ?callable $pr
             $mirrored += $added;
             $details[$entry] = $added;
         }
+
+        // Always carry the classic per-user admin UI language over. Classic
+        // admin stored it at the top-level `language:` key; admin2 reads it
+        // from `admin_next.preferences.adminLanguage`, so without this a user
+        // who ran the admin in e.g. German would silently drop back to the
+        // site default after migrating (grav-plugin-admin2#98).
+        if (mg_migrate_account_language($path)) {
+            $langsMigrated++;
+        }
+
         $count++;
 
         if ($progress) $progress(['phase' => 'done-entry', 'entry' => "accounts/{$entry}", 'added' => $details[$entry] ?? 0]);
@@ -834,6 +845,7 @@ function do_accounts(string $webroot, array $flag, array $options, ?callable $pr
         'at'             => time(),
         'count'          => $count,
         'migrated_perms' => $mirrored,
+        'migrated_langs' => $langsMigrated,
         'skipped_perms'  => !$migratePerms,
         'details'        => $details,
     ];
@@ -842,6 +854,7 @@ function do_accounts(string $webroot, array $flag, array $options, ?callable $pr
     $msg = "Processed {$count} account file(s)";
     if ($migratePerms) $msg .= "; mirrored {$mirrored} admin.* → api.* permission(s)";
     else               $msg .= "; permission mirroring skipped";
+    if ($langsMigrated) $msg .= "; carried {$langsMigrated} admin language preference(s) into Admin 2.0";
     return ['ok' => true, 'msg' => $msg . '.'];
 }
 
@@ -893,6 +906,55 @@ function mg_migrate_account_perms(string $src, string $dst): int
 
     @file_put_contents($dst, $out);
     return $added;
+}
+
+/**
+ * Carry a classic account's admin UI language into admin2's preference store.
+ *
+ * Classic admin persisted the per-user admin language at the top-level
+ * `language:` key of the account yaml. Admin 2.0 reads it from
+ * `admin_next.preferences.adminLanguage` (see PreferencesResolver), so a
+ * migrated account keeps its top-level `language` but admin2 never consults it
+ * and falls back to the site default. This copies that value across in place.
+ *
+ * The top-level `language` is left untouched (non-destructive, and Grav core
+ * still uses it). An `admin_next.preferences.adminLanguage` that's already set
+ * is respected rather than overwritten. Returns true if a value was written.
+ */
+function mg_migrate_account_language(string $path): bool
+{
+    mg_ensure_yaml_available();
+
+    if (!class_exists('Symfony\\Component\\Yaml\\Yaml')) { return false; }
+
+    $raw = @file_get_contents($path);
+    if ($raw === false) { return false; }
+
+    try {
+        $data = \Symfony\Component\Yaml\Yaml::parse($raw);
+    } catch (\Throwable) { return false; }
+    if (!is_array($data)) { return false; }
+
+    $lang = $data['language'] ?? null;
+    if (!is_string($lang) || trim($lang) === '') { return false; }
+    // Match PreferencesResolver's coercion (non-empty string, max 32 chars).
+    $lang = substr(trim($lang), 0, 32);
+
+    $adminNext = (isset($data['admin_next']) && is_array($data['admin_next'])) ? $data['admin_next'] : [];
+    $prefs = (isset($adminNext['preferences']) && is_array($adminNext['preferences'])) ? $adminNext['preferences'] : [];
+
+    // Respect a language the user already picked in admin2.
+    if (isset($prefs['adminLanguage']) && is_string($prefs['adminLanguage']) && $prefs['adminLanguage'] !== '') {
+        return false;
+    }
+
+    $prefs['adminLanguage'] = $lang;
+    $adminNext['preferences'] = $prefs;
+    $data['admin_next'] = $adminNext;
+
+    $out = \Symfony\Component\Yaml\Yaml::dump($data, 6, 2);
+    @file_put_contents($path, $out);
+    return true;
 }
 
 /**
