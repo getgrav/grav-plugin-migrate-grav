@@ -3972,19 +3972,91 @@ function mg_http_context(array $http = [], array $ssl = []): mixed
 }
 
 /**
- * Download a URL into memory with a few retries. Shared hosts routinely hit a
- * transient TLS reset / GPM hiccup on the first try, and a single-shot
- * file_get_contents() turns that into a failed plugin install (and, downstream,
- * a disabled required plugin). Treats a body under $minBytes as a failure too —
- * a 404/HTML error page is short and would otherwise be written out as a "zip".
+ * Fetch a URL into memory, preferring PHP's stream wrapper but falling back to
+ * cURL when allow_url_fopen is disabled — the common case on restrictive shared
+ * hosting. Without this fallback every remote fetch here (curated registry, GPM
+ * index, GitHub release lookup, plugin/theme zips) silently returns false on
+ * such hosts, so the in-process installer downloads nothing and required plugins
+ * like admin2/api/flex-objects never make it into the staged site. classes/
+ * Kickoff.php already mirrors this logic for the main Grav 2.0 zip download,
+ * which is why staging succeeds while the plugin installs used to fail. [#14]
  *
+ * $http mirrors the options mg_http_context() understands: 'timeout',
+ * 'header' (CRLF-joined request headers) and 'ignore_errors' (when false, a
+ * 4xx/5xx becomes a failed fetch rather than the error body).
+ *
+ * @return string|false The response body on success, false on any failure.
+ */
+function mg_http_get(string $url, array $http = [])
+{
+    // Preferred path: PHP stream wrapper, when the host permits it.
+    if (filter_var(ini_get('allow_url_fopen'), FILTER_VALIDATE_BOOLEAN)) {
+        return @file_get_contents($url, false, mg_http_context($http));
+    }
+
+    // Fallback: cURL. Mirrors classes/Kickoff.php's downloadViaCurl(), including
+    // its proxy/cafile handling, so both download paths behave identically.
+    if (!function_exists('curl_init')) {
+        return false;
+    }
+    $ch = curl_init($url);
+    if ($ch === false) {
+        return false;
+    }
+
+    $timeout   = (int) ($http['timeout'] ?? 20);
+    $ignoreErr = (bool) ($http['ignore_errors'] ?? false);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS      => 5,
+        CURLOPT_CONNECTTIMEOUT => min($timeout, 30),
+        CURLOPT_TIMEOUT        => max($timeout, 1),
+        CURLOPT_FAILONERROR    => !$ignoreErr, // match stream 'ignore_errors' semantics
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+    ]);
+
+    // Forward the request headers built for the stream path (User-Agent, Accept).
+    // GitHub's API 403s a request with no User-Agent, so this matters.
+    $headerLines = array_values(array_filter(array_map('trim',
+        preg_split('/\r\n|\r|\n/', (string) ($http['header'] ?? '')))));
+    if ($headerLines) {
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headerLines);
+    }
+
+    // Honor the same proxy config the stream path applies via mg_http_context().
+    $proxy = mg_proxy_config();
+    if ($proxy['url'] !== '') {
+        curl_setopt($ch, CURLOPT_PROXY, $proxy['url']);
+        $certPath = $proxy['cert_path'];
+        if ($certPath !== '') {
+            if (is_file($certPath))    curl_setopt($ch, CURLOPT_CAINFO, $certPath);
+            elseif (is_dir($certPath)) curl_setopt($ch, CURLOPT_CAPATH, $certPath);
+        }
+    }
+
+    $body = curl_exec($ch);
+    curl_close($ch);
+    return $body === false ? false : $body;
+}
+
+/**
+ * Download a URL into memory with a few retries. Shared hosts routinely hit a
+ * transient TLS reset / GPM hiccup on the first try, and a single-shot fetch
+ * turns that into a failed plugin install (and, downstream, a disabled required
+ * plugin). Treats a body under $minBytes as a failure too — a 404/HTML error
+ * page is short and would otherwise be written out as a "zip". Fetches through
+ * mg_http_get() so the cURL fallback applies on allow_url_fopen-disabled hosts.
+ *
+ * @param array $http HTTP options (timeout/header/ignore_errors), as mg_http_get().
  * @return string|false The body on success, false after exhausting attempts.
  */
-function mg_download_retry(string $url, $ctx, int $minBytes = 1024, int $attempts = 3)
+function mg_download_retry(string $url, array $http, int $minBytes = 1024, int $attempts = 3)
 {
     $delay = 1;
     for ($i = 1; $i <= $attempts; $i++) {
-        $bytes = @file_get_contents($url, false, $ctx);
+        $bytes = mg_http_get($url, $http);
         if ($bytes !== false && strlen($bytes) >= $minBytes) {
             return $bytes;
         }
@@ -4012,12 +4084,11 @@ function mg_fetch_and_install_github(string $webroot, string $stageDir, string $
     // record version as "1.0.0" — sentinel for "pre-release install".
     $resolved = mg_github_resolve_download($repo);
 
-    $ctx = mg_http_context([
+    $bytes = mg_download_retry($resolved['zipball'], [
         'timeout'       => 20,
         'header'        => "User-Agent: grav-migrate-wizard/1.0\r\nAccept: application/vnd.github+json\r\n",
         'ignore_errors' => false,
     ]);
-    $bytes = mg_download_retry($resolved['zipball'], $ctx);
     if ($bytes === false) {
         return ['ok' => false, 'msg' => "Could not download {$repo} ({$resolved['source']}) after retries"];
     }
@@ -4082,12 +4153,11 @@ function mg_install_zip_url(string $webroot, string $stageDir, string $kind, str
     $safeSlug = preg_replace('/[^a-z0-9\-]/i', '_', $slug);
     $zipPath  = $tmp . '/update-' . $safeKind . '-' . $safeSlug . '.zip';
 
-    $ctx = mg_http_context([
+    $bytes = mg_download_retry($url, [
         'timeout'       => 25,
         'header'        => "User-Agent: grav-migrate-wizard/1.0\r\n",
         'ignore_errors' => false,
     ]);
-    $bytes = mg_download_retry($url, $ctx);
     if ($bytes === false) {
         return ['ok' => false, 'msg' => "Could not download {$slug} from {$url} after retries"];
     }
@@ -4141,14 +4211,14 @@ function mg_install_zip_url(string $webroot, string $stageDir, string $kind, str
  */
 function mg_github_resolve_download(string $repo): array
 {
-    $ctx = mg_http_context([
+    $http = [
         'timeout'       => 6,
         'header'        => "User-Agent: grav-migrate-wizard/1.0\r\nAccept: application/vnd.github+json\r\n",
         'ignore_errors' => true,
-    ]);
+    ];
 
     // Tier 1: /releases/latest (excludes pre-releases by GitHub's design).
-    $raw = @file_get_contents("https://api.github.com/repos/{$repo}/releases/latest", false, $ctx);
+    $raw = mg_http_get("https://api.github.com/repos/{$repo}/releases/latest", $http);
     if ($raw !== false) {
         $data = json_decode($raw, true);
         if (is_array($data) && !empty($data['zipball_url'])) {
@@ -4164,7 +4234,7 @@ function mg_github_resolve_download(string $repo): array
     // Tier 2: /releases — newest non-draft entry, pre-releases included.
     // GitHub orders the list by created_at desc by default, so the first
     // non-draft release is the newest tag.
-    $raw = @file_get_contents("https://api.github.com/repos/{$repo}/releases?per_page=10", false, $ctx);
+    $raw = mg_http_get("https://api.github.com/repos/{$repo}/releases?per_page=10", $http);
     if ($raw !== false) {
         $list = json_decode($raw, true);
         if (is_array($list)) {
@@ -4947,12 +5017,11 @@ function mg_fetch_gpm_index(string $kind, string $gravVersion = '', string $phpV
         'php'     => $phpVersion  !== '' ? $phpVersion  : PHP_VERSION,
         'testing' => 1,
     ]);
-    $ctx = mg_http_context([
+    $raw = mg_http_get($url, [
         'timeout'       => 6,
         'ignore_errors' => true,
         'header'        => "User-Agent: grav-migrate-wizard/1.0\r\n",
     ]);
-    $raw = @file_get_contents($url, false, $ctx);
     if ($raw === false) return null;
     $data = json_decode($raw, true);
     if (!is_array($data)) return null;
@@ -4979,12 +5048,11 @@ function mg_fetch_gpm_index(string $kind, string $gravVersion = '', string $phpV
  */
 function mg_fetch_curated(): ?array
 {
-    $ctx = mg_http_context([
+    $raw = mg_http_get(MG_COMPAT_URL, [
         'timeout'       => 4,
         'ignore_errors' => true,
         'header'        => "User-Agent: grav-migrate-wizard/1.0\r\n",
     ]);
-    $raw = @file_get_contents(MG_COMPAT_URL, false, $ctx);
     if ($raw === false) return null;
 
     $data = json_decode($raw, true);
@@ -5025,7 +5093,12 @@ function mg_baseline_registry(): array
             'flex-objects' => [
                 'grav'            => ['2.0'],
                 'minimum_version' => '1.4.0',
-                'github_repo'     => 'getgrav/grav-plugin-flex-objects',
+                // Lives under trilbymedia, not getgrav — the getgrav path 404s,
+                // which used to drop the GitHub fallback to an untagged
+                // default-branch zip (version sentinel 1.0.0) that then failed
+                // the v1.4.0+ floor. The primary GPM path is still preferred;
+                // this only matters when the GPM index is unreachable. [#14]
+                'github_repo'     => 'trilbymedia/grav-plugin-flex-objects',
                 'notes'           => 'Requires v1.4.0+ for Grav 2.0',
             ],
             'form' => [
@@ -5652,6 +5725,27 @@ function render_wizard(array $flag, string $step, string $webroot, string $stage
         . 'Remedy: raise max_execution_time (and your php-fpm request_terminate_timeout / proxy read timeout) for this site, '
         . 'then reload this page.';
 
+    // Outbound HTTP capability. Every download the wizard performs — the Grav
+    // 2.0 zip and each required 2.0 plugin (admin2, api, flex-objects, …) —
+    // needs a way out to the network. mg_http_get() uses PHP's stream wrapper
+    // when allow_url_fopen is on, else falls back to cURL; the staged bin/gpm
+    // update (when proc_open is available) needs the same. Only when BOTH are
+    // missing is there genuinely no path out, and the migration cannot
+    // complete — so this is the one download-related HARD failure. Note this is
+    // the same capability Grav's own GPM relies on, so a host with a working
+    // admin/GPM will pass here (its curl extension is what we fall back to).
+    $allowUrlFopen = filter_var(ini_get('allow_url_fopen'), FILTER_VALIDATE_BOOLEAN);
+    $hasCurl       = function_exists('curl_init');
+    $canFetch      = $allowUrlFopen || $hasCurl;
+    $fetchHint = 'Neither <code>allow_url_fopen</code> nor the PHP <code>curl</code> extension is available, so the wizard '
+        . 'has no way to download the Grav 2.0 zip or the required 2.0 plugins (admin2, api, flex-objects, …). '
+        . 'The migration cannot complete on this host as configured. '
+        . 'Remedy: enable the PHP <code>curl</code> extension (this is what your existing Grav admin\'s GPM already uses) '
+        . 'or turn on <code>allow_url_fopen</code>. If neither can be changed on the web server, run the migration from the '
+        . 'command line — <code>bin/plugin migrate-grav init</code> — where CLI PHP commonly has these enabled; or download '
+        . 'the Grav 2.0 zip by hand, set <code>source_local_zip</code> in the plugin config, and hand-install the missing 2.0 '
+        . 'plugins into <code>' . htmlspecialchars(trim($stageDir, '/')) . '/user/plugins/</code> before promoting.';
+
     $preflight = [
         ['webroot writable',           is_writable($webroot)],
         ['staged zip present',         is_file($webroot . '/' . ltrim($stagedZip, '/'))],
@@ -5659,6 +5753,7 @@ function render_wizard(array $flag, string $step, string $webroot, string $stage
         ['stage dir writable / absent', !is_dir($stageDirAbs) || is_writable($stageDirAbs)],
         ['PHP version >= 8.3',         version_compare(PHP_VERSION, '8.3.0', '>=')],
         ['zip extension loaded',       extension_loaded('zip')],
+        ['outbound downloads (allow_url_fopen or cURL)', $canFetch, 'fail', $fetchHint],
         ['set_time_limit() available', !$stlOff, 'warn', $stlHint],
         ['ignore_user_abort() available', !mg_fn_disabled('ignore_user_abort'), 'warn',
             'ignore_user_abort() is blocked by disable_functions. If the connection drops or the proxy times out mid-step, '

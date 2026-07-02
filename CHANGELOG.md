@@ -1,3 +1,11 @@
+# v1.0.4
+## 07-02-2026
+
+1. [](#bugfix)
+    * **The in-process plugin installer now works on hosts with `allow_url_fopen` disabled.** The 1.0.3 fallback that installs each plugin's 2.0 release when `proc_open()` is blocked still fetched every URL with PHP's stream wrapper, so on restrictive shared hosts that also disable `allow_url_fopen` (a common pairing) the curated registry, the GPM index, the GitHub release lookup, and the plugin/theme zip downloads all silently returned nothing — admin2/api never installed and flex-objects couldn't upgrade, so the promote guard correctly blocked with "missing required plugins" and the migration dead-ended. Every remote fetch in the wizard now falls back to cURL when `allow_url_fopen` is off, mirroring the staging download that already did — the same transport Grav's own GPM uses, so a host with a working admin/GPM can now download here too. [#14]
+    * **flex-objects now upgrades to its 2.0 release even when the GPM index is unreachable.** The baseline registry pointed flex-objects at `getgrav/grav-plugin-flex-objects`, but the repo lives under `trilbymedia` — the wrong path 404s, so the GitHub fallback dropped to an untagged default-branch zip (version sentinel `1.0.0`) that then failed the required v1.4.0+ floor and blocked the promote. The primary path (the getgrav.org GPM release zip) is unchanged and preferred; the registry owner is corrected so the GitHub fallback also resolves a real tagged release when the GPM index can't be fetched. [#14]
+    * **The pre-flight check now hard-fails up front when the host truly can't download.** `proc_open` and `allow_url_fopen` each have a working fallback, so neither alone blocks a migration; the one condition that genuinely can't complete is when *both* `allow_url_fopen` is off *and* the PHP `curl` extension is missing — there's then no way out to fetch the Grav 2.0 zip or the required 2.0 plugins. Step 1 now surfaces this as a red, blocking check with the reason and concrete remedies (enable `curl` or `allow_url_fopen`, run `bin/plugin migrate-grav init` from the CLI, or stage the zip and plugins by hand), instead of letting the migration proceed and silently dead-end at promote. [#14]
+
 # v1.0.3
 ## 06-26-2026
 
