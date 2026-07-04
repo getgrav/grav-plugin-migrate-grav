@@ -25,6 +25,13 @@ const MG_STEPS = ['staged', 'extracted', 'plugins_done', 'accounts_done', 'conte
 // top-level `const` statements execute in order, unlike function definitions.)
 const MG_IMPORT_DEFAULT  = ['pages', 'accounts', 'data', 'config', 'env', 'languages'];
 const MG_IMPORT_OPTIONAL = ['plugins', 'themes'];
+// Version-control metadata directories that belong to the deployment/webroot,
+// not to the Grav install. The promote must leave these in place (never back
+// them up, never delete them) so a version-controlled webroot keeps its repo
+// across the 1.x → 2.0 swap — otherwise the migration would wipe the user's
+// history (issue #15). Top-level only; a `.git` nested inside a plugin is part
+// of that plugin's tree and handled normally.
+const MG_PRESERVE_IN_PLACE = ['.git', '.svn', '.hg'];
 const MG_COMPAT_URL      = 'https://getgrav.org/gpm/compatibility/v1/_all';
 const MG_COMPAT_TARGET   = '2.0';
 const MG_COMPAT_TTL      = 900;
@@ -806,6 +813,7 @@ function do_accounts(string $webroot, array $flag, array $options, ?callable $pr
     $migratePerms = !empty($options['migrate_perms']);
     $count = 0;
     $mirrored = 0;
+    $langsMigrated = 0;
     $details = [];
 
     foreach (scandir($dst) ?: [] as $entry) {
@@ -824,6 +832,16 @@ function do_accounts(string $webroot, array $flag, array $options, ?callable $pr
             $mirrored += $added;
             $details[$entry] = $added;
         }
+
+        // Always carry the classic per-user admin UI language over. Classic
+        // admin stored it at the top-level `language:` key; admin2 reads it
+        // from `admin_next.preferences.adminLanguage`, so without this a user
+        // who ran the admin in e.g. German would silently drop back to the
+        // site default after migrating (grav-plugin-admin2#98).
+        if (mg_migrate_account_language($path)) {
+            $langsMigrated++;
+        }
+
         $count++;
 
         if ($progress) $progress(['phase' => 'done-entry', 'entry' => "accounts/{$entry}", 'added' => $details[$entry] ?? 0]);
@@ -834,6 +852,7 @@ function do_accounts(string $webroot, array $flag, array $options, ?callable $pr
         'at'             => time(),
         'count'          => $count,
         'migrated_perms' => $mirrored,
+        'migrated_langs' => $langsMigrated,
         'skipped_perms'  => !$migratePerms,
         'details'        => $details,
     ];
@@ -842,6 +861,7 @@ function do_accounts(string $webroot, array $flag, array $options, ?callable $pr
     $msg = "Processed {$count} account file(s)";
     if ($migratePerms) $msg .= "; mirrored {$mirrored} admin.* → api.* permission(s)";
     else               $msg .= "; permission mirroring skipped";
+    if ($langsMigrated) $msg .= "; carried {$langsMigrated} admin language preference(s) into Admin 2.0";
     return ['ok' => true, 'msg' => $msg . '.'];
 }
 
@@ -893,6 +913,55 @@ function mg_migrate_account_perms(string $src, string $dst): int
 
     @file_put_contents($dst, $out);
     return $added;
+}
+
+/**
+ * Carry a classic account's admin UI language into admin2's preference store.
+ *
+ * Classic admin persisted the per-user admin language at the top-level
+ * `language:` key of the account yaml. Admin 2.0 reads it from
+ * `admin_next.preferences.adminLanguage` (see PreferencesResolver), so a
+ * migrated account keeps its top-level `language` but admin2 never consults it
+ * and falls back to the site default. This copies that value across in place.
+ *
+ * The top-level `language` is left untouched (non-destructive, and Grav core
+ * still uses it). An `admin_next.preferences.adminLanguage` that's already set
+ * is respected rather than overwritten. Returns true if a value was written.
+ */
+function mg_migrate_account_language(string $path): bool
+{
+    mg_ensure_yaml_available();
+
+    if (!class_exists('Symfony\\Component\\Yaml\\Yaml')) { return false; }
+
+    $raw = @file_get_contents($path);
+    if ($raw === false) { return false; }
+
+    try {
+        $data = \Symfony\Component\Yaml\Yaml::parse($raw);
+    } catch (\Throwable) { return false; }
+    if (!is_array($data)) { return false; }
+
+    $lang = $data['language'] ?? null;
+    if (!is_string($lang) || trim($lang) === '') { return false; }
+    // Match PreferencesResolver's coercion (non-empty string, max 32 chars).
+    $lang = substr(trim($lang), 0, 32);
+
+    $adminNext = (isset($data['admin_next']) && is_array($data['admin_next'])) ? $data['admin_next'] : [];
+    $prefs = (isset($adminNext['preferences']) && is_array($adminNext['preferences'])) ? $adminNext['preferences'] : [];
+
+    // Respect a language the user already picked in admin2.
+    if (isset($prefs['adminLanguage']) && is_string($prefs['adminLanguage']) && $prefs['adminLanguage'] !== '') {
+        return false;
+    }
+
+    $prefs['adminLanguage'] = $lang;
+    $adminNext['preferences'] = $prefs;
+    $data['admin_next'] = $adminNext;
+
+    $out = \Symfony\Component\Yaml\Yaml::dump($data, 6, 2);
+    @file_put_contents($path, $out);
+    return true;
 }
 
 /**
@@ -1363,7 +1432,9 @@ function mg_validate_staged_critical(string $webroot, string $stageDir, array $f
  *   1. Create {webroot}/backup-pre-2.0-{YYYYMMDD-HHMMSS}/
  *   2. Move every top-level entry at the webroot EXCEPT the stage dir and
  *      the new backup dir into the backup (this includes migrate.php itself,
- *      .migrating, .htaccess, system/, vendor/, user/, tmp/, logs/, etc.)
+ *      .migrating, .htaccess, system/, vendor/, user/, tmp/, logs/, etc.).
+ *      Version-control metadata (.git/.svn/.hg) is left in place, not deleted,
+ *      so a version-controlled webroot keeps its repo across the swap (#15).
  *   3. Move every top-level entry from the stage dir up to the webroot.
  *   4. Remove the empty stage dir.
  *
@@ -1520,10 +1591,18 @@ function do_promote(string $webroot, array $flag, ?callable $progress = null): a
         return ['ok' => false, 'msg' => $msg, 'locked' => $locked];
     }
 
-    $deleted = [];
+    $deleted   = [];
+    $preserved = [];
     foreach (scandir($webroot) ?: [] as $entry) {
         if ($entry === '.' || $entry === '..') continue;
         if ($entry === $stageDir) continue;
+        // Leave version-control metadata untouched so a git-managed webroot
+        // keeps its repo across the swap (issue #15). The staged 2.0 tree has
+        // no .git of its own, so Phase 3 never collides with what we keep here.
+        if (in_array($entry, MG_PRESERVE_IN_PLACE, true)) {
+            $preserved[] = $entry;
+            continue;
+        }
 
         if ($progress) $progress(['phase' => 'copy', 'entry' => 'clear', 'file' => $entry, 'copied' => $added]);
         $path = $webroot . '/' . $entry;
@@ -1581,6 +1660,9 @@ function do_promote(string $webroot, array $flag, ?callable $progress = null): a
     }
     if ($cbRestore !== null) {
         $msg .= ' Restored system.custom_base_url (' . $cbRestore . ') now that the site is back at the original webroot.';
+    }
+    if ($preserved !== []) {
+        $msg .= ' Left version control in place (' . implode(', ', $preserved) . ') — your webroot repo is intact.';
     }
 
     return [
@@ -1670,6 +1752,15 @@ function mg_zip_webroot(ZipArchive $zip, string $webroot, string $skipTop, int &
                     if (strpos($path, $webroot . DIRECTORY_SEPARATOR . $skipTop . DIRECTORY_SEPARATOR) === 0
                         || $path === $webroot . DIRECTORY_SEPARATOR . $skipTop) {
                         return false;
+                    }
+                    // Skip top-level VCS metadata — it's preserved in place across
+                    // the promote (issue #15), so there's no reason to also fold a
+                    // potentially huge repo into the backup zip.
+                    foreach (MG_PRESERVE_IN_PLACE as $vcs) {
+                        if ($path === $webroot . DIRECTORY_SEPARATOR . $vcs
+                            || strpos($path, $webroot . DIRECTORY_SEPARATOR . $vcs . DIRECTORY_SEPARATOR) === 0) {
+                            return false;
+                        }
                     }
                     return true;
                 }
@@ -6200,6 +6291,20 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
             echo '<form method="post" onsubmit="return confirm(\'Promote Grav 2.0 to live? Existing install will be zipped up to backup/ and then removed from the webroot. Revert requires manually extracting the backup zip.\');">';
             echo '<input type="hidden" name="action" value="promote">';
             echo '<input type="hidden" name="token"  value="' . htmlspecialchars($token) . '">';
+
+            // If the webroot is under version control, reassure the operator it
+            // survives the swap (issue #15) — it's preserved in place, not backed
+            // up and deleted, so it isn't in the carry-forward list below.
+            $vcsPresent = array_values(array_filter(
+                MG_PRESERVE_IN_PLACE,
+                static fn($v) => is_dir($webroot . '/' . $v)
+            ));
+            if ($vcsPresent !== []) {
+                echo '<div class="mg-callout mg-callout-info"><i class="mg-i-info"></i><div>'
+                   . 'Your webroot is under version control (<code>' . htmlspecialchars(implode('</code>, <code>', $vcsPresent)) . '</code>). '
+                   . 'It stays in place during promote, so your repo and its history are kept — the new Grav 2.0 files will simply show up as changes to review and commit.'
+                   . '</div></div>';
+            }
 
             // Optional: carry forward operator-authored root files/folders that
             // the migration doesn't otherwise touch (issue #9). Grav-managed
