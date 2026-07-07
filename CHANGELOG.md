@@ -1,3 +1,9 @@
+# v1.0.8
+## 07-07-2026
+
+1. [](#improved)
+    * **The Step 5 content summary is now a readable list instead of a wall of text.** The post-migration summary — everything the content step enabled, widened, removed, and flagged — was assembled as one long run-on paragraph, so the important NOTEs about unmapped sandbox methods and plugin-provided Twig functions were buried mid-sentence. It now renders as a lead line plus one bullet per action, with config keys/paths set in code and NOTE/WARNING lines given a subtle accent, so what needs your attention stands out at a glance.
+
 # v1.0.7
 ## 07-07-2026
 
