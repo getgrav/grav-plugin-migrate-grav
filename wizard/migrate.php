@@ -448,7 +448,9 @@ function stream_extract_page(string $webroot, array $flag, string $token): void
         $qs   = http_build_query(['token' => $token, 'flash' => 'extracted', 'msg' => $result['msg']]);
         $url  = base_path_from_script() . $self . '?' . $qs;
 
-        echo '<div class="mg-callout mg-callout-ok"><i class="mg-i-info"></i><div><strong>Done.</strong> ' . htmlspecialchars($result['msg']) . ' &mdash; redirecting…</div></div>';
+        // The full (formatted) summary renders on the redirect target; here we
+        // only flash a brief confirmation before the immediate redirect.
+        echo '<div class="mg-callout mg-callout-ok"><i class="mg-i-info"></i><div><strong>Done.</strong> Redirecting…</div></div>';
         echo '<script>window.location.replace(' . json_encode($url) . ');</script>';
         echo '<noscript><p><a href="' . htmlspecialchars($url) . '">Continue</a></p></noscript>';
     } else {
@@ -2118,7 +2120,14 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
     ];
     save_flag($webroot . '/.migrating', $flag);
 
-    $msg = 'Content already migrated in Step 2 — ' . count($entries) . ' top-level entries under staged user/.';
+    // Build the summary as discrete segments (one statement each) rather than
+    // one long paragraph, so the wizard can render them as a readable list
+    // instead of a wall of text. The first segment is the lead line; the rest
+    // are individual notes. Segments are newline-joined for transport (the flash
+    // round-trips through a URL) and split back out at render time — see
+    // mg_render_msg_segments().
+    $parts = [];
+    $parts[] = 'Content already migrated in Step 2 — ' . count($entries) . ' top-level entries under staged user/.';
     if ($twigScan['process_enabled']) {
         $reasons = [];
         if ($twigScan['pages_with_twig'] > 0) {
@@ -2130,16 +2139,16 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
         if (!empty($twigScan['frontmatter_twig'])) {
             $reasons[] = 'system.yaml pages.frontmatter.process_twig was on';
         }
-        $msg .= ' Enabled security.twig_content.process_enabled (' . implode('; ', $reasons) . ').';
+        $parts[] = 'Enabled security.twig_content.process_enabled (' . implode('; ', $reasons) . ').';
     }
     if ($twigScan['config_access']) {
-        $msg .= ' Enabled security.twig_content.config_access (found `config.` usage in ' . count($twigScan['config_pages']) . ' page(s)).';
+        $parts[] = 'Enabled security.twig_content.config_access (found `config.` usage in ' . count($twigScan['config_pages']) . ' page(s)).';
     }
 
     // Twig function/filter seeding.
     $safeAdded = array_merge($twigScan['safe_functions_added'] ?? [], $twigScan['safe_filters_added'] ?? []);
     if ($safeAdded) {
-        $msg .= ' Added ' . count($safeAdded) . ' PHP function(s) to system.twig.safe_functions/safe_filters ('
+        $parts[] = 'Added ' . count($safeAdded) . ' PHP function(s) to system.twig.safe_functions/safe_filters ('
               . implode(', ', $safeAdded) . ') so they stay callable in Twig.';
     }
     $addedFns = $twigScan['sandbox_functions_added'] ?? [];
@@ -2148,49 +2157,49 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
         $bits = [];
         if ($addedFns) $bits[] = count($addedFns) . ' function(s)';
         if ($addedFls) $bits[] = count($addedFls) . ' filter(s)';
-        $msg .= ' Widened security.twig_sandbox allowlist (' . implode(', ', $bits) . ') so page content can use them.';
+        $parts[] = 'Widened security.twig_sandbox allowlist (' . implode(', ', $bits) . ') so page content can use them.';
     }
     $addedMethods = $twigScan['sandbox_methods_added'] ?? [];
     if ($addedMethods) {
         // The standard documented media chain is allow-listed by Grav 2.0 core
         // (getgrav/grav#4164) and is skipped here; what remains are object
         // methods your content used that 2.0 defaults do not already permit.
-        $msg .= ' Added ' . count($addedMethods) . ' object method(s) not already covered by 2.0 defaults to security.twig_sandbox.allowed_methods ('
+        $parts[] = 'Added ' . count($addedMethods) . ' object method(s) not already covered by 2.0 defaults to security.twig_sandbox.allowed_methods ('
               . implode(', ', $addedMethods) . ').';
     }
     $unresolvedMethods = $twigScan['sandbox_methods_unresolved'] ?? [];
     if ($unresolvedMethods) {
-        $msg .= ' NOTE: ' . count($unresolvedMethods) . ' method call(s) in content could not be mapped to a sandbox class ('
+        $parts[] = 'NOTE: ' . count($unresolvedMethods) . ' method call(s) in content could not be mapped to a sandbox class ('
               . implode(', ', $unresolvedMethods) . '). If these are on custom objects, add them to'
               . ' security.twig_sandbox.allowed_methods under the right class by hand, or they will fail after migration.';
     }
     $plugin = $twigScan['sandbox_plugin_funcs'] ?? [];
     if ($plugin) {
-        $msg .= ' NOTE: ' . count($plugin) . ' name(s) in content are not PHP functions (' . implode(', ', $plugin)
+        $parts[] = 'NOTE: ' . count($plugin) . ' name(s) in content are not PHP functions (' . implode(', ', $plugin)
               . ') — these are plugin-provided Twig functions. The providing plugin must register them (ideally via'
               . ' the onBuildTwigSandboxPolicy event); otherwise they will still fail after migration.';
     }
     $fromContent = $twigScan['sandbox_from_content'] ?? [];
     if ($fromContent && !empty($twigScan['undefined_functions_was_on'])) {
-        $msg .= ' Your source site had system.twig.undefined_functions ON, and ' . count($fromContent)
+        $parts[] = 'Your source site had system.twig.undefined_functions ON, and ' . count($fromContent)
               . ' name(s) used in content were not in your safe_functions list — review the additions and remove any you do not trust.';
     }
     $blockedDanger = $twigScan['sandbox_blocked_dangerous'] ?? [];
     if ($blockedDanger) {
-        $msg .= ' Did NOT add ' . count($blockedDanger) . ' dangerous function(s) Grav 2.0 always refuses ('
+        $parts[] = 'Did NOT add ' . count($blockedDanger) . ' dangerous function(s) Grav 2.0 always refuses ('
               . implode(', ', $blockedDanger) . ') — those content usages will not work and must be reworked.';
     }
     $blocked = $twigScan['sandbox_blocked'] ?? [];
     if ($blocked) {
-        $msg .= ' Did NOT allowlist ' . count($blocked) . ' function(s) the content sandbox blocks by design ('
+        $parts[] = 'Did NOT allowlist ' . count($blocked) . ' function(s) the content sandbox blocks by design ('
               . implode(', ', $blocked) . ').';
     }
     $stripped = $twigScan['system_twig_undefined_stripped'] ?? [];
     if ($stripped) {
-        $msg .= ' Removed dead 1.x key(s) from system.yaml: ' . implode(', ', $stripped) . '.';
+        $parts[] = 'Removed dead 1.x key(s) from system.yaml: ' . implode(', ', $stripped) . '.';
     }
     if (!empty($twigScan['system_twig_warning'])) {
-        $msg .= ' WARNING (system.yaml): ' . $twigScan['system_twig_warning'] . '.';
+        $parts[] = 'WARNING (system.yaml): ' . $twigScan['system_twig_warning'] . '.';
     }
 
     // Point the operator at the Grav 2.0 Admin report for follow-up. It lists any
@@ -2198,7 +2207,7 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
     // "Add to allowlist", and a content scan — the precise, render-time view that
     // supersedes this migration-time heuristic for anything left to resolve.
     if ($twigScan['process_enabled']) {
-        $msg .= ' Follow up in Admin under Tools → Reports → "Twig in Content": it shows any pages still leaking raw Twig and lets you allow-list blocked members in one click.';
+        $parts[] = 'Follow up in Admin under Tools → Reports → "Twig in Content": it shows any pages still leaking raw Twig and lets you allow-list blocked members in one click.';
     }
 
     // URL-based image actions (system.images.url_actions).
@@ -2206,31 +2215,31 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
         $where = [];
         if (!empty($mediaScan['page_hits']))     $where[] = count($mediaScan['page_hits']) . ' page(s)';
         if (!empty($mediaScan['template_hits'])) $where[] = count($mediaScan['template_hits']) . ' template(s)';
-        $msg .= ' Enabled system.images.url_actions — found URL-based image transforms that bypass the media object (e.g. `image.jpg?'
+        $parts[] = 'Enabled system.images.url_actions — found URL-based image transforms that bypass the media object (e.g. `image.jpg?'
               . ($mediaScan['actions'][0] ?? 'cropResize') . '=…`) in ' . implode(' and ', $where)
               . '. Grav 2.0 disables these by default; without the toggle those images would stop transforming after migration.';
     } elseif ($mediaScan['already_on']) {
-        $msg .= ' system.images.url_actions was already on — left as-is.';
+        $parts[] = 'system.images.url_actions was already on — left as-is.';
     }
     if (!empty($mediaScan['oversized'])) {
-        $msg .= ' NOTE: ' . count($mediaScan['oversized']) . ' of those request the image above the system.images.max_pixels ceiling ('
+        $parts[] = 'NOTE: ' . count($mediaScan['oversized']) . ' of those request the image above the system.images.max_pixels ceiling ('
               . number_format($mediaScan['max_pixels']) . 'px) and will still be refused — raise max_pixels or rework them.';
     }
     if (!empty($mediaScan['warning'])) {
-        $msg .= ' WARNING (system.yaml images): ' . $mediaScan['warning'] . '.';
+        $parts[] = 'WARNING (system.yaml images): ' . $mediaScan['warning'] . '.';
     }
 
     // Custom base URL handling for the staged preview.
     if (!empty($cbResult['stash'])) {
-        $msg .= ' Temporarily cleared system.custom_base_url (' . $cbResult['was']
+        $parts[] = 'Temporarily cleared system.custom_base_url (' . $cbResult['was']
               . ') so the staged preview at /' . $stageDir . '/ loads without a redirect loop;'
               . ' it will be restored automatically when you promote to the live webroot.';
     }
     if (!empty($cbResult['warning'])) {
-        $msg .= ' WARNING (system.yaml custom_base_url): ' . $cbResult['warning'] . '.';
+        $parts[] = 'WARNING (system.yaml custom_base_url): ' . $cbResult['warning'] . '.';
     }
 
-    return ['ok' => true, 'msg' => $msg];
+    return ['ok' => true, 'msg' => implode("\n", $parts)];
 }
 
 /**
@@ -5590,7 +5599,9 @@ function mg_stream_finish(array $result, string $token, string $flashKey): void
         $self = basename($_SERVER['SCRIPT_NAME'] ?? 'migrate.php');
         $qs   = http_build_query(['token' => $token, 'flash' => $flashKey, 'msg' => $result['msg']]);
         $url  = base_path_from_script() . $self . '?' . $qs;
-        echo '<div class="mg-callout mg-callout-ok"><i class="mg-i-info"></i><div><strong>Done.</strong> ' . htmlspecialchars($result['msg']) . ' &mdash; redirecting…</div></div>';
+        // The full (formatted) summary renders on the redirect target; here we
+        // only flash a brief confirmation before the immediate redirect.
+        echo '<div class="mg-callout mg-callout-ok"><i class="mg-i-info"></i><div><strong>Done.</strong> Redirecting…</div></div>';
         echo '<script>window.location.replace(' . json_encode($url) . ');</script>';
         echo '<noscript><p><a href="' . htmlspecialchars($url) . '">Continue</a></p></noscript>';
     } else {
@@ -5858,6 +5869,48 @@ function mg_rewind_to(string $webroot, array &$flag, string $target): void
 // Renderers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Render a summary flash message as a readable lead line plus a bulleted list
+ * of the remaining notes, rather than one run-on paragraph. do_content() (and
+ * the other steps) build their summary as newline-joined segments — the first
+ * is the lead, each subsequent line is one note. A single-segment message (most
+ * flashes) renders as a plain lead line with no list. Text is HTML-escaped;
+ * `backtick` spans become <code> and NOTE/WARNING lines get a subtle accent.
+ */
+function mg_render_msg_segments(string $msg): string
+{
+    $segments = array_values(array_filter(
+        array_map('trim', explode("\n", $msg)),
+        static fn($s) => $s !== ''
+    ));
+    if (!$segments) {
+        return '';
+    }
+
+    $fmt = static function (string $s): string {
+        $s = htmlspecialchars($s, ENT_QUOTES);
+        // Render `code` spans (the message uses backticks for config keys/paths).
+        return preg_replace('/`([^`]+)`/', '<code>$1</code>', $s) ?? $s;
+    };
+
+    $lead = array_shift($segments);
+    $html = '<div class="mg-msg-lead">' . $fmt($lead) . '</div>';
+    if ($segments) {
+        $html .= '<ul class="mg-msg-list">';
+        foreach ($segments as $s) {
+            $cls = '';
+            if (str_starts_with($s, 'WARNING')) {
+                $cls = ' class="mg-msg-warn"';
+            } elseif (str_starts_with($s, 'NOTE') || str_starts_with($s, 'Did NOT')) {
+                $cls = ' class="mg-msg-note"';
+            }
+            $html .= '<li' . $cls . '>' . $fmt($s) . '</li>';
+        }
+        $html .= '</ul>';
+    }
+    return $html;
+}
+
 function render_error_page(string $title, string $body): void
 {
     page_header($title);
@@ -5958,7 +6011,6 @@ function render_wizard(array $flag, string $step, string $webroot, string $stage
         $type = in_array($flash['type'], $successKeys, true)
             ? 'ok'
             : ($flash['type'] === 'error' ? 'error' : 'warn');
-        $msg = htmlspecialchars($flash['msg'] ?: ucfirst($flash['type']));
 
         // Map flash type → the just-completed step's flag key, so we can
         // expand the rich breakdown inline beneath the success message.
@@ -5970,7 +6022,7 @@ function render_wizard(array $flag, string $step, string $webroot, string $stage
         $detailsKey = $detailsMap[$flash['type']] ?? null;
 
         echo '<div class="mg-callout mg-callout-' . $type . '"><i class="mg-i-info"></i><div>';
-        echo '<div>' . $msg . '</div>';
+        echo mg_render_msg_segments($flash['msg'] ?: ucfirst($flash['type']));
 
         if ($detailsKey && isset($flag[$detailsKey])) {
             echo '<details class="mg-details mg-flash-details"><summary>Show what was copied / skipped / disabled</summary>';
@@ -6796,6 +6848,14 @@ function page_css(): string
     .mg-callout-warn  { background: #fffaf0; border-left: 4px solid #f7a600; color: #5a4a1f; }
     .mg-callout-error { background: #fff1f1; border-left: 4px solid #d94141; color: #762222; }
     .mg-callout code  { background: rgba(0,0,0,0.05); padding: 1px 5px; border-radius: 3px; }
+    .mg-msg-lead { font-weight: 600; }
+    .mg-msg-list { margin: 8px 0 0; padding: 0; list-style: none; }
+    .mg-msg-list li { position: relative; padding: 5px 0 5px 18px; }
+    .mg-msg-list li + li { border-top: 1px solid rgba(0,0,0,0.06); }
+    .mg-msg-list li::before { content: ""; position: absolute; left: 4px; top: 12px;
+        width: 5px; height: 5px; border-radius: 50%; background: currentColor; opacity: 0.45; }
+    .mg-msg-list li.mg-msg-note { color: #5a4a1f; }
+    .mg-msg-list li.mg-msg-warn { color: #8a2f2f; font-weight: 600; }
     .mg-i-info, .mg-i-warn { flex: 0 0 auto; width: 18px; height: 18px; border-radius: 50%;
         display: inline-block; position: relative; margin-top: 1px; }
     .mg-i-info { background: #5b3ea8; }
