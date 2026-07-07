@@ -3776,15 +3776,22 @@ function mg_set_system_images_url_actions(string $systemYaml, array &$result): v
         return;
     }
 
-    // Walk the images: children looking for an existing url_actions: key.
-    // Capture the *direct* child indent from the first child line only. Later
-    // lines can be more deeply nested (the `cls:` / `defaults:` / `watermark:`
-    // sub-maps), so reusing the last-seen indent for the insert would push
-    // url_actions past its siblings — e.g. inserting at 4 spaces above
-    // `adapter: gd` at 2 spaces — and corrupt the block (RocketTheme YAML
-    // throws "Indentation problem near ...").
-    $childIndent  = '';
-    $directIndent = -1;
+    // Walk the images: children, capturing (a) the block's true direct-child
+    // indent and (b) any existing url_actions: key.
+    //
+    // The direct-child indent is the *shallowest* child indent in the block, not
+    // the first child's: a buggy earlier build (< 1.0.7) inserted url_actions at
+    // the indent of the last, deeply-nested line it scanned (a `cls:` /
+    // `defaults:` / `watermark:` sub-key), landing it at four spaces directly
+    // above `adapter: gd` at two — mixed indentation that Grav refuses to boot
+    // on ("Indentation problem near ..."). Taking the shallowest indent recovers
+    // the intended level even when the first line we meet is that stray key, so
+    // we can both insert correctly AND repair a file an earlier run corrupted.
+    $directIndentStr = '';
+    $minIndent       = PHP_INT_MAX;
+    $urlIdx          = -1;
+    $urlVal          = '';
+    $urlIndent       = -1;
     $n = count($lines);
     for ($j = $imagesStart + 1; $j < $n; $j++) {
         $line = $lines[$j];
@@ -3792,35 +3799,37 @@ function mg_set_system_images_url_actions(string $systemYaml, array &$result): v
         if ($trimmed === '' || $trimmed[0] === '#') continue;
         $indent = strlen($line) - strlen(ltrim($line, " \t"));
         if ($indent === 0) break;                       // left the images: block
-        if ($directIndent === -1) {
-            $directIndent = $indent;
-            $childIndent  = substr($line, 0, $indent);
+        if ($indent < $minIndent) {
+            $minIndent       = $indent;
+            $directIndentStr = substr($line, 0, $indent);
         }
-        // Only a direct child at the block's own indent is images.url_actions;
-        // a url_actions key nested inside a sub-map is something else.
-        if ($indent === $directIndent
-            && preg_match('/^([ \t]+)url_actions:[ \t]*(.*)$/', $line, $km)) {
-            if ($isTruthy($valueOf($km[2]))) {
-                $result['already_on'] = true;           // nothing to do
-                return;
-            }
-            $lines[$j] = $km[1] . 'url_actions: true';
-            $out = implode($eol, $lines);
-            if (!mg_yaml_text_is_valid($out)) {
-                $result['warning'] = 'skipped images.url_actions edit — result would not parse as YAML; set `images.url_actions: true` by hand';
-                return;
-            }
-            if (mg_atomic_write($systemYaml, $out, $result)) {
-                $result['enabled'] = true;
-            }
-            return;
+        if ($urlIdx === -1 && preg_match('/^[ \t]+url_actions:[ \t]*(.*)$/', $line, $km)) {
+            $urlIdx    = $j;
+            $urlVal    = $valueOf($km[1]);
+            $urlIndent = $indent;
         }
     }
 
-    // images: block exists but no url_actions key — insert as first child,
-    // using the block's own child indent (default two spaces).
-    if ($childIndent === '') $childIndent = '  ';
-    array_splice($lines, $imagesStart + 1, 0, [$childIndent . 'url_actions: true']);
+    // No children at all — insert as the first child at two spaces.
+    if ($minIndent === PHP_INT_MAX) {
+        $directIndentStr = '  ';
+    }
+
+    if ($urlIdx !== -1) {
+        // Key already present. It's genuinely done only when it sits at the
+        // block's own indent AND is truthy; otherwise re-emit it correctly —
+        // this both flips a false value on and repairs a stray indent left by an
+        // earlier build, so re-running the migration heals a corrupted file.
+        if ($urlIndent === $minIndent && $isTruthy($urlVal)) {
+            $result['already_on'] = true;
+            return;
+        }
+        $lines[$urlIdx] = $directIndentStr . 'url_actions: true';
+    } else {
+        // images: block exists but no url_actions key — insert as first child.
+        array_splice($lines, $imagesStart + 1, 0, [$directIndentStr . 'url_actions: true']);
+    }
+
     $out = implode($eol, $lines);
     if (!mg_yaml_text_is_valid($out)) {
         $result['warning'] = 'skipped images.url_actions edit — result would not parse as YAML; set `images.url_actions: true` by hand';
