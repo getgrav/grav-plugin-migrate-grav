@@ -1,3 +1,10 @@
+# v1.0.6
+## 07-07-2026
+
+1. [](#bugfix)
+    * **A migrated site no longer boots to a blank page / 500 when URL image-actions are detected.** Enabling `system.images.url_actions` rewrote the staged `system.yaml` by hand, but it took its insert indentation from the *last* line it scanned inside the `images:` block — which is a deeply nested key in the `cls:` / `defaults:` / `watermark:` sub-maps — so `url_actions: true` landed at four spaces directly above `adapter: gd` at two. That mixed indentation is invalid YAML, and Grav 2.0 refuses to boot (`Indentation problem near "adapter: gd"`), so the whole staged site went blank until the operator reset the config to defaults. The writer now takes the indent from the block's first direct child, so the key lands correctly aligned. This hit essentially every migration where content used query-string image transforms.
+    * **Surgical `system.yaml` edits are now validated before they're written.** The migrator edits config as raw text (to preserve your comments and formatting rather than flattening everything through a parse/dump), but a mis-computed indent could still emit YAML that Grav then won't load. Every surgical write to `system.yaml` — both the `images.url_actions` toggle and the `security.twig_*` changes — now parses the result first and skips the write with a clear warning if it wouldn't load, so a bad edit can never blank the migrated site.
+
 # v1.0.5
 ## 07-04-2026
 
