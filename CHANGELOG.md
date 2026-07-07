@@ -1,5 +1,8 @@
-# v1.0.6
+# v1.0.7
 ## 07-07-2026
+
+1. [](#bugfix)
+    * **Re-running the migration now repairs a `system.yaml` an earlier build had already corrupted.** The 1.0.6 indentation fix stopped *new* corruption, but a site migrated with the buggy build still had the broken `images:` block on disk — and re-running did nothing, because the writer saw a `url_actions:` key already present and bailed as "already on", leaving it mis-indented and the site blank. The writer now derives the block's real indent from its shallowest child (so a stray key can't throw it off), and re-emits `url_actions: true` at the correct indentation whenever the existing key is mis-indented or set to a false value. Re-running the content step over an already-broken staged install now heals it. (Sites already promoted to live with the broken config must fix `system.yaml` by hand or restore the backup and re-migrate on 1.0.7.)
 
 1. [](#bugfix)
     * **A migrated site no longer boots to a blank page / 500 when URL image-actions are detected.** Enabling `system.images.url_actions` rewrote the staged `system.yaml` by hand, but it took its insert indentation from the *last* line it scanned inside the `images:` block — which is a deeply nested key in the `cls:` / `defaults:` / `watermark:` sub-maps — so `url_actions: true` landed at four spaces directly above `adapter: gd` at two. That mixed indentation is invalid YAML, and Grav 2.0 refuses to boot (`Indentation problem near "adapter: gd"`), so the whole staged site went blank until the operator reset the config to defaults. The writer now takes the indent from the block's first direct child, so the key lands correctly aligned. This hit essentially every migration where content used query-string image transforms.
