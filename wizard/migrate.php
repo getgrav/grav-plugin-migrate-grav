@@ -3376,6 +3376,13 @@ function mg_rewrite_system_twig_keys(string $systemYaml, array $stripKeys, array
         return $stripped;
     }
 
+    // Never ship system.yaml we can't prove parses — a mis-computed indent here
+    // would blank the migrated site. Skip the write and warn instead.
+    if (!mg_yaml_text_is_valid($modified)) {
+        $result['system_twig_warning'] = 'skipped twig security edits to system.yaml — result would not parse as YAML; apply the security.twig_* changes by hand';
+        return [];
+    }
+
     // Atomic write: temp file + rename.
     $tmp = $systemYaml . '.tmp.' . getmypid();
     if (@file_put_contents($tmp, $modified) === false) {
@@ -3759,6 +3766,10 @@ function mg_set_system_images_url_actions(string $systemYaml, array &$result): v
             $prefix .= $eol;
         }
         $block = $prefix . 'images:' . $eol . '  url_actions: true' . $eol;
+        if (!mg_yaml_text_is_valid($raw . $block)) {
+            $result['warning'] = 'skipped images.url_actions edit — result would not parse as YAML; set `images.url_actions: true` by hand';
+            return;
+        }
         if (mg_atomic_append($systemYaml, $block, $result)) {
             $result['enabled'] = true;
         }
@@ -3766,7 +3777,14 @@ function mg_set_system_images_url_actions(string $systemYaml, array &$result): v
     }
 
     // Walk the images: children looking for an existing url_actions: key.
-    $childIndent = '  ';
+    // Capture the *direct* child indent from the first child line only. Later
+    // lines can be more deeply nested (the `cls:` / `defaults:` / `watermark:`
+    // sub-maps), so reusing the last-seen indent for the insert would push
+    // url_actions past its siblings — e.g. inserting at 4 spaces above
+    // `adapter: gd` at 2 spaces — and corrupt the block (RocketTheme YAML
+    // throws "Indentation problem near ...").
+    $childIndent  = '';
+    $directIndent = -1;
     $n = count($lines);
     for ($j = $imagesStart + 1; $j < $n; $j++) {
         $line = $lines[$j];
@@ -3774,24 +3792,69 @@ function mg_set_system_images_url_actions(string $systemYaml, array &$result): v
         if ($trimmed === '' || $trimmed[0] === '#') continue;
         $indent = strlen($line) - strlen(ltrim($line, " \t"));
         if ($indent === 0) break;                       // left the images: block
-        $childIndent = substr($line, 0, $indent);
-        if (preg_match('/^([ \t]+)url_actions:[ \t]*(.*)$/', $line, $km)) {
+        if ($directIndent === -1) {
+            $directIndent = $indent;
+            $childIndent  = substr($line, 0, $indent);
+        }
+        // Only a direct child at the block's own indent is images.url_actions;
+        // a url_actions key nested inside a sub-map is something else.
+        if ($indent === $directIndent
+            && preg_match('/^([ \t]+)url_actions:[ \t]*(.*)$/', $line, $km)) {
             if ($isTruthy($valueOf($km[2]))) {
                 $result['already_on'] = true;           // nothing to do
                 return;
             }
             $lines[$j] = $km[1] . 'url_actions: true';
-            if (mg_atomic_write($systemYaml, implode($eol, $lines), $result)) {
+            $out = implode($eol, $lines);
+            if (!mg_yaml_text_is_valid($out)) {
+                $result['warning'] = 'skipped images.url_actions edit — result would not parse as YAML; set `images.url_actions: true` by hand';
+                return;
+            }
+            if (mg_atomic_write($systemYaml, $out, $result)) {
                 $result['enabled'] = true;
             }
             return;
         }
     }
 
-    // images: block exists but no url_actions key — insert as first child.
+    // images: block exists but no url_actions key — insert as first child,
+    // using the block's own child indent (default two spaces).
+    if ($childIndent === '') $childIndent = '  ';
     array_splice($lines, $imagesStart + 1, 0, [$childIndent . 'url_actions: true']);
-    if (mg_atomic_write($systemYaml, implode($eol, $lines), $result)) {
+    $out = implode($eol, $lines);
+    if (!mg_yaml_text_is_valid($out)) {
+        $result['warning'] = 'skipped images.url_actions edit — result would not parse as YAML; set `images.url_actions: true` by hand';
+        return;
+    }
+    if (mg_atomic_write($systemYaml, $out, $result)) {
         $result['enabled'] = true;
+    }
+}
+
+/**
+ * Does this text parse as valid YAML?
+ *
+ * The surgical system.yaml editors preserve the operator's comments and
+ * formatting by rewriting raw text rather than round-tripping through a
+ * parse→dump (which would flatten every explanatory comment in Grav's default
+ * config). The cost of that is a mis-computed indent can emit YAML that Grav
+ * then refuses to boot on — a blank/500 site. So every surgical write is gated
+ * on this check: if the result won't parse, we skip the write and warn instead
+ * of shipping config that breaks the migrated site. Uses the same Symfony Yaml
+ * the rest of the wizard relies on; if it can't be loaded we can't validate, so
+ * we conservatively allow the write (the edits are otherwise well-formed).
+ */
+function mg_yaml_text_is_valid(string $text): bool
+{
+    mg_ensure_yaml_available();
+    if (!class_exists('Symfony\\Component\\Yaml\\Yaml')) {
+        return true; // no parser available — can't validate, don't block
+    }
+    try {
+        \Symfony\Component\Yaml\Yaml::parse($text);
+        return true;
+    } catch (\Throwable) {
+        return false;
     }
 }
 
