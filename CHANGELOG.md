@@ -1,5 +1,8 @@
-# v1.0.8
-## 07-07-2026
+# v1.0.9
+## 07-09-2026
+
+1. [](#bugfix)
+    * **An interrupted promote no longer corrupts the site — the swap is now crash-safe and resumable.** The final promote ran as one blocking request that deleted the whole live install and *then* moved the staged Grav 2.0 tree up in its place. A proxy/PHP-FPM 503/504 (or any hard worker kill) partway through left a half-swapped webroot with no way back: 2.0's `user/` live while `system/`/`vendor/`/`bin/` were missing or stale (Admin 2.0 UI but a 1.7 version string, broken GPM, "failed to load users/logs/reports"), and `assets/`+`backup/` gone. The swap now moves the old install *aside* into a quarantine dir with atomic renames instead of deleting it, writes a journal before the first destructive step, and keeps `migrate.php`/`.migrating` in place until the very end — so nothing is ever unrecoverable, and re-opening the wizard offers a **Finish promoting** button that completes the swap forward from exactly where it stopped (or you can restore the backup zip to roll back). The old install is deleted only after the 2.0 tree is fully in place, and `assets/`+`backup/` are recreated writable so a migrated site never boots to a "not writeable" error. [#17]
 
 1. [](#improved)
     * **The Step 5 content summary is now a readable list instead of a wall of text.** The post-migration summary — everything the content step enabled, widened, removed, and flagged — was assembled as one long run-on paragraph, so the important NOTEs about unmapped sandbox methods and plugin-provided Twig functions were buried mid-sentence. It now renders as a lead line plus one bullet per action, with config keys/paths set in code and NOTE/WARNING lines given a subtle accent, so what needs your attention stands out at a glance.

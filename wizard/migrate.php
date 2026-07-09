@@ -236,6 +236,16 @@ if (isset($_GET['flash'])) {
     $flash = ['type' => (string) $_GET['flash'], 'msg' => (string) ($_GET['msg'] ?? '')];
 }
 
+// A promote journal on disk means a previous promote committed to the swap but
+// was interrupted mid-way (proxy/PHP-FPM 503/504, worker kill). The 1.x install
+// is set aside in quarantine, not deleted, and the swap can be finished by
+// re-running promote. Show a focused "finish the promote" screen instead of the
+// normal step view, which would otherwise scan a half-swapped webroot (#17).
+if (mg_read_promote_journal($webroot . '/.mg-promote.json') !== null) {
+    render_promote_resume($webroot, $expected);
+    exit(0);
+}
+
 render_wizard($flag, $step, $webroot, $stageDir, $stagedZip, $flagPath, $expected, $flash);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1430,23 +1440,51 @@ function mg_validate_staged_critical(string $webroot, string $stageDir, array $f
 }
 
 /**
- * Promote the staged Grav 2.0 install to the webroot:
- *   1. Create {webroot}/backup-pre-2.0-{YYYYMMDD-HHMMSS}/
- *   2. Move every top-level entry at the webroot EXCEPT the stage dir and
- *      the new backup dir into the backup (this includes migrate.php itself,
- *      .migrating, .htaccess, system/, vendor/, user/, tmp/, logs/, etc.).
- *      Version-control metadata (.git/.svn/.hg) is left in place, not deleted,
- *      so a version-controlled webroot keeps its repo across the swap (#15).
- *   3. Move every top-level entry from the stage dir up to the webroot.
- *   4. Remove the empty stage dir.
+ * Promote the staged Grav 2.0 install to the webroot.
  *
- * All operations are `rename()` calls on the same filesystem (fast + near-atomic).
- * After success the running PHP process is already finished reading migrate.php,
- * so even though the file has moved the response still renders; the user is
- * redirected to the new webroot.
+ * The swap is designed to be CRASH-SAFE and RESUMABLE, because it runs in one
+ * long HTTP request and a proxy/PHP-FPM 503/504 (or a hard worker kill) can cut
+ * it off at any instant — and the operations are destructive to the live site
+ * (issue #17). The guarantees:
+ *
+ *   Phase 0/0b  Carry over operator-selected root files + custom .htaccess into
+ *               the staged tree (non-destructive to the live site).
+ *   Phase 1     Zip the whole 1.x install to {stage}/backup/ (non-destructive).
+ *   ── commit ──  Write .mg-promote.json, the journal that makes the rest
+ *               resumable, and preserve migrate.php + .migrating so the wizard
+ *               can be re-driven to finish an interrupted swap.
+ *   Phase 2     Move each live top-level entry ASIDE into a quarantine dir
+ *               (.mg-old-*) via rename() — reversible, nothing is deleted.
+ *   Phase 3     rename() each staged entry up into the webroot.
+ *   Phase 4     Point of no return reached (2.0 fully in place): recreate the
+ *               writable assets/ + backup/ dirs, drop the breadcrumb, then
+ *               delete the quarantined 1.x install and the wizard remnants.
+ *
+ * At no point before Phase 4 is any 1.x file unrecoverable: it is either still
+ * live, set aside in quarantine, or captured in the Phase 1 backup zip. If the
+ * request dies mid-swap, re-running promote finds the journal and finishes
+ * forward from where it stopped (see the resume block below). Version-control
+ * metadata (.git/.svn/.hg) is left in place throughout so a version-controlled
+ * webroot keeps its repo across the swap (#15).
  */
 function do_promote(string $webroot, array $flag, ?callable $progress = null): array
 {
+    $journalPath = $webroot . '/.mg-promote.json';
+
+    // ── Resume path ────────────────────────────────────────────────────────
+    // A journal on disk means a previous promote committed to the swap but was
+    // interrupted (proxy/FPM 503/504, worker kill, OOM). The 1.x install is NOT
+    // gone — Phase 2 sets it aside into quarantine rather than deleting, and the
+    // wizard preserves itself — so finish the swap forward from where it
+    // stopped. The readiness gate, backup, and Phase 0 are skipped: the backup
+    // zip already exists and the staged tree may be half-moved up, so
+    // re-validating or re-copying it would wrongly fail or clobber.
+    $resume = mg_read_promote_journal($journalPath);
+    if ($resume !== null) {
+        $resumeStage = trim((string) ($resume['stage_dir'] ?? 'grav-2'), '/');
+        return mg_promote_execute_swap($webroot, $resumeStage, $resume, $progress);
+    }
+
     $stageDir  = trim((string)($flag['stage_dir'] ?? 'grav-2'), '/');
     $stagePath = $webroot . '/' . $stageDir;
 
@@ -1571,18 +1609,15 @@ function do_promote(string $webroot, array $flag, ?callable $progress = null): a
         return ['ok' => false, 'msg' => 'Backup zip looks invalid after close'];
     }
 
-    // ─── Phase 2: delete everything at webroot except the stage dir ────────
-    //
     // Pre-flight: on Windows, a file held open by another process (VSCode
     // file-watcher, Sourcetree's libgit2, a tail -f, a tmux pane with the
-    // file open in vim) cannot be deleted — unlink() fails. Phase 2 partway
-    // through would leave the webroot half-destroyed AND the backup zip
-    // sitting inside grav-2/backup waiting to be hand-extracted. Detect
-    // locks BEFORE the destructive work so the user can close the offender
-    // and retry without recovering. macOS/Linux skip this — unlink succeeds
-    // there regardless of open handles, so the runtime check would be wasted
-    // I/O and would also produce false negatives (the rename-rename-back
-    // probe always succeeds when share-delete is the default).
+    // file open in vim) cannot be moved — rename() fails. A Phase 2 that got
+    // partway would leave the webroot half-swapped. Detect locks BEFORE the
+    // destructive work so the user can close the offender and retry without
+    // recovering. macOS/Linux skip this — rename succeeds there regardless of
+    // open handles, so the runtime check would be wasted I/O and would also
+    // produce false negatives (the rename-rename-back probe always succeeds
+    // when share-delete is the default).
     $locked = mg_check_windows_locks($webroot, $stageDir);
     if ($locked !== []) {
         $sample = array_slice($locked, 0, 10);
@@ -1593,56 +1628,135 @@ function do_promote(string $webroot, array $flag, ?callable $progress = null): a
         return ['ok' => false, 'msg' => $msg, 'locked' => $locked];
     }
 
-    $deleted   = [];
-    $preserved = [];
-    foreach (scandir($webroot) ?: [] as $entry) {
-        if ($entry === '.' || $entry === '..') continue;
-        if ($entry === $stageDir) continue;
-        // Leave version-control metadata untouched so a git-managed webroot
-        // keeps its repo across the swap (issue #15). The staged 2.0 tree has
-        // no .git of its own, so Phase 3 never collides with what we keep here.
-        if (in_array($entry, MG_PRESERVE_IN_PLACE, true)) {
-            $preserved[] = $entry;
-            continue;
-        }
+    // ── Commit: write the journal that makes the swap resumable ────────────
+    // Everything above this line is non-destructive to the live 1.x site (the
+    // gate, custom_base_url restore, root-extra/htaccess copies into the stage,
+    // and the backup zip). From here on we touch the live webroot, so we record
+    // the plan first. If the request dies during Phase 2/3, re-running promote
+    // reads this journal and finishes forward (see the resume block at the top
+    // of do_promote). migrate.php + .migrating are deliberately left in place
+    // through the swap so the wizard stays reachable to be re-driven.
+    $journal = [
+        'created'          => date('c'),
+        'stage_dir'        => $stageDir,
+        'quarantine'       => '.mg-old-' . $timestamp,
+        'zip_name'         => $zipName,
+        'from_version'     => $currentVersion,
+        'backup_files'     => $added,
+        'root_copied'      => $rootCopied,
+        'htaccess_spliced' => $htaccessSpliced,
+        'cb_restore'       => $cbRestore,
+        'phase'            => 'quarantine',
+    ];
+    mg_write_promote_journal($journalPath, $journal);
 
-        if ($progress) $progress(['phase' => 'copy', 'entry' => 'clear', 'file' => $entry, 'copied' => $added]);
-        $path = $webroot . '/' . $entry;
-        $failedPath = null;
-        if (is_link($path) || is_file($path)) {
-            if (!@unlink($path)) {
-                $rel = ltrim(substr($path, strlen($webroot)), '/\\');
-                return ['ok' => false, 'msg' => "Could not delete {$rel} (file is locked by another process — close any editor, git GUI, or terminal that has it open, then retry)."];
-            }
-        } elseif (is_dir($path)) {
-            if (!mg_rm_tree($path, $failedPath)) {
-                $rel = $failedPath !== null
-                    ? ltrim(substr($failedPath, strlen($webroot)), '/\\')
-                    : $entry;
-                return ['ok' => false, 'msg' => "Could not delete {$rel} (file is locked by another process — close any editor, git GUI, or terminal that has it open, then retry)."];
-            }
-        }
-        $deleted[] = $entry;
+    return mg_promote_execute_swap($webroot, $stageDir, $journal, $progress);
+}
+
+/**
+ * Execute (or resume) the destructive half of the promote — Phases 2-4 — driven
+ * by the on-disk journal so an interrupted swap can be finished by re-running.
+ * See do_promote()'s docblock for the crash-safety contract. Called both from
+ * do_promote() on a fresh promote and from its resume block on a re-run.
+ */
+function mg_promote_execute_swap(string $webroot, string $stageDir, array $journal, ?callable $progress = null): array
+{
+    $journalPath    = $webroot . '/.mg-promote.json';
+    $stagePath      = $webroot . '/' . $stageDir;
+    $quarantine     = (string) ($journal['quarantine'] ?? '.mg-old');
+    $quarantinePath = $webroot . '/' . $quarantine;
+    ensure_dir($quarantinePath);
+
+    // A missing stage dir is only a problem before Phase 3 has run. Once
+    // phase == 'promote', Phase 3 emptied and rmdir'd it on a prior pass — that
+    // means the swap already reached Phase 4, so fall through to the idempotent
+    // finalize/cleanup below rather than failing.
+    if (!is_dir($stagePath) && ($journal['phase'] ?? 'quarantine') !== 'promote') {
+        return ['ok' => false, 'resumable' => true, 'quarantine' => $quarantine,
+            'msg' => "Staged install {$stageDir}/ is missing, so the swap can't be finished automatically. "
+                   . "Your 1.x install is set aside in {$quarantine}/ and in the backup zip — restore from either."];
     }
 
-    // ─── Phase 3: promote stage contents up ────────────────────────────────
+    // Entries that must stay at the webroot root through the whole swap:
+    //  - the stage dir (its contents are what we promote up)
+    //  - the quarantine dir (holds the set-aside 1.x install)
+    //  - version-control metadata, preserved in place across the swap (#15)
+    //  - the wizard + its flag + this journal — removing these is exactly what
+    //    makes an interrupted swap NON-recoverable, so they're deleted only in
+    //    Phase 4 after the swap has fully succeeded.
+    $keepAtRoot = array_merge(MG_PRESERVE_IN_PLACE, [
+        $stageDir, $quarantine, 'migrate.php', '.migrating', '.mg-promote.json',
+    ]);
+    $keepLookup = array_fill_keys($keepAtRoot, true);
+
+    // ─── Phase 2 (reversible): move the live 1.x install aside ─────────────
+    // rename() each live top-level entry into the quarantine dir instead of
+    // deleting it. rename is atomic on one filesystem, so no file is ever
+    // half-gone, and the old install stays fully intact in quarantine until
+    // Phase 4. Skipped on resume once Phase 2 completed (journal phase ==
+    // 'promote') — by then the webroot holds freshly-promoted 2.0 entries we
+    // must NOT move aside.
+    if (($journal['phase'] ?? 'quarantine') === 'quarantine') {
+        foreach (scandir($webroot) ?: [] as $entry) {
+            if ($entry === '.' || $entry === '..') continue;
+            if (isset($keepLookup[$entry])) continue;
+
+            if ($progress) $progress(['phase' => 'copy', 'entry' => 'set-aside', 'file' => $entry, 'copied' => 0]);
+            $src = $webroot . '/' . $entry;
+            $dst = $quarantinePath . '/' . $entry;
+            // A same-named entry already in quarantine is a leftover from an
+            // earlier interrupted pass; rename is atomic so the source can't
+            // also exist — leave the quarantined copy as the source of truth.
+            if (file_exists($dst) || is_link($dst)) continue;
+            if (!@rename($src, $dst)) {
+                return ['ok' => false, 'resumable' => true, 'quarantine' => $quarantine,
+                    'msg' => "Could not move {$entry} aside into {$quarantine}/ (permission or lock). "
+                           . "Nothing was deleted — free the file and click Promote again to finish."];
+            }
+        }
+        $journal['phase'] = 'promote';
+        mg_write_promote_journal($journalPath, $journal);
+    }
+
+    // ─── Phase 3: promote the staged 2.0 tree up into the webroot ──────────
+    // Skipped entirely when the stage dir is already gone (Phase 4 resume).
     $promoted = [];
-    foreach (scandir($stagePath) ?: [] as $entry) {
-        if ($entry === '.' || $entry === '..') continue;
-
-        if ($progress) $progress(['phase' => 'copy', 'entry' => 'promote', 'file' => $entry, 'copied' => count($promoted)]);
-        if (!@rename($stagePath . '/' . $entry, $webroot . '/' . $entry)) {
-            return ['ok' => false, 'msg' => "Failed to promote {$entry}"];
+    if (is_dir($stagePath)) {
+        foreach (scandir($stagePath) ?: [] as $entry) {
+            if ($entry === '.' || $entry === '..') continue;
+            $dst = $webroot . '/' . $entry;
+            // Already promoted by an earlier interrupted pass — count it and skip.
+            if (file_exists($dst) || is_link($dst)) {
+                $promoted[] = $entry;
+                continue;
+            }
+            if ($progress) $progress(['phase' => 'copy', 'entry' => 'promote', 'file' => $entry, 'copied' => count($promoted)]);
+            if (!@rename($stagePath . '/' . $entry, $dst)) {
+                return ['ok' => false, 'resumable' => true, 'quarantine' => $quarantine,
+                    'msg' => "Failed to promote {$entry} from {$stageDir}/. Your 1.x install is preserved in {$quarantine}/ "
+                           . "and in the backup zip. Click Promote again to retry, or restore from the backup."];
+            }
+            $promoted[] = $entry;
         }
-        $promoted[] = $entry;
+        @rmdir($stagePath);
     }
-    @rmdir($stagePath);
+
+    // ─── Phase 4: swap succeeded — safe to finalize and clean up ───────────
+    // Grav recreates these on boot, but a host that first boots before writing
+    // to them (or with a restrictive umask) shows "assets/backup not writeable"
+    // — the exact first-boot failure in issue #17. Creating them now, owned by
+    // the web-server user, avoids it. backup/ already arrived from the stage.
+    ensure_dir($webroot . '/assets');
+    ensure_dir($webroot . '/backup');
+
+    $zipName    = (string) ($journal['zip_name'] ?? '');
+    $rootCopied = (array) ($journal['root_copied'] ?? []);
 
     // Breadcrumb for the new install.
     $summary = [
         'migrated_at'  => date('c'),
         'backup_zip'   => 'backup/' . $zipName,
-        'from_version' => $currentVersion,
+        'from_version' => (string) ($journal['from_version'] ?? 'unknown'),
         'promoted'     => $promoted,
     ];
     @file_put_contents(
@@ -1650,18 +1764,36 @@ function do_promote(string $webroot, array $flag, ?callable $progress = null): a
         json_encode($summary, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)
     );
 
+    // Delete the set-aside 1.x install LAST — this is the point of no return,
+    // and it's only reached once the 2.0 tree is fully in place. A leftover
+    // here doesn't break the new site, so it's best-effort.
+    $rmFail = null;
+    mg_rm_tree($quarantinePath, $rmFail);
+
+    // Remove the wizard, its flag, and the journal now that the swap is done.
+    @unlink($webroot . '/migrate.php');
+    @unlink($webroot . '/.migrating');
+    @unlink($journalPath);
+
     if ($progress) $progress(['phase' => 'done-entry', 'entry' => 'promote', 'copied' => count($promoted)]);
 
+    // Which VCS metadata we left in place, for the summary line.
+    $preserved = [];
+    foreach (MG_PRESERVE_IN_PLACE as $vcs) {
+        if (is_dir($webroot . '/' . $vcs)) $preserved[] = $vcs;
+    }
+
+    $added = (int) ($journal['backup_files'] ?? 0);
     $msg = "Backed up {$added} files to backup/{$zipName}; promoted " . count($promoted) . ' entries to webroot.';
     if ($rootCopied !== []) {
         $msg .= ' Carried over ' . count($rootCopied) . ' root entr' . (count($rootCopied) === 1 ? 'y' : 'ies')
               . ' from the 1.x install (' . implode(', ', $rootCopied) . ').';
     }
-    if ($htaccessSpliced) {
+    if (!empty($journal['htaccess_spliced'])) {
         $msg .= ' Spliced your custom .htaccess rules into the new .htaccess (in a marked migrate-grav block).';
     }
-    if ($cbRestore !== null) {
-        $msg .= ' Restored system.custom_base_url (' . $cbRestore . ') now that the site is back at the original webroot.';
+    if (!empty($journal['cb_restore'])) {
+        $msg .= ' Restored system.custom_base_url (' . $journal['cb_restore'] . ') now that the site is back at the original webroot.';
     }
     if ($preserved !== []) {
         $msg .= ' Left version control in place (' . implode(', ', $preserved) . ') — your webroot repo is intact.';
@@ -1672,6 +1804,24 @@ function do_promote(string $webroot, array $flag, ?callable $progress = null): a
         'msg'    => $msg,
         'backup' => $zipName,
     ];
+}
+
+/**
+ * Read the promote journal (.mg-promote.json) if a swap is in progress. Returns
+ * the decoded plan, or null when there's no journal or it's unreadable/empty.
+ */
+function mg_read_promote_journal(string $path): ?array
+{
+    if (!is_file($path)) return null;
+    $data = json_decode((string) @file_get_contents($path), true);
+    return (is_array($data) && !empty($data['stage_dir'])) ? $data : null;
+}
+
+/** Persist the promote journal. Best-effort; the swap can still finish if a
+ *  progress write fails, it just loses the resume marker for that transition. */
+function mg_write_promote_journal(string $path, array $journal): void
+{
+    @file_put_contents($path, json_encode($journal, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
 }
 
 /**
@@ -5639,9 +5789,9 @@ function stream_promote_page(string $webroot, array $flag, string $token): void
     $result = do_promote($webroot, $flag, mg_stream_progress_cb());
 
     if ($result['ok']) {
-        // After promote, .migrating / migrate.php are inside the backup dir —
-        // the wizard's state is effectively gone, so redirect to the new
-        // live webroot instead of trying to re-render a wizard page.
+        // After promote, .migrating / migrate.php / the journal have been
+        // removed, so the wizard's state is gone — redirect to the new live
+        // webroot instead of trying to re-render a wizard page.
         $base = base_path_from_script();
         echo '<div class="mg-callout mg-callout-ok"><i class="mg-i-info"></i><div><strong>Migration complete.</strong> ' . htmlspecialchars($result['msg']) . ' &mdash; redirecting to the new install…</div></div>';
         echo '<script>window.location.replace(' . json_encode($base) . ');</script>';
@@ -5684,35 +5834,101 @@ function stream_promote_page(string $webroot, array $flag, string $token): void
         $msg = nl2br(htmlspecialchars((string) $result['msg']));
         echo '<div class="mg-callout mg-callout-error"><i class="mg-i-warn"></i><div><strong>Promote failed.</strong><br>' . $msg . '</div></div>';
 
-        // Two recovery hints, scoped to where Phase 2 left things:
-        //   - "locked" populated → Phase 2 aborted via the pre-flight check.
-        //     The webroot is INTACT. The backup zip was created in Phase 1
-        //     and is sitting in the stage's backup/ dir, but the user
-        //     doesn't need to touch it — they free the locks and click
-        //     Promote again.
-        //   - locked absent      → Phase 1 or Phase 3 failure, or a Phase 2
-        //     failure that snuck past the pre-flight (race window between
-        //     the probe and the actual unlink, or non-Windows). The webroot
-        //     may be partially destroyed; the backup zip is the only safe
-        //     way back.
-        $stageDir   = trim((string)($flag['stage_dir'] ?? 'grav-2'), '/');
-        $backupGlob = $webroot . '/' . $stageDir . '/backup/migration-backup-*.zip';
-        $backups    = glob($backupGlob) ?: [];
-        $latestZip  = $backups !== [] ? basename(end($backups)) : null;
+        // Recovery hints, scoped to where the swap left things:
+        //   - "locked" populated → the pre-flight check aborted BEFORE any
+        //     destructive work. The webroot is INTACT — free the locks and
+        //     click Promote again. No recovery needed.
+        //   - "resumable" set     → the swap committed but stopped mid-way. The
+        //     1.x install is set aside in quarantine (nothing deleted), the
+        //     journal is on disk, and re-running promote finishes forward.
+        //   - neither              → a Phase 1 (backup) failure before the swap
+        //     committed; the webroot is intact, retry or restore from the zip.
+        $stageDir  = trim((string)($flag['stage_dir'] ?? 'grav-2'), '/');
+        // The backup zip starts in {stage}/backup/ and moves up to {webroot}/
+        // backup/ as the swap promotes entries — look in both.
+        $backups   = array_merge(
+            glob($webroot . '/' . $stageDir . '/backup/migration-backup-*.zip') ?: [],
+            glob($webroot . '/backup/migration-backup-*.zip') ?: []
+        );
+        $latestZip = $backups !== [] ? end($backups) : null;
+        $latestRel = $latestZip !== null ? ltrim(substr($latestZip, strlen($webroot)), '/\\') : null;
 
         if (!empty($result['locked'])) {
             echo '<div class="mg-callout mg-callout-info"><i class="mg-i-info"></i><div><strong>What to do.</strong> The destructive phase did not start — your 1.x site is unchanged. Close the listed editor/git GUI/terminal, then re-open this wizard and click <em>Promote</em> again. No backup recovery is needed.</div></div>';
+        } elseif (!empty($result['resumable'])) {
+            $quarantine = (string) ($result['quarantine'] ?? '.mg-old-*');
+            echo '<div class="mg-callout mg-callout-info"><i class="mg-i-info"></i><div><strong>The swap can be finished.</strong> Nothing was deleted — your 1.x install is set aside in <code>' . htmlspecialchars($quarantine) . '/</code> and captured in the backup zip. Click <em>Finish promoting</em> to complete the swap from where it stopped.</div></div>';
+            echo '<form method="post" class="mg-form" style="margin-top:12px">';
+            echo '<input type="hidden" name="csrf_token" value="' . htmlspecialchars($token) . '">';
+            echo '<input type="hidden" name="action" value="promote">';
+            echo '<button type="submit" class="mg-btn mg-btn-primary">Finish promoting</button>';
+            echo '<span class="mg-btn-note">Resumes the interrupted swap. Safe to run more than once.</span>';
+            echo '</form>';
+            echo '<div class="mg-callout mg-callout-warn" style="margin-top:12px"><i class="mg-i-warn"></i><div><strong>Prefer to roll back instead?</strong> Restore the backup zip over your webroot to return to 1.x, then re-run the wizard.';
+            if ($latestRel !== null) {
+                echo '<div class="mg-result-row" style="margin-top:8px"><strong>Backup zip:</strong> <code>' . htmlspecialchars($latestRel) . '</code></div>';
+            }
+            echo '</div></div>';
         } else {
             echo '<div class="mg-callout mg-callout-warn"><i class="mg-i-warn"></i><div><strong>If your webroot looks empty or partial:</strong> a backup zip was created in Phase 1 before the failure. Extract it back over your webroot to restore your 1.x site, then you can retry the wizard from scratch.';
-            if ($latestZip !== null) {
-                echo '<div class="mg-result-row" style="margin-top:8px"><strong>Backup zip:</strong> <code>' . htmlspecialchars($stageDir . '/backup/' . $latestZip) . '</code></div>';
+            if ($latestRel !== null) {
+                echo '<div class="mg-result-row" style="margin-top:8px"><strong>Backup zip:</strong> <code>' . htmlspecialchars($latestRel) . '</code></div>';
             }
             echo '<div class="mg-result-row" style="margin-top:8px"><strong>Windows:</strong> right-click the zip in File Explorer &rarr; <em>Extract All&hellip;</em> and pick the webroot. 7-Zip and WinRAR also work.</div>';
-            echo '<div class="mg-result-row"><strong>macOS / Linux:</strong> <code>unzip /path/to/' . htmlspecialchars((string) ($latestZip ?? 'migration-backup-*.zip')) . ' -d /path/to/webroot</code>, or double-click in Finder to extract via Archive Utility.</div>';
+            echo '<div class="mg-result-row"><strong>macOS / Linux:</strong> <code>unzip /path/to/' . htmlspecialchars((string) ($latestZip !== null ? basename($latestZip) : 'migration-backup-*.zip')) . ' -d /path/to/webroot</code>, or double-click in Finder to extract via Archive Utility.</div>';
             echo '<div class="mg-result-row" style="margin-top:8px"><em>If the zip extracts as flat files with <code>\\</code> or <code>&middot;</code> in their names</em>, the backup was written by an older wizard build on Windows with a separator bug. Run the standalone repair script first &mdash; it writes a corrected zip alongside the original: <code>php user/plugins/migrate-grav/wizard/mg-repair-backup.php /path/to/backup.zip</code></div>';
             echo '</div></div>';
         }
     }
+
+    echo '</div>';
+    page_footer();
+}
+
+/**
+ * GET screen shown when a promote journal is on disk — a previous promote
+ * committed to the swap but was interrupted (proxy/FPM 503/504, worker kill).
+ * The 1.x install is set aside in quarantine, not deleted, so the swap can be
+ * finished by re-submitting promote (do_promote's resume path picks up the
+ * journal). Offered instead of the normal step view, which would scan a
+ * half-swapped webroot. Rolling back to 1.x from the backup zip stays available.
+ */
+function render_promote_resume(string $webroot, string $token): void
+{
+    $journal    = mg_read_promote_journal($webroot . '/.mg-promote.json') ?? [];
+    $stageDir   = trim((string) ($journal['stage_dir'] ?? 'grav-2'), '/');
+    $quarantine = (string) ($journal['quarantine'] ?? '.mg-old-*');
+    $fromVer    = (string) ($journal['from_version'] ?? '');
+    $backups    = array_merge(
+        glob($webroot . '/' . $stageDir . '/backup/migration-backup-*.zip') ?: [],
+        glob($webroot . '/backup/migration-backup-*.zip') ?: []
+    );
+    $latestZip  = $backups !== [] ? end($backups) : null;
+    $latestRel  = $latestZip !== null ? ltrim(substr($latestZip, strlen($webroot)), '/\\') : null;
+
+    page_header('Finish the interrupted promote');
+    echo '<div class="mg-page">';
+    echo '<div class="mg-hero"><div class="mg-hero-inner">';
+    echo '<div class="mg-hero-icon">⚠</div>';
+    echo '<div class="mg-hero-text"><h2>The promote was interrupted</h2>';
+    echo '<p>A previous promote started swapping Grav 2.0 in but didn\'t finish — most likely the request hit a server or proxy timeout. Nothing has been lost.</p>';
+    echo '</div></div></div>';
+
+    echo '<div class="mg-callout mg-callout-info"><i class="mg-i-info"></i><div><strong>Your site is recoverable.</strong> The swap sets your old install aside into <code>' . htmlspecialchars($quarantine) . '/</code> before deleting anything, so your Grav ' . htmlspecialchars($fromVer !== '' ? $fromVer : '1.x') . ' files are intact — either still in place, set aside in quarantine, or captured in the backup zip. Finishing the promote completes the swap from exactly where it stopped; it\'s safe to run more than once.</div></div>';
+
+    echo '<form method="post" class="mg-form" style="margin-top:16px">';
+    echo '<input type="hidden" name="csrf_token" value="' . htmlspecialchars($token) . '">';
+    echo '<input type="hidden" name="action" value="promote">';
+    echo '<button type="submit" class="mg-btn mg-btn-primary">Finish promoting</button>';
+    echo '<span class="mg-btn-note">Completes the interrupted swap and cleans up.</span>';
+    echo '</form>';
+
+    echo '<div class="mg-callout mg-callout-warn" style="margin-top:16px"><i class="mg-i-warn"></i><div><strong>Prefer to roll back to Grav ' . htmlspecialchars($fromVer !== '' ? $fromVer : '1.x') . ' instead?</strong> Extract the backup zip over your webroot to restore the old site, then re-run the wizard when you\'re ready.';
+    if ($latestRel !== null) {
+        echo '<div class="mg-result-row" style="margin-top:8px"><strong>Backup zip:</strong> <code>' . htmlspecialchars($latestRel) . '</code></div>';
+        echo '<div class="mg-result-row" style="margin-top:8px"><strong>macOS / Linux:</strong> <code>unzip ' . htmlspecialchars(basename($latestZip)) . ' -d /path/to/webroot</code></div>';
+    }
+    echo '</div></div>';
 
     echo '</div>';
     page_footer();
