@@ -1,3 +1,16 @@
+# v1.0.10
+## 07-27-2026
+
+1. [](#new)
+    * **Pages that use raw `<style>`, `<iframe>` or `<script>` markup keep working after the migration.** Grav 2.0 escapes those tags in Markdown output by default, so a 1.7 page carrying a style block or a video embed would suddenly render the tag as visible text; the content step now scans the migrated pages and turns the filter off when it finds any, listing which tags and pages triggered it.
+
+1. [](#bugfix)
+    * **User groups are now migrated too, so sites that manage permissions with groups don't lose them.** `user/config/groups.yaml` was never touched by the permission step, which left every group's permissions behind in the old namespace and locked out anyone whose access came from group membership. [#18]
+    * **Migrated users can now actually use Admin 2.0 instead of being refused on every action.** Accounts and groups now receive the API access permission that Grav 2.0 checks before anything else, which no Grav 1.x permission corresponds to, so non-superusers were left able to log in but unable to do anything. [#18]
+    * **Old permissions are now translated into the ones Grav 2.0 really uses, rather than copied under names nothing reads.** Only three of the classic permissions happened to match a Grav 2.0 name, so the rest produced account files that looked fully provisioned and granted nothing. [#18]
+    * **The accounts step now reports anything it couldn't carry over, instead of only a success count.** Permissions with no Grav 2.0 equivalent, users left without API access, and a missing groups file are all called out in the summary so nothing is discovered after going live. [#18]
+    * **Restoring the backup zip now recreates directories with their original permissions instead of 777.** The backup archive never recorded the permissions of the folders and files it packed, so unzipping it by hand rebuilt every directory as world-writable 0777 rather than the 0755 they started as; the backup now stores each entry's real permissions so any unzip tool restores them correctly.
+
 # v1.0.9
 ## 07-09-2026
 
