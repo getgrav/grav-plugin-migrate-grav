@@ -1,3 +1,9 @@
+# v1.0.10
+## 07-13-2026
+
+1. [](#bugfix)
+    * **Restoring the backup zip now recreates directories with their original permissions instead of 777.** The backup archive never recorded the permissions of the folders and files it packed, so unzipping it by hand rebuilt every directory as world-writable 0777 rather than the 0755 they started as; the backup now stores each entry's real permissions so any unzip tool restores them correctly.
+
 # v1.0.9
 ## 07-09-2026
 

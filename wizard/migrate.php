@@ -1888,6 +1888,33 @@ function mg_staged_zip_version(string $webroot, array &$flag): ?string
 }
 
 /**
+ * Resolve the unix file mode to stamp into a backup zip entry.
+ *
+ * ZipArchive::addFile()/addEmptyDir() do NOT copy the source's permissions
+ * into the archive's central directory, so a restore with a stock unzip tool
+ * recreates every directory at 0777 and every file at 0666 (the extractor's
+ * defaults). This returns the real st_mode (type + perm bits) so the caller
+ * can persist it via setExternalAttributesName().
+ *
+ * On Windows PHP fabricates modes (0777 dirs, 0666/0777 files) that carry no
+ * meaning on a unix restore host, so those are normalized to sane defaults —
+ * 0755 dirs, 0644 files, 0755 only when the fake mode kept an execute bit —
+ * rather than reintroducing the world-writable entries this whole function
+ * exists to prevent.
+ */
+function mg_entry_mode(\SplFileInfo $file, bool $isDir): int
+{
+    $perms = @$file->getPerms();
+    if ($perms === false || ($perms & 0o777) === 0) {
+        return $isDir ? 0o040755 : 0o100644;
+    }
+    if (DIRECTORY_SEPARATOR === '\\') {
+        return $isDir ? 0o040755 : (($perms & 0o111) ? 0o100755 : 0o100644);
+    }
+    return $perms & 0xFFFF; // full st_mode (S_IFDIR/S_IFREG | permission bits)
+}
+
+/**
  * Add everything at the webroot to the zip EXCEPT the stage dir. Skips
  * symlinks (avoids chasing dev-env links into unrelated repos). Streams
  * progress per ~200 files for the UI.
@@ -1948,10 +1975,27 @@ function mg_zip_webroot(ZipArchive $zip, string $webroot, string $skipTop, int &
 
         if ($file->isDir()) {
             $zip->addEmptyDir($rel);
+            // Stamp the directory's real mode into the archive. Without this
+            // addEmptyDir() stores 0777, so a stock unzip of the backup lands
+            // every dir at 0777 instead of 0755 (the plugin's own restore path
+            // corrects modes, but a manual `unzip` never sees them). The stored
+            // entry name carries a trailing slash, so match it here.
+            @$zip->setExternalAttributesName(
+                $rel . '/',
+                ZipArchive::OPSYS_UNIX,
+                (mg_entry_mode($file, true) & 0xFFFF) << 16
+            );
         } else {
             if (!$zip->addFile($path, $rel)) {
                 return "Could not add to zip: {$rel}";
             }
+            // Preserve the file's real mode too, so restores keep bin/* +x and
+            // don't widen everything to the extractor's 0666 default.
+            @$zip->setExternalAttributesName(
+                $rel,
+                ZipArchive::OPSYS_UNIX,
+                (mg_entry_mode($file, false) & 0xFFFF) << 16
+            );
             $added++;
             if ($progress && $added % 200 === 0) {
                 $progress(['phase' => 'copy', 'entry' => 'backup', 'file' => $rel, 'copied' => $added]);
