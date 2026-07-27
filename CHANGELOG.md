@@ -1,6 +1,9 @@
 # v1.0.10
 ## 07-27-2026
 
+1. [](#new)
+    * **Pages that use raw `<style>`, `<iframe>` or `<script>` markup keep working after the migration.** Grav 2.0 escapes those tags in Markdown output by default, so a 1.7 page carrying a style block or a video embed would suddenly render the tag as visible text; the content step now scans the migrated pages and turns the filter off when it finds any, listing which tags and pages triggered it.
+
 1. [](#bugfix)
     * **User groups are now migrated too, so sites that manage permissions with groups don't lose them.** `user/config/groups.yaml` was never touched by the permission step, which left every group's permissions behind in the old namespace and locked out anyone whose access came from group membership. [#18]
     * **Migrated users can now actually use Admin 2.0 instead of being refused on every action.** Accounts and groups now receive the API access permission that Grav 2.0 checks before anything else, which no Grav 1.x permission corresponds to, so non-superusers were left able to log in but unable to do anything. [#18]

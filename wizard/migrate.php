@@ -2675,6 +2675,12 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
     // flip it on where the source content relied on it.
     $mediaScan = mg_scan_media_url_actions($webroot, $dstUser);
 
+    // Scan for raw HTML tags Grav 2.0's GFM tagfilter escapes in Markdown
+    // output (`<style>`, `<iframe>`, `<script>`, …). Grav 1.7 had no filter, so
+    // any page relying on those tags would start rendering them as visible text
+    // after migration; turn the filter off where the source content used them.
+    $rawHtmlScan = mg_scan_raw_html_tags($webroot, $dstUser);
+
     // A non-empty system.custom_base_url breaks the staged preview. The staged
     // install runs under a subpath (stage_dir, default /grav-2/), but a custom
     // base url like `https://site.test` forces Grav's root_path to '' (Uri.php
@@ -2694,6 +2700,7 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
         'entries'           => $entries,
         'twig_scan'         => $twigScan,
         'media_url_actions' => $mediaScan,
+        'raw_html_tags'     => $rawHtmlScan,
         'custom_base_url'   => $cbResult,
     ];
     save_flag($webroot . '/.migrating', $flag);
@@ -2805,6 +2812,29 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
     }
     if (!empty($mediaScan['warning'])) {
         $parts[] = 'WARNING (system.yaml images): ' . $mediaScan['warning'] . '.';
+    }
+
+    // Raw HTML tags escaped by the Grav 2.0 GFM tagfilter.
+    if ($rawHtmlScan['disabled']) {
+        $parts[] = 'Disabled `pages.markdown.gfm.tagfilter` — found raw `<'
+              . implode('>`, `<', $rawHtmlScan['tags']) . '>` tag(s) in ' . count($rawHtmlScan['page_hits'])
+              . ' page(s). Grav 2.0 escapes those tags in Markdown output by default, so without the toggle they'
+              . ' would render as visible text after migration.';
+        if (!empty($rawHtmlScan['active_tags'])) {
+            $parts[] = 'NOTE: that filter also covers `<' . implode('>`, `<', $rawHtmlScan['active_tags'])
+                  . '>`, which run code or embed third-party documents. Review those pages, and consider moving the'
+                  . ' markup into a Twig template so you can turn the filter back on.';
+        }
+    } elseif ($rawHtmlScan['already_off']) {
+        $parts[] = '`pages.markdown.gfm.tagfilter` was already off — left as-is.';
+    }
+    if (!empty($rawHtmlScan['remote_pages'])) {
+        $parts[] = 'NOTE: ' . count($rawHtmlScan['remote_pages']) . ' page(s) inject content from another Grav'
+              . ' instance over `remote://`. That markup is fetched at render time and could not be scanned, so if'
+              . ' it carries any of those tags, check those pages after migrating.';
+    }
+    if (!empty($rawHtmlScan['warning'])) {
+        $parts[] = 'WARNING (system.yaml markdown): ' . $rawHtmlScan['warning'] . '.';
     }
 
     // Custom base URL handling for the staged preview.
@@ -4425,6 +4455,349 @@ function mg_set_system_images_url_actions(string $systemYaml, array &$result): v
     if (mg_atomic_write($systemYaml, $out, $result)) {
         $result['enabled'] = true;
     }
+}
+
+/**
+ * Walk the staged `user/pages/` tree looking for raw HTML tags that Grav 2.0
+ * escapes in Markdown output, and turn `pages.markdown.gfm.tagfilter` off in
+ * the staged `system.yaml` when any are found.
+ *
+ * Background: Grav 2.0 enables the GitHub Flavored Markdown "tagfilter"
+ * extension, which escapes the leading `<` of a fixed denylist — `title`,
+ * `textarea`, `style`, `xmp`, `iframe`, `noembed`, `noframes`, `script`,
+ * `plaintext` — so those tags render as inert text instead of active markup.
+ * Grav 1.7 had no such filter. A 1.7 page carrying a `<style>` block or a
+ * `<iframe>` video embed therefore keeps working right up until the migration,
+ * then renders the tag as visible source. Ordinary tags (`<div>`, `<ul>`, …)
+ * are untouched, which is why the breakage looks so selective.
+ *
+ * Detection is deliberately narrow: only Markdown page bodies are scanned
+ * (Twig templates are not Markdown-rendered, so the filter cannot affect them),
+ * frontmatter is skipped, and fenced/inline code is stripped first so a page
+ * that merely *documents* `<script>` in a code block doesn't count. Indented
+ * (four-space) code blocks are not stripped — a documentation site written that
+ * way may over-report, which only restores 1.7 behaviour and is listed in the
+ * report for review.
+ *
+ * Only the primary staged `user/config/system.yaml` is written. An env-scoped
+ * override that re-enables the filter is left alone; it's reported by the
+ * per-page hits rather than silently rewritten.
+ *
+ * Pages that pull content in locally (page-inject, content-inject, shortcodes)
+ * need no special handling: the injected page is itself a `.md` file in this
+ * same tree, so its tags are already counted, and the toggle this flips is
+ * site-wide. Remote injections are the exception — that markup lives on another
+ * Grav instance and is fetched at render time, so it can't be scanned. Pages
+ * using one are collected in `remote_pages` for the report.
+ *
+ * @return array{
+ *   needed:bool, already_off:bool, disabled:bool,
+ *   page_hits:array<string,list<string>>, tags:list<string>,
+ *   active_tags:list<string>, remote_pages:list<string>, warning:string
+ * }
+ */
+function mg_scan_raw_html_tags(string $webroot, string $dstUser): array
+{
+    $result = [
+        'needed'      => false,
+        'already_off' => false,
+        'disabled'    => false,
+        'page_hits'    => [],  // page-rel path => list of tag names found
+        'tags'         => [],  // union of tag names found
+        'active_tags'  => [],  // subset that can execute or embed (review these)
+        'remote_pages' => [],  // pages pulling content from another Grav instance
+        'warning'      => '',
+    ];
+
+    // page-inject/content-inject links (and their shortcode equivalents) that
+    // pull from a `remote://` instance. That markup never lands in this tree,
+    // so it can't be scanned — the report tells the operator to check it.
+    // Covers every documented form on one line: the markdown-style
+    // `[plugin:page-inject](remote://…)` and the shortcodes
+    // `[page-inject=remote://… /]` / `[page-inject path="remote://…" /]`.
+    $remoteRe = '~\[(?:plugin:)?(?:page|content)-inject[^\n]{0,200}?remote://~i';
+
+    // GFM's disallowed-raw-HTML denylist, matching core's filterDisallowedRawHtml().
+    $re = '/<(title|textarea|style|xmp|iframe|noembed|noframes|script|plaintext)\b/i';
+    // The tags worth a second look in the report: they run code or embed a
+    // third-party document, rather than just styling the page.
+    $active = ['script' => true, 'iframe' => true, 'noembed' => true, 'noframes' => true];
+
+    $pagesRoot = realpath($dstUser . '/pages') ?: '';
+    if ($pagesRoot === '' || !is_dir($pagesRoot)) {
+        return $result;
+    }
+
+    $rii = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($pagesRoot, \FilesystemIterator::SKIP_DOTS));
+    foreach ($rii as $file) {
+        /** @var \SplFileInfo $file */
+        if ($file->isDir() || $file->getExtension() !== 'md') continue;
+
+        $raw = @file_get_contents($file->getPathname());
+        if ($raw === false || $raw === '') continue;
+
+        [, $body] = mg_split_frontmatter($raw);
+        if ($body === '') continue;
+
+        // Drop fenced blocks and inline code spans — Parsedown escapes their
+        // contents anyway, so the tagfilter never applies there.
+        $body = preg_replace('/^[ \t]*(```|~~~).*?^[ \t]*\1[ \t]*$/ms', '', $body) ?? $body;
+        $body = preg_replace('/`[^`\n]*`/', '', $body) ?? $body;
+
+        $rel = ltrim(str_replace($pagesRoot, '', $file->getPathname()), '/\\');
+
+        if (str_contains($body, 'remote://') && preg_match($remoteRe, $body)) {
+            $result['remote_pages'][] = $rel;
+        }
+
+        if (!str_contains($body, '<') || !preg_match_all($re, $body, $matches)) continue;
+
+        $tags = [];
+        foreach ($matches[1] as $tag) {
+            $tags[strtolower($tag)] = true;
+        }
+        $result['page_hits'][$rel] = array_keys($tags);
+    }
+
+    $allTags = [];
+    foreach ($result['page_hits'] as $tags) {
+        foreach ($tags as $t) $allTags[$t] = true;
+    }
+    $result['tags']        = array_keys($allTags);
+    $result['active_tags'] = array_keys(array_intersect_key($allTags, $active));
+    $result['needed']      = !empty($result['page_hits']);
+
+    if (!$result['needed']) {
+        return $result;
+    }
+
+    $systemYaml = $dstUser . '/config/system.yaml';
+    if (is_file($systemYaml)) {
+        mg_set_pages_markdown_tagfilter($systemYaml, $result);
+    } else {
+        $result['warning'] = 'staged system.yaml missing — set pages.markdown.gfm.tagfilter: false by hand';
+    }
+
+    return $result;
+}
+
+/**
+ * Set `pages.markdown.gfm.tagfilter: false` in a staged `system.yaml`, creating
+ * whichever levels of the `pages: → markdown: → gfm:` nesting are absent.
+ * Operates on raw text so the operator's comments and formatting survive, and
+ * the result is YAML-validated before it is written (see mg_yaml_text_is_valid).
+ *
+ * Indentation is taken from the file itself: each level inserts at the
+ * shallowest indent already used by its parent's children, falling back to two
+ * spaces when the parent has none. Flow-style mappings (`pages: { … }`) are
+ * detected but not edited — rewriting one key inside a flow mapping without a
+ * real YAML round-trip is fragile, so the operator is asked to do it by hand.
+ *
+ * Sets `$result['disabled']` on a successful write, `$result['already_off']`
+ * when the key is already false at the right indent, or `$result['warning']`.
+ */
+function mg_set_pages_markdown_tagfilter(string $systemYaml, array &$result): void
+{
+    $raw = @file_get_contents($systemYaml);
+    if ($raw === false) {
+        $result['warning'] = 'could not read staged system.yaml';
+        return;
+    }
+
+    $eol = str_contains($raw, "\r\n") ? "\r\n" : "\n";
+    $lines = preg_split('/\r?\n/', $raw);
+    if (!is_array($lines)) {
+        $result['warning'] = 'could not parse staged system.yaml';
+        return;
+    }
+
+    $byHand = 'please set `pages.markdown.gfm.tagfilter: false` by hand';
+
+    // Descend pages: → markdown: → gfm:, remembering where a missing level
+    // would have to be spliced in and at what indent.
+    $from        = 0;
+    $to          = count($lines);
+    $insertAt    = -1;      // line index to splice a missing sub-block at
+    $insertIndent = '';     // indent string for that missing key
+    $missingFrom = null;    // first level of $path that isn't in the file
+    $path = ['pages', 'markdown', 'gfm'];
+
+    foreach ($path as $depth => $key) {
+        $block = mg_yaml_find_block($lines, $from, $to, $key);
+        if ($block['flow']) {
+            $result['warning'] = 'flow-style `' . $key . ': { … }` in system.yaml; ' . $byHand;
+            return;
+        }
+        if ($block['idx'] === -1) {
+            $missingFrom  = $depth;
+            $insertAt     = $block['insert_at'];
+            $insertIndent = $block['insert_indent'];
+            break;
+        }
+        $from         = $block['idx'] + 1;
+        $to           = $block['end'];
+        $insertAt     = $block['idx'] + 1;
+        $insertIndent = $block['child_indent'];
+    }
+
+    if ($missingFrom !== null) {
+        // Build the missing tail of the nesting, indenting one level per step.
+        $new = [];
+        $indent = $insertIndent;
+        for ($d = $missingFrom; $d < count($path); $d++) {
+            $new[] = $indent . $path[$d] . ':';
+            $indent .= '  ';
+        }
+        $new[] = $indent . 'tagfilter: false';
+
+        if ($insertAt === -1) {
+            // No `pages:` block at all — append a fresh one at the end.
+            $prefix = '';
+            if ($raw !== '' && !str_ends_with($raw, "\n") && !str_ends_with($raw, "\r")) {
+                $prefix .= $eol;
+            }
+            $block = $prefix . $eol . implode($eol, $new) . $eol;
+            if (!mg_yaml_text_is_valid($raw . $block)) {
+                $result['warning'] = 'skipped tagfilter edit — result would not parse as YAML; ' . $byHand;
+                return;
+            }
+            if (mg_atomic_append($systemYaml, $block, $result)) {
+                $result['disabled'] = true;
+            }
+            return;
+        }
+
+        array_splice($lines, $insertAt, 0, $new);
+    } else {
+        // pages.markdown.gfm exists — set or insert its tagfilter child.
+        $tag = mg_yaml_find_block($lines, $from, $to, 'tagfilter');
+        if ($tag['flow']) {
+            $result['warning'] = 'flow-style `gfm: { … }` in system.yaml; ' . $byHand;
+            return;
+        }
+        if ($tag['idx'] !== -1) {
+            // Only the values Grav actually reads as false count as already
+            // done. `off`/`no` are NOT among them: Symfony's YAML 1.2 parser
+            // hands those back as the strings "off"/"no", which Grav casts to
+            // true — so they get rewritten to a real `false` like any other
+            // truthy value.
+            if (in_array(strtolower($tag['value']), ['false', '0'], true)) {
+                $result['already_off'] = true;
+                return;
+            }
+            $lines[$tag['idx']] = $insertIndent . 'tagfilter: false';
+        } else {
+            array_splice($lines, $insertAt, 0, [$insertIndent . 'tagfilter: false']);
+        }
+    }
+
+    $out = implode($eol, $lines);
+    if (!mg_yaml_text_is_valid($out)) {
+        $result['warning'] = 'skipped tagfilter edit — result would not parse as YAML; ' . $byHand;
+        return;
+    }
+    if (mg_atomic_write($systemYaml, $out, $result)) {
+        $result['disabled'] = true;
+    }
+}
+
+/**
+ * Find the block-style mapping key `$key` among the direct children of the
+ * region `[$from, $to)` of a YAML file's lines. Direct children are the lines
+ * at the shallowest indent in the region, which is how the rest of these
+ * surgical editors identify a level (and what lets them heal a file where an
+ * earlier build inserted a key at a stray indent).
+ *
+ * Returns:
+ *   - idx           line index of the key, or -1 when absent
+ *   - value         the key's inline scalar with any trailing comment stripped
+ *   - end           exclusive end of the key's own child region
+ *   - child_indent  indent string to use for the key's children
+ *   - insert_at     where a missing key should be spliced (-1 when the region
+ *                   is the whole file and has no content to anchor to)
+ *   - insert_indent indent string a missing key should be written at
+ *   - flow          true when the key was found as a flow mapping (`key: { … }`)
+ *
+ * @return array{idx:int,value:string,end:int,child_indent:string,insert_at:int,insert_indent:string,flow:bool}
+ */
+function mg_yaml_find_block(array $lines, int $from, int $to, string $key): array
+{
+    $out = [
+        'idx'           => -1,
+        'value'         => '',
+        'end'           => $to,
+        'child_indent'  => '',
+        'insert_at'     => $from < $to ? $from : -1,
+        'insert_indent' => '',
+        'flow'          => false,
+    ];
+
+    $valueOf = static function (string $rest): string {
+        $rest = preg_replace('/\s+#.*$/', '', $rest) ?? $rest;
+        return trim($rest);
+    };
+
+    // Pass 1: the region's direct-child indent is its shallowest content indent.
+    $minIndent = PHP_INT_MAX;
+    $minIndentStr = '';
+    for ($i = $from; $i < $to; $i++) {
+        $trimmed = trim($lines[$i]);
+        if ($trimmed === '' || $trimmed[0] === '#') continue;
+        $indent = strlen($lines[$i]) - strlen(ltrim($lines[$i], " \t"));
+        if ($indent < $minIndent) {
+            $minIndent    = $indent;
+            $minIndentStr = substr($lines[$i], 0, $indent);
+        }
+    }
+    if ($minIndent === PHP_INT_MAX) {
+        // Empty region: a missing key goes in at the parent's indent + 2.
+        $out['insert_indent'] = $from > 0
+            ? substr($lines[$from - 1], 0, strlen($lines[$from - 1]) - strlen(ltrim($lines[$from - 1], " \t"))) . '  '
+            : '';
+        $out['child_indent'] = $out['insert_indent'] . '  ';
+        return $out;
+    }
+    $out['insert_indent'] = $minIndentStr;
+    $out['child_indent']  = $minIndentStr . '  ';
+
+    // Pass 2: locate the key at that indent, then walk to the end of its block.
+    for ($i = $from; $i < $to; $i++) {
+        $line = $lines[$i];
+        $trimmed = trim($line);
+        if ($trimmed === '' || $trimmed[0] === '#') continue;
+        $indent = strlen($line) - strlen(ltrim($line, " \t"));
+        if ($indent !== $minIndent) continue;
+        if (!preg_match('/^[ \t]*' . preg_quote($key, '/') . ':[ \t]*(.*)$/', $line, $m)) continue;
+
+        $value = $valueOf($m[1]);
+        if ($value !== '' && $value[0] === '{') {
+            $out['flow'] = true;
+            return $out;
+        }
+
+        $out['idx']   = $i;
+        $out['value'] = $value;
+
+        // The key's children run until the next line at or above its indent.
+        $end = $to;
+        $childIndentStr = null;
+        for ($j = $i + 1; $j < $to; $j++) {
+            $t = trim($lines[$j]);
+            if ($t === '' || $t[0] === '#') continue;
+            $ind = strlen($lines[$j]) - strlen(ltrim($lines[$j], " \t"));
+            if ($ind <= $minIndent) { $end = $j; break; }
+            if ($childIndentStr === null || $ind < strlen($childIndentStr)) {
+                $childIndentStr = substr($lines[$j], 0, $ind);
+            }
+        }
+        $out['end']          = $end;
+        $out['child_indent'] = $childIndentStr ?? ($minIndentStr . '  ');
+        return $out;
+    }
+
+    // Key absent: splice it in as the region's first child.
+    $out['insert_at'] = $from;
+    return $out;
 }
 
 /**
