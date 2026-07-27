@@ -827,6 +827,8 @@ function do_accounts(string $webroot, array $flag, array $options, ?callable $pr
     $mirrored = 0;
     $langsMigrated = 0;
     $details = [];
+    $notes = [];
+    $noAccess = [];
 
     foreach (scandir($dst) ?: [] as $entry) {
         if ($entry === '.' || $entry === '..') continue;
@@ -839,10 +841,17 @@ function do_accounts(string $webroot, array $flag, array $options, ?callable $pr
         if ($progress) $progress(['phase' => 'start', 'entry' => "accounts/{$entry}"]);
 
         if ($migratePerms) {
-            // Rewrite in place: read, mirror admin.* → api.*, overwrite.
-            $added = mg_migrate_account_perms($path, $path);
+            // Rewrite in place: read, map admin.* → api.*, overwrite.
+            $res   = mg_migrate_account_perms($path, $path);
+            $added = $res['added'];
             $mirrored += $added;
             $details[$entry] = $added;
+            foreach ($res['notes'] as $note) { $notes[] = $note; }
+            // An account that came out without api.access can log into Admin
+            // 2.0 but 403s on every operation — the operator has to know.
+            if (!$res['access'] && $added > 0) {
+                $noAccess[] = $entry;
+            }
         }
 
         // Always carry the classic per-user admin UI language over. Classic
@@ -859,6 +868,19 @@ function do_accounts(string $webroot, array $flag, array $options, ?callable $pr
         if ($progress) $progress(['phase' => 'done-entry', 'entry' => "accounts/{$entry}", 'added' => $details[$entry] ?? 0]);
     }
 
+    // Groups carry the permissions on most multi-user sites, and the API
+    // resolves group access exactly like account access — but they live in
+    // user/config/groups.yaml, which this step never used to touch.
+    $groups = ['groups' => 0, 'added' => 0, 'notes' => [], 'no_access' => [], 'present' => false];
+    if ($migratePerms) {
+        $groupsFile = $webroot . '/' . $stageDir . '/user/config/groups.yaml';
+        if ($progress) $progress(['phase' => 'start', 'entry' => 'config/groups.yaml']);
+        $groups = mg_migrate_group_perms($groupsFile);
+        $mirrored += $groups['added'];
+        foreach ($groups['notes'] as $note) { $notes[] = $note; }
+        if ($progress) $progress(['phase' => 'done-entry', 'entry' => 'config/groups.yaml', 'added' => $groups['added']]);
+    }
+
     $flag['step'] = 'accounts_done';
     $flag['accounts'] = [
         'at'             => time(),
@@ -867,64 +889,426 @@ function do_accounts(string $webroot, array $flag, array $options, ?callable $pr
         'migrated_langs' => $langsMigrated,
         'skipped_perms'  => !$migratePerms,
         'details'        => $details,
+        'groups'         => $groups,
+        'no_access'      => $noAccess,
+        'notes'          => mg_perm_summarize_notes($notes),
     ];
     save_flag($webroot . '/.migrating', $flag);
 
     $msg = "Processed {$count} account file(s)";
-    if ($migratePerms) $msg .= "; mirrored {$mirrored} admin.* → api.* permission(s)";
-    else               $msg .= "; permission mirroring skipped";
+    if ($migratePerms) {
+        $msg .= "; mapped {$mirrored} admin.* permission(s) to api.*";
+        if ($groups['present']) {
+            $msg .= "; migrated {$groups['groups']} group(s) in user/config/groups.yaml";
+        }
+    } else {
+        $msg .= "; permission mirroring skipped";
+    }
     if ($langsMigrated) $msg .= "; carried {$langsMigrated} admin language preference(s) into Admin 2.0";
-    return ['ok' => true, 'msg' => $msg . '.'];
+    $msg .= '.';
+
+    // Anything the operator has to act on goes in the flash, not just the
+    // details pane — reporting a bare success count is what let a site ship
+    // with every non-super account locked out (issue #18).
+    if ($migratePerms && !$groups['present']) {
+        $msg .= "\nNOTE: no `user/config/groups.yaml` in the staged install — nothing to migrate there.";
+    }
+    if ($noAccess) {
+        $msg .= "\nWARNING: " . count($noAccess) . ' account(s) came out without `api.access` and will get 403s on every'
+              . ' Admin 2.0 action: ' . implode(', ', array_map(static fn($f) => '`' . $f . '`', array_slice($noAccess, 0, 8)))
+              . (count($noAccess) > 8 ? ' …' : '') . '.';
+    }
+    if (!empty($groups['no_access'])) {
+        $msg .= "\nWARNING: group(s) with no `api.access`: "
+              . implode(', ', array_map(static fn($g) => '`' . $g . '`', $groups['no_access']))
+              . '. Members relying only on these groups cannot use Admin 2.0.';
+    }
+    $summary = mg_perm_summarize_notes($notes);
+    if (!empty($summary['config_partial'])) {
+        $msg .= "\nNOTE: per-section config permissions have no Grav 2.0 equivalent, so "
+              . implode(', ', array_map(static fn($k) => '`' . $k . '`', $summary['config_partial']))
+              . ' became read-only `api.config.read`. Grant `api.config.write` by hand if those users should still save config.';
+    }
+    if (!empty($summary['verbatim'])) {
+        $msg .= "\nNOTE: copied " . count($summary['verbatim']) . ' unrecognized permission(s) across verbatim ('
+              . implode(', ', array_map(static fn($k) => '`' . $k . '`', array_slice($summary['verbatim'], 0, 8)))
+              . (count($summary['verbatim']) > 8 ? ' …' : '')
+              . '). These come from third-party plugins — check the plugin registers an `api.*` twin.';
+    }
+
+    return ['ok' => true, 'msg' => $msg];
 }
 
 /**
- * Copy a single account yaml from $src to $dst, and for every `admin.X`
- * permission under `access:` (nested OR dotted-flat), add a matching
- * `api.X` with the same value if one isn't already present. Preserves
- * existing admin.* entries. Returns the number of api.* keys added.
+ * Collapse the per-key notes the mapper emits into unique key lists per code,
+ * for both the flash message and the summary pane.
+ *
+ * @param  array<int, array{code: string, key: string}> $notes
+ * @return array<string, array<int, string>>
  */
-function mg_migrate_account_perms(string $src, string $dst): int
+function mg_perm_summarize_notes(array $notes): array
 {
-    mg_ensure_yaml_available();
+    $out = [];
+    foreach ($notes as $note) {
+        $code = $note['code'] ?? '';
+        $key  = $note['key'] ?? '';
+        if ($code === '' || $key === '') continue;
+        if (!isset($out[$code])) $out[$code] = [];
+        if (!in_array($key, $out[$code], true)) $out[$code][] = $key;
+    }
+    foreach ($out as &$keys) { sort($keys); }
+    unset($keys);
 
-    $raw = @file_get_contents($src);
-    if ($raw === false) { @copy($src, $dst); return 0; }
+    return $out;
+}
 
-    if (!class_exists('Symfony\\Component\\Yaml\\Yaml')) { @copy($src, $dst); return 0; }
-    try {
-        $data = \Symfony\Component\Yaml\Yaml::parse($raw);
-    } catch (\Throwable) { @copy($src, $dst); return 0; }
-    if (!is_array($data)) { @copy($src, $dst); return 0; }
+/**
+ * Is an access-map value a positive grant? Mirrors how Grav treats the truthy
+ * spellings that turn up in hand-edited account and group yamls.
+ */
+function mg_perm_is_positive(mixed $value): bool
+{
+    return $value === true || $value === 1 || $value === '1'
+        || (is_string($value) && in_array(strtolower($value), ['true', 'yes', 'on'], true));
+}
 
-    $added = 0;
-    if (isset($data['access']) && is_array($data['access'])) {
-        // Nested form:  access: { admin: { super: true, login: true } }
-        if (isset($data['access']['admin']) && is_array($data['access']['admin'])) {
-            $apiExisting = (array) ($data['access']['api'] ?? []);
-            foreach ($data['access']['admin'] as $k => $v) {
-                if (!array_key_exists($k, $apiExisting)) {
-                    $apiExisting[$k] = $v;
-                    $added++;
-                }
-            }
-            $data['access']['api'] = $apiExisting;
+/**
+ * Flatten a nested `access:` map into dot-notation keys, exactly as Grav's own
+ * Utils::arrayFlattenDotNotation() does before the ACL resolves anything. Keys
+ * that are ALREADY dotted (`admin.super: true`) concatenate naturally, so both
+ * yaml spellings — and the hybrids that show up in hand-edited files, e.g.
+ * `admin.configuration: { pages: true }` — collapse to one comparable form.
+ *
+ * @return array<string, mixed>
+ */
+function mg_flatten_access(array $node, string $prefix = ''): array
+{
+    $out = [];
+    foreach ($node as $k => $v) {
+        $key = $prefix === '' ? (string) $k : $prefix . '.' . $k;
+        if (is_array($v)) {
+            $out += mg_flatten_access($v, $key);
+        } else {
+            $out[$key] = $v;
         }
-        // Dotted-flat form: access: { admin.super: true, admin.login: true }
-        foreach ($data['access'] as $k => $v) {
-            if (is_string($k) && str_starts_with($k, 'admin.')) {
-                $apiKey = 'api.' . substr($k, strlen('admin.'));
-                if (!array_key_exists($apiKey, $data['access'])) {
-                    $data['access'][$apiKey] = $v;
-                    $added++;
-                }
+    }
+
+    return $out;
+}
+
+/**
+ * Classic keys that Grav 2.0 still reads under their ORIGINAL `admin.*` name,
+ * so mirroring them to `api.*` would only add a key nothing ever looks at.
+ * `admin.pages_twig` gates the Twig-in-content toggle (grav-plugin-api's
+ * PagesController) and `admin.impersonate` gates user impersonation.
+ */
+function mg_perm_admin_only(): array
+{
+    return ['pages_twig', 'impersonate'];
+}
+
+/**
+ * Resolve which `api.*` permission(s) a classic `admin.*` permission becomes.
+ *
+ * This is deliberately NOT a 1:1 rename. Grav 2.0's API registers its own
+ * permission set (grav-plugin-api's permissions.yaml) and only three classic
+ * names — `super`, `pages`, `users` — happen to land on a registered `api.*`
+ * key. Copying the rest verbatim produced `api.cache`, `api.configuration`,
+ * `api.maintenance`, `api.plugins`, `api.themes`, `api.tools` and `api.login`,
+ * none of which are registered, so the account read as fully provisioned and
+ * granted nothing (issue #18).
+ *
+ * The mapping never grants MORE authority than the classic permission did.
+ * Where 2.0 has no equivalent at the same granularity the read-side is granted
+ * and the caller reports the shortfall, rather than silently widening. In
+ * particular a PARTIAL `admin.configuration.<section>` grant maps to
+ * `api.config.read` only: 2.0 has no per-section config permission, so
+ * promoting it to `api.config` would hand someone who could edit one config
+ * page the keys to `system.yaml` and `security.yaml`.
+ *
+ * Unrecognized keys are copied verbatim — that's the convention third-party
+ * plugins follow (flex-objects registers both `admin.flex-objects` and
+ * `api.flex-objects`), so a verbatim twin is the right guess for anything
+ * outside the classic core set.
+ *
+ * $key is the classic permission WITHOUT its `admin.` prefix.
+ *
+ * @param  array<int, array{code: string, key: string}> $notes  Appended to.
+ * @return array<int, string>  Dotted `api.*` targets (possibly empty).
+ */
+function mg_perm_targets(string $key, array &$notes): array
+{
+    // Classic core → registered api.* equivalents. Verified against
+    // grav-plugin-api/permissions.yaml and the controllers that gate on them:
+    // cache clearing is api.system.write, backups are the separately-gated
+    // api.system.backup, package install/removal is api.gpm, and the classic
+    // Pages permission covered media management (2.0 splits that out).
+    $map = [
+        'login'       => ['api.access'],
+        'super'       => ['api.super'],
+        'pages'       => ['api.pages', 'api.media'],
+        'users'       => ['api.users'],
+        'cache'       => ['api.system.write'],
+        'tools'       => ['api.system.read'],
+        'statistics'  => ['api.reports.read'],
+        'plugins'     => ['api.gpm'],
+        'themes'      => ['api.gpm'],
+        'maintenance' => ['api.system.backup', 'api.gpm'],
+    ];
+
+    if (isset($map[$key])) {
+        return $map[$key];
+    }
+
+    if (in_array($key, mg_perm_admin_only(), true)) {
+        $notes[] = ['code' => 'admin_only', 'key' => 'admin.' . $key];
+        return [];
+    }
+
+    // Whole-namespace config access — the operator already had every section.
+    if ($key === 'configuration') {
+        return ['api.config'];
+    }
+
+    // A single section: `admin.configuration.pages`, or its legacy alias form
+    // `admin.configuration_system`. Read-only, and say so.
+    if (str_starts_with($key, 'configuration.') || str_starts_with($key, 'configuration_')) {
+        $notes[] = ['code' => 'config_partial', 'key' => 'admin.' . $key];
+        return ['api.config.read'];
+    }
+
+    $notes[] = ['code' => 'verbatim', 'key' => 'admin.' . $key];
+
+    return ['api.' . $key];
+}
+
+/**
+ * Translate one `access:` map from classic `admin.*` to Grav 2.0 `api.*`.
+ *
+ * Additive and idempotent: existing `admin.*` entries are left untouched (so
+ * the account keeps working on Admin 1.x during the transition) and an `api.*`
+ * key the operator already set — at that key or at any parent of it — always
+ * wins over what the mapper would have written.
+ *
+ * The critical output is `api.access`. Every API endpoint gates on it before
+ * the specific permission (AbstractApiController::requirePermission), and no
+ * classic permission corresponds to it, so a 1:1 mirror could never produce
+ * one and every mirrored non-super account was locked out of everything. Any
+ * positive classic grant now implies it.
+ *
+ * @param  array<int, array{code: string, key: string}> $notes  Appended to.
+ * @return array{0: array<string, mixed>, 1: int}  [new access map, keys added]
+ */
+function mg_mirror_access(array $access, array &$notes): array
+{
+    $flat = mg_flatten_access($access);
+
+    $classic  = [];
+    $existing = [];
+    foreach ($flat as $k => $v) {
+        if (str_starts_with($k, 'admin.')) {
+            $classic[substr($k, strlen('admin.'))] = $v;
+        } elseif ($k === 'api' || str_starts_with($k, 'api.')) {
+            $existing[$k] = $v;
+        }
+    }
+    if (!$classic) {
+        return [$access, 0];
+    }
+
+    // Resolve every classic grant to its 2.0 target(s). When two classic keys
+    // land on the same target (admin.plugins and admin.themes both become
+    // api.gpm) a positive grant wins, matching how the API's PermissionResolver
+    // merges group access: one "yes" is enough.
+    $proposed = [];
+    foreach ($classic as $key => $value) {
+        foreach (mg_perm_targets($key, $notes) as $target) {
+            $seen = array_key_exists($target, $proposed);
+            if (!$seen || (!mg_perm_is_positive($proposed[$target]) && mg_perm_is_positive($value))) {
+                $proposed[$target] = $value;
             }
         }
     }
 
-    $out = \Symfony\Component\Yaml\Yaml::dump($data, 6, 2);
+    // The gate that made the old mirror inert. Anything positive implies it.
+    if (!isset($proposed['api.access'])) {
+        foreach ($proposed as $value) {
+            if (mg_perm_is_positive($value)) {
+                $proposed['api.access'] = true;
+                break;
+            }
+        }
+    }
 
-    @file_put_contents($dst, $out);
-    return $added;
+    // Never override a decision the operator already made in the api namespace,
+    // at the key itself or at any ancestor of it — an explicit `api.system:
+    // false` is a deny that a mapped `api.system.write: true` would punch a
+    // hole in.
+    $writable = [];
+    foreach ($proposed as $target => $value) {
+        $conflict = null;
+        $probe = $target;
+        while (true) {
+            if (array_key_exists($probe, $existing)) { $conflict = $probe; break; }
+            $pos = strrpos($probe, '.');
+            if ($pos === false) { break; }
+            $probe = substr($probe, 0, $pos);
+        }
+        if ($conflict !== null) {
+            if ($conflict !== $target) {
+                $notes[] = ['code' => 'preset', 'key' => $target . ' (covered by ' . $conflict . ')'];
+            }
+            continue;
+        }
+        $writable[$target] = $value;
+    }
+    if (!$writable) {
+        return [$access, 0];
+    }
+
+    // Write back in whichever shape the source used, so the migrated file reads
+    // the way the operator's own file did.
+    $nested = isset($access['admin']) && is_array($access['admin']);
+    $added  = 0;
+    foreach ($writable as $target => $value) {
+        $path = substr($target, strlen('api.'));
+        if ($nested) {
+            $api = (isset($access['api']) && is_array($access['api'])) ? $access['api'] : [];
+            if (mg_access_set_nested($api, $path, $value)) {
+                $access['api'] = $api;
+                $added++;
+                continue;
+            }
+            // A scalar sits where a sub-map is needed (`api: {system: true}`
+            // vs `api.system.write`). Fall back to the dotted spelling, which
+            // Grav flattens to exactly the same key.
+        }
+        $access[$target] = $value;
+        $added++;
+    }
+
+    return [$access, $added];
+}
+
+/**
+ * Set a dot-path inside a nested access map. Returns false — writing nothing —
+ * when a scalar already occupies part of the path, so the caller can fall back
+ * to the dotted spelling instead of clobbering an existing grant.
+ */
+function mg_access_set_nested(array &$node, string $path, mixed $value): bool
+{
+    $parts = explode('.', $path);
+    $last  = array_pop($parts);
+    $ref   = &$node;
+
+    foreach ($parts as $part) {
+        if (!array_key_exists($part, $ref)) {
+            $ref[$part] = [];
+        } elseif (!is_array($ref[$part])) {
+            return false;
+        }
+        $ref = &$ref[$part];
+    }
+    $ref[$last] = $value;
+
+    return true;
+}
+
+/**
+ * Rewrite a single account yaml in place, translating its classic `admin.*`
+ * permissions into the `api.*` set Grav 2.0 actually enforces.
+ *
+ * @return array{added: int, notes: array<int, array{code: string, key: string}>, access: bool}
+ *   `access` is whether the account ends up holding api.access — without it the
+ *   user can log into Admin 2.0 but every operation returns 403.
+ */
+function mg_migrate_account_perms(string $src, string $dst): array
+{
+    $empty = ['added' => 0, 'notes' => [], 'access' => false];
+
+    $data = mg_yaml_parse_file($src);
+    if ($data === null) {
+        if ($src !== $dst) { @copy($src, $dst); }
+        return $empty;
+    }
+
+    if (!isset($data['access']) || !is_array($data['access'])) {
+        if ($src !== $dst) { @copy($src, $dst); }
+        return $empty;
+    }
+
+    $notes = [];
+    [$access, $added] = mg_mirror_access($data['access'], $notes);
+    $data['access'] = $access;
+
+    $flat = mg_flatten_access($access);
+    $hasAccess = mg_perm_is_positive($flat['api.access'] ?? null)
+        || mg_perm_is_positive($flat['api.super'] ?? null);
+
+    if ($added > 0) {
+        $out = mg_yaml_dump($data);
+        if ($out === null) { return $empty; }
+        @file_put_contents($dst, $out);
+    } elseif ($src !== $dst) {
+        @copy($src, $dst);
+    }
+
+    return ['added' => $added, 'notes' => $notes, 'access' => $hasAccess];
+}
+
+/**
+ * Rewrite `user/config/groups.yaml` the same way as the account yamls.
+ *
+ * Groups are the documented way to run a multi-user Grav site, and the API's
+ * PermissionResolver reads `groups.<name>.access` when it builds a user's
+ * effective permissions — so group grants work fine in 2.0. They were simply
+ * never migrated: the step only ever walked `user/accounts/`, leaving every
+ * group's permissions stranded in the `admin.*` namespace and locking out
+ * every user whose access came from group membership (issue #18).
+ *
+ * @return array{groups: int, added: int, notes: array<int, array{code: string, key: string}>,
+ *               no_access: array<int, string>, present: bool}
+ */
+function mg_migrate_group_perms(string $path): array
+{
+    $result = ['groups' => 0, 'added' => 0, 'notes' => [], 'no_access' => [], 'present' => is_file($path)];
+
+    if (!$result['present']) {
+        return $result;
+    }
+
+    $data = mg_yaml_parse_file($path);
+    if ($data === null) {
+        return $result;
+    }
+
+    $notes = [];
+    $added = 0;
+    foreach ($data as $name => $group) {
+        if (!is_array($group) || !isset($group['access']) || !is_array($group['access'])) {
+            continue;
+        }
+        [$access, $n] = mg_mirror_access($group['access'], $notes);
+        $data[$name]['access'] = $access;
+        $added += $n;
+        $result['groups']++;
+
+        $flat = mg_flatten_access($access);
+        if (!mg_perm_is_positive($flat['api.access'] ?? null) && !mg_perm_is_positive($flat['api.super'] ?? null)) {
+            $result['no_access'][] = (string) $name;
+        }
+    }
+
+    if ($added > 0) {
+        $out = mg_yaml_dump($data);
+        if ($out === null) { return $result; }
+        @file_put_contents($path, $out);
+    }
+
+    $result['added'] = $added;
+    $result['notes'] = $notes;
+
+    return $result;
 }
 
 /**
@@ -5814,7 +6198,7 @@ function stream_plugins_themes_page(string $webroot, array $flag, string $token,
 
 function stream_accounts_page(string $webroot, array $flag, string $token, array $options): void
 {
-    mg_stream_setup('Processing accounts…', 'Account yamls were copied during Step 2' . (empty($options['migrate_perms']) ? '; confirming accounts step and moving on.' : '. Mirroring <code>admin.*</code> permissions to <code>api.*</code> in place so the same users keep full access on Admin 2.0.'));
+    mg_stream_setup('Processing accounts…', 'Account yamls were copied during Step 2' . (empty($options['migrate_perms']) ? '; confirming accounts step and moving on.' : '. Translating <code>admin.*</code> permissions into the <code>api.*</code> set Admin 2.0 enforces — in your account yamls and in <code>user/config/groups.yaml</code> — so the same users keep working. Anything without a 2.0 equivalent is reported rather than dropped silently.'));
     $result = do_accounts($webroot, $flag, $options, mg_stream_progress_cb());
     mg_stream_finish($result, $token, 'accounts_done');
 }
@@ -6104,6 +6488,14 @@ function mg_rewind_to(string $webroot, array &$flag, string $target): void
             if (is_dir($srcAccounts)) {
                 copy_tree($srcAccounts, $dstAccounts, static function () {});
             }
+            // Step 3 also rewrites groups.yaml in place, so undoing the perm
+            // mapping means restoring that from the live 1.x install too —
+            // otherwise a re-run maps an already-mapped file.
+            $srcGroups = $webroot . '/user/config/groups.yaml';
+            $dstGroups = $stagedUser . '/config/groups.yaml';
+            if (is_file($srcGroups) && is_dir(dirname($dstGroups))) {
+                @copy($srcGroups, $dstGroups);
+            }
             if (isset($flag['accounts'])) {
                 $stash['accounts'] = [
                     'migrate_perms' => empty($flag['accounts']['skipped_perms']),
@@ -6337,14 +6729,20 @@ function render_wizard(array $flag, string $step, string $webroot, string $stage
         $ac = $flag['accounts'];
         $summary = (int) ($ac['count'] ?? 0) . ' account file(s)'
                  . (!empty($ac['skipped_perms'])
-                     ? '; permission mirror skipped'
-                     : '; mirrored ' . (int) ($ac['migrated_perms'] ?? 0) . ' admin.* → api.* perms');
+                     ? '; permission migration skipped'
+                     : '; mapped ' . (int) ($ac['migrated_perms'] ?? 0) . ' admin.* → api.* perms'
+                       . ((int) ($ac['groups']['groups'] ?? 0) > 0
+                           ? '; ' . (int) $ac['groups']['groups'] . ' group(s)'
+                           : ''))
+                 . (!empty($ac['no_access']) || !empty($ac['groups']['no_access'])
+                     ? ' ⚠ some without api.access'
+                     : '');
 
         echo '<tr><th>Accounts</th><td>';
         echo '<details class="mg-details"><summary><code>' . htmlspecialchars($summary) . '</code></summary>';
         echo '<div class="mg-details-body">';
         mg_render_accounts_details($ac);
-        mg_render_rerun_form($token, 'plugins_done', 'Re-run Step 3 with different options', 'Re-copies user/accounts/ from your live 1.x install and clears Step 4. Plugins/themes (Step 2) are not affected.');
+        mg_render_rerun_form($token, 'plugins_done', 'Re-run Step 3 with different options', 'Re-copies user/accounts/ and user/config/groups.yaml from your live 1.x install and clears Step 4. Plugins/themes (Step 2) are not affected.');
         echo '</div></details></td></tr>';
     }
     if (isset($flag['content'])) {
@@ -6536,12 +6934,13 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
 
             echo '<div class="mg-card mg-card-active"><h3>Step 3: Accounts</h3>';
             echo '<p>Account yamls were copied verbatim into the staged install during Step 2 (' . $nAccounts . ' yaml(s) detected in staged <code>user/accounts/</code>). This step just applies the optional permission transform.</p>';
-            echo '<p>Grav 2.0 (with Admin 2.0) uses <code>api.*</code> permission names going forward. Your existing <code>admin.*</code> permissions can be mirrored in place so the same users keep full access on both Admin 1.x and 2.0 while you transition.</p>';
+            echo '<p>Grav 2.0 (with Admin 2.0) enforces its own <code>api.*</code> permission set. Your existing <code>admin.*</code> permissions can be translated in place — in the account yamls and in <code>user/config/groups.yaml</code> — so the same users keep working on both Admin 1.x and 2.0 while you transition. Your <code>admin.*</code> entries are left untouched.</p>';
+            echo '<p class="mg-btn-note">This is a mapping, not a rename: <code>admin.cache</code> becomes <code>api.system.write</code>, <code>admin.plugins</code> becomes <code>api.gpm</code>, and every account or group with any permission gets <code>api.access</code> — the gate Admin 2.0 checks before anything else. Permissions with no 2.0 equivalent are listed in the summary instead of being dropped quietly.</p>';
             echo '<form method="post" style="margin-top:14px">';
             echo '<input type="hidden" name="action" value="accounts">';
             echo '<input type="hidden" name="token"  value="' . htmlspecialchars($token) . '">';
-            echo '<label class="mg-check mg-check-block"><input type="checkbox" name="skip_perms" value="1"> Skip permission mirroring <span class="mg-btn-note">(leave account yamls as-is; you\'ll set <code>api.*</code> perms manually later)</span></label>';
-            echo '<div style="margin-top:14px"><button type="submit" class="mg-btn mg-btn-primary">Apply permission mirror →</button></div>';
+            echo '<label class="mg-check mg-check-block"><input type="checkbox" name="skip_perms" value="1"> Skip permission migration <span class="mg-btn-note">(leave account yamls and <code>groups.yaml</code> as-is; you\'ll set <code>api.*</code> perms manually later)</span></label>';
+            echo '<div style="margin-top:14px"><button type="submit" class="mg-btn mg-btn-primary">Migrate permissions →</button></div>';
             echo '</form>';
             echo '</div>';
             break;
@@ -6838,11 +7237,59 @@ function mg_render_accounts_details(array $ac): void
     }
     echo '</div>';
 
-    echo '<div class="mg-result-section"><strong>Permission mirror</strong>';
+    echo '<div class="mg-result-section"><strong>Permission migration</strong>';
     if (!empty($ac['skipped_perms'])) {
-        echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-skip">skipped</span> No <code>admin.*</code> permissions were mirrored to <code>api.*</code>. Set them manually if needed for Admin 2.0.</div>';
+        echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-skip">skipped</span> No <code>admin.*</code> permissions were translated to <code>api.*</code>. Set them manually if needed for Admin 2.0.</div>';
+        echo '</div>';
+        return;
+    }
+
+    echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-ok">applied</span> Mapped ' . (int) ($ac['migrated_perms'] ?? 0) . ' <code>admin.*</code> → <code>api.*</code> permission(s).</div>';
+
+    // Groups: report the file's absence explicitly. "0 groups" reads as
+    // "nothing to do" only when you can see we actually looked (issue #18).
+    $groups = is_array($ac['groups'] ?? null) ? $ac['groups'] : [];
+    if (!empty($groups['present'])) {
+        echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-ok">groups</span> Migrated '
+           . (int) ($groups['groups'] ?? 0) . ' group(s) in <code>user/config/groups.yaml</code> (+'
+           . (int) ($groups['added'] ?? 0) . ' api perms).</div>';
     } else {
-        echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-ok">applied</span> Mirrored ' . (int) ($ac['migrated_perms'] ?? 0) . ' <code>admin.*</code> → <code>api.*</code> permission(s).</div>';
+        echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-skip">groups</span> No <code>user/config/groups.yaml</code> in the staged install — nothing to migrate there.</div>';
+    }
+
+    $noAccess = array_merge(
+        array_map(static fn($f) => 'account ' . $f, (array) ($ac['no_access'] ?? [])),
+        array_map(static fn($g) => 'group ' . $g, (array) ($groups['no_access'] ?? []))
+    );
+    if ($noAccess) {
+        echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-skip">no api.access</span> '
+           . htmlspecialchars(implode(', ', $noAccess))
+           . ' — these hold no <code>api.access</code>, so Admin 2.0 will return 403 on every action.'
+           . ' Grant it (or a permission that implies it) before going live.</div>';
+    }
+
+    $notes = is_array($ac['notes'] ?? null) ? $ac['notes'] : [];
+    if (!empty($notes['config_partial'])) {
+        echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-skip">read-only</span> '
+           . htmlspecialchars(implode(', ', $notes['config_partial']))
+           . ' — Grav 2.0 has no per-section config permission, so these became <code>api.config.read</code>.'
+           . ' Grant <code>api.config.write</code> by hand if those users should still save config.</div>';
+    }
+    if (!empty($notes['verbatim'])) {
+        echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-skip">verbatim</span> '
+           . htmlspecialchars(implode(', ', $notes['verbatim']))
+           . ' — not part of the classic core set, so copied across under the same name.'
+           . ' Third-party plugins that register an <code>api.*</code> twin (as flex-objects does) will pick these up; others will not.</div>';
+    }
+    if (!empty($notes['admin_only'])) {
+        echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-ok">left as-is</span> '
+           . htmlspecialchars(implode(', ', $notes['admin_only']))
+           . ' — still read under the <code>admin.*</code> name in Grav 2.0, so no twin was added.</div>';
+    }
+    if (!empty($notes['preset'])) {
+        echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-skip">already set</span> '
+           . htmlspecialchars(implode(', ', $notes['preset']))
+           . ' — an existing <code>api.*</code> value already covered these, so they were left alone.</div>';
     }
     echo '</div>';
 }
