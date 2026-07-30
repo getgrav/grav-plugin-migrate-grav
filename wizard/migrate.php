@@ -99,6 +99,35 @@ if (PHP_SAPI === 'cli') {
     exit(2);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Fatal visibility
+// ─────────────────────────────────────────────────────────────────────────────
+// This wizard is standalone — no framework is loaded behind it that could catch
+// a fatal and report it. On any production host (display_errors off) that meant
+// an uncaught error anywhere in this file reached the browser as a blank HTTP
+// 500 with nothing in it, leaving the operator with nothing to act on and
+// nothing to report. Every "migrate.php just 500s" ticket has started from that
+// blank page. So the wizard renders its own failures instead.
+//
+// Only fatals and uncaught throwables are handled. Warnings and notices are
+// deliberately left alone: the pipeline leans on @-suppressed calls whose
+// failure is already handled in-band, and promoting those to fatals would
+// break working migrations.
+@ini_set('display_errors', '0');
+error_reporting(E_ALL);
+
+set_exception_handler(static function (Throwable $e): void {
+    mg_render_fatal(get_class($e) . ': ' . $e->getMessage(), $e->getFile(), $e->getLine(), $e->getTraceAsString());
+});
+
+register_shutdown_function(static function (): void {
+    $err = error_get_last();
+    if ($err === null || !in_array($err['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
+        return;
+    }
+    mg_render_fatal((string) $err['message'], (string) $err['file'], (int) $err['line'], null);
+});
+
 // Common validation for any POST action
 if ($method === 'POST') {
     $flagForAuth = load_flag($flagPath);
@@ -6943,6 +6972,62 @@ function render_error_page(string $title, string $body): void
     echo '<div class="mg-callout mg-callout-error"><i class="mg-i-warn"></i><div><strong>' . htmlspecialchars($title) . '</strong><br>' . $body . '</div></div>';
     echo '</div>';
     page_footer();
+}
+
+/**
+ * Render a PHP fatal / uncaught throwable as something the operator can read
+ * and paste into a bug report, instead of the blank 500 they'd otherwise get.
+ *
+ * Runs from both the exception handler and the shutdown handler — in PHP 8 an
+ * uncaught throwable is itself a fatal, so both can fire for one failure and
+ * the static guard keeps the page from rendering twice.
+ *
+ * When a long streaming step is already mid-flight the headers are long gone
+ * and a page shell would be nonsense, so the failure is appended inline. The
+ * streaming steps only ever flush complete tags, so appending here is safe.
+ */
+function mg_render_fatal(string $message, string $file, int $line, ?string $trace): void
+{
+    static $rendered = false;
+    if ($rendered) {
+        return;
+    }
+    $rendered = true;
+
+    $streaming = headers_sent();
+    if (!$streaming) {
+        http_response_code(500);
+        header('Content-Type: text/html; charset=utf-8');
+    }
+
+    $log = (string) ini_get('error_log');
+    $body = '<p>The migration wizard hit a PHP error and stopped here. Nothing after this point ran.</p>'
+        . '<p><code>' . htmlspecialchars($message) . '</code></p>'
+        . '<p class="mg-check-hint">' . htmlspecialchars($file) . ' &middot; line ' . $line . '<br>'
+        . 'PHP ' . htmlspecialchars(PHP_VERSION) . ' (' . htmlspecialchars(PHP_SAPI) . ') on '
+        . htmlspecialchars((string) ($_SERVER['SERVER_SOFTWARE'] ?? 'an unknown webserver'))
+        . ($log !== '' ? '<br>PHP error log: <code>' . htmlspecialchars($log) . '</code>' : '')
+        . '</p>';
+
+    if ($trace !== null && $trace !== '') {
+        $body .= '<details class="mg-details"><summary>Stack trace</summary>'
+            . '<div class="mg-details-body"><pre class="mg-snippet">' . htmlspecialchars($trace) . '</pre></div></details>';
+    }
+
+    $body .= '<p>Reload this page to see where the migration stands. A step that failed part-way'
+        . ' can be re-run, and Reset Migration on the Grav admin page starts over cleanly.'
+        . ' Please report this with the message above at'
+        . ' <a href="https://github.com/getgrav/grav-plugin-migrate-grav/issues">the migrate-grav issue tracker</a>.</p>';
+
+    if ($streaming) {
+        echo '<div class="mg-callout mg-callout-error"><i class="mg-i-warn"></i><div>'
+            . '<strong>The migration stopped with a PHP error.</strong>' . $body . '</div></div>';
+        echo '</div>';
+        page_footer();
+        return;
+    }
+
+    render_error_page('Migration wizard error', $body);
 }
 
 function render_wizard(array $flag, string $step, string $webroot, string $stageDir, string $stagedZip, string $flagPath, string $token, ?array $flash): void
