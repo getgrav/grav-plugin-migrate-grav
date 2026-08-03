@@ -1,3 +1,12 @@
+# v1.0.11
+## 08-03-2026
+
+1. [](#improved)
+    * **A wizard that dies now says why, instead of handing back a blank page.** `migrate.php` runs standalone, with nothing behind it to catch a PHP error and report it, so on a normal production host (where PHP is told not to print errors) any failure arrived as an empty HTTP 500 — nothing on screen, nothing to paste into a bug report, no way to tell a timeout from a missing extension. The wizard now catches its own fatals and renders the message, the file and line, the PHP version and webserver, and the path to the PHP error log, whether it happens on a normal page or partway through a long streaming step.
+
+1. [](#bugfix)
+    * **The Caddy rule shown to operators on non-Apache hosts now actually blocks anything.** It was written in nginx's regex style, which Caddy reads as a literal path that never matches, so anyone who pasted it in was told their `user/` folders were covered while they stayed publicly readable. It is now a `path_regexp` matcher that answers 403, with a note that it belongs ahead of the catch-all rewrite. The nginx rule is anchored to the start of the path at the same time, matching Grav's own bundled config.
+
 # v1.0.10
 ## 07-27-2026
 

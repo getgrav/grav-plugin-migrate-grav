@@ -187,7 +187,7 @@ HTACCESS;
     {
         $s = $this->serverSoftware();
         if (str_contains($s, 'nginx')) {
-            return "location ~* /user/(accounts|config|data|env)/.*$ { return 403; }";
+            return "location ~* ^/user/(accounts|config|data|env)/ { return 403; }";
         }
         if (str_contains($s, 'iis') || str_contains($s, 'microsoft')) {
             return '<rule name="user_sensitive_folders" stopProcessing="true">' . "\n"
@@ -196,7 +196,14 @@ HTACCESS;
                 . '</rule>';
         }
         if (str_contains($s, 'caddy')) {
-            return "rewrite /user/(accounts|config|data|env)/.* /403";
+            // Caddy's `path` matcher is literal — a bare
+            // `rewrite /user/(accounts|...)/.* /403` reads as a literal path
+            // and matches nothing, so this has to be a named `path_regexp`
+            // matcher answering 403 itself. It also has to sit inside the
+            // `route` block ahead of the `try_files` rewrite: outside a route
+            // Caddy runs the rewrite first and this never sees the request.
+            return "@grav_user_sensitive path_regexp (?i)^/user/(accounts|config|data|env)/\n"
+                . "respond @grav_user_sensitive 403";
         }
         if (str_contains($s, 'lighttpd')) {
             return '$HTTP["url"] =~ "^/user/(accounts|config|data|env)/(.*)" { url.access-deny = ("") }';
