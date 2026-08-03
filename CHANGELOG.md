@@ -1,5 +1,5 @@
 # v1.0.11
-## 07-30-2026
+## 08-03-2026
 
 1. [](#improved)
     * **A wizard that dies now says why, instead of handing back a blank page.** `migrate.php` runs standalone, with nothing behind it to catch a PHP error and report it, so on a normal production host (where PHP is told not to print errors) any failure arrived as an empty HTTP 500 — nothing on screen, nothing to paste into a bug report, no way to tell a timeout from a missing extension. The wizard now catches its own fatals and renders the message, the file and line, the PHP version and webserver, and the path to the PHP error log, whether it happens on a normal page or partway through a long streaming step.
