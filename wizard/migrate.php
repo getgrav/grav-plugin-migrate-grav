@@ -824,6 +824,7 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
     $msg = "Copied {$copied} files across user/ (" . count($copiedEntries) . ' top-level entries)';
     if ($mode !== MG_MODE_STRICT) $msg .= "; mode: {$mode}";
     if (!empty($policyResult['force_included'])) $msg .= '; force-included ' . count($policyResult['force_included']);
+    if (!empty($policyResult['needs_manual'])) $msg .= '; ' . count($policyResult['needs_manual']) . ' left enabled to verify';
     if ($upgraded) $msg .= "; updated " . count($upgraded);
     if ($symlinkCount) $msg .= "; preserved {$symlinkCount} symlink(s)";
     if ($disabled) $msg .= "; disabled " . count($disabled);
@@ -5167,6 +5168,9 @@ function mg_http_get(string $url, array $http = [])
         CURLOPT_FAILONERROR    => !$ignoreErr, // match stream 'ignore_errors' semantics
         CURLOPT_SSL_VERIFYPEER => true,
         CURLOPT_SSL_VERIFYHOST => 2,
+        // Accept any encoding cURL can decode itself. The GPM catalog is ~1.5 MB
+        // of JSON that gzips to ~375 KB — worth having on a slow shared host.
+        CURLOPT_ENCODING       => '',
     ]);
 
     // Forward the request headers built for the stream path (User-Agent, Accept).
@@ -5315,15 +5319,22 @@ function mg_install_zip_url(string $webroot, string $stageDir, string $kind, str
     }
     @file_put_contents($zipPath, $bytes);
 
-    $dest = $webroot . '/' . $stageDir . '/user/' . $kind . '/' . $slug;
-    if (is_dir($dest)) remove_dir($dest);
-    ensure_dir($dest);
-
+    // Validate the archive BEFORE touching what's already staged. The old order
+    // wiped the destination first, so any response that was large enough to
+    // clear mg_download_retry()'s floor but wasn't actually a zip — a proxy
+    // interstitial, an HTML 5xx, a licence rejection page — left an empty
+    // plugin directory behind, which reads to Grav as an installed-but-broken
+    // plugin. Failing here leaves the existing copy untouched instead.
     $zip = new ZipArchive();
     if (($rc = $zip->open($zipPath)) !== true) {
         @unlink($zipPath);
         return ['ok' => false, 'msg' => "Bad zip for {$slug} (code {$rc})"];
     }
+
+    $dest = $webroot . '/' . $stageDir . '/user/' . $kind . '/' . $slug;
+    if (is_dir($dest)) remove_dir($dest);
+    ensure_dir($dest);
+
     $prefix = detect_common_prefix($zip);
     for ($i = 0, $n = $zip->numFiles; $i < $n; $i++) {
         $name = $zip->getNameIndex($i);
@@ -5812,10 +5823,59 @@ function mg_write_plugin_enable(string $stageRoot, string $slug): void
 }
 
 /**
+ * Build a "what still needs this?" map across everything the migration is
+ * KEEPING — every kept plugin plus every theme (themes are always kept, per the
+ * Twig 3 compatibility policy). Returns dep-slug => ['theme typhoon', …].
+ *
+ * Blueprint `dependencies:` accepts both the mapping form
+ * (`- {name: svg-icons, version: '>=1.0.0'}`) and the bare-string form
+ * (`- svg-icons`); both are read. The `grav` pseudo-dependency is skipped — it
+ * describes the core version, not a package, and mg_infer_compat_from_deps()
+ * already handles it.
+ */
+function mg_build_dependency_map(string $stageRoot, array $keptPluginSlugs): array
+{
+    $sources = [];
+    foreach ($keptPluginSlugs as $slug) {
+        $sources[] = ['kind' => 'plugins', 'slug' => $slug];
+    }
+    $themeDir = $stageRoot . '/user/themes';
+    if (is_dir($themeDir)) {
+        foreach (scandir($themeDir) ?: [] as $slug) {
+            if ($slug === '.' || $slug === '..' || $slug[0] === '.') continue;
+            if (!is_dir($themeDir . '/' . $slug)) continue;
+            $sources[] = ['kind' => 'themes', 'slug' => $slug];
+        }
+    }
+
+    $map = [];
+    foreach ($sources as $src) {
+        $bp = mg_read_blueprint($stageRoot . '/user/' . $src['kind'] . '/' . $src['slug'] . '/blueprints.yaml');
+        foreach ((array) ($bp['dependencies'] ?? []) as $dep) {
+            $name = is_array($dep) ? (string) ($dep['name'] ?? '') : (string) $dep;
+            if ($name === '' || $name === 'grav' || $name === $src['slug']) continue;
+            $label = ($src['kind'] === 'themes' ? 'theme ' : 'plugin ') . $src['slug'];
+            $map[$name][$label] = true;
+        }
+    }
+    foreach ($map as $name => $labels) {
+        $map[$name] = array_keys($labels);
+    }
+    return $map;
+}
+
+/**
  * Apply the chosen compat policy to staged plugins, using POST-UPGRADE
  * verdicts (mg_rescan_staged result). Symlinked dirs are left alone —
  * dev environments choose their own versions and we don't second-guess
  * them. Supersedes are handled in their own phase before this runs.
+ *
+ * Runs in two passes so the second can see the whole picture: pass 1 decides
+ * every slug's fate, pass 2 acts on it. Between them we work out what the kept
+ * set still depends on, because removing a plugin a kept theme declares as a
+ * dependency produces a staged site that fatals on first render — a theme that
+ * calls `svg-icons`' Twig functions doesn't care that svg-icons read as
+ * 1.7-only. Those get reported for manual attention instead of deleted.
  *
  * Returns ['skipped', 'disabled', 'force_included', 'needs_manual'].
  */
@@ -5825,8 +5885,8 @@ function mg_apply_plugin_policy(string $stageRoot, array $postScan, string $poli
     $disabled      = [];
     $forceIncluded = []; // slugs that strict would have flagged as incompatible
                          // but the chosen mode promoted to compatible
-    $needsManual   = []; // protected/required slugs we refused to disable even
-                         // though they still read incompatible — reported, not killed
+    $needsManual   = []; // slugs we refused to disable even though they still
+                         // read incompatible — reported, not killed
     $pluginDir     = $stageRoot . '/user/plugins';
     if (!is_dir($pluginDir)) {
         return ['skipped' => $skipped, 'disabled' => $disabled, 'force_included' => $forceIncluded, 'needs_manual' => $needsManual];
@@ -5834,16 +5894,17 @@ function mg_apply_plugin_policy(string $stageRoot, array $postScan, string $poli
 
     $verdicts = $postScan['plugins'] ?? [];
 
+    // ── Pass 1: classify ────────────────────────────────────────────────────
+    $condemned = [];  // slug => verdict, candidates for disable/remove
+    $keptSlugs = [];  // everything staying, incl. symlinks and protected slugs
     foreach (scandir($pluginDir) ?: [] as $slug) {
         if ($slug === '.' || $slug === '..') continue;
         if ($slug[0] === '.') continue;
         $slugDir = $pluginDir . '/' . $slug;
 
         // Symlinked plugins: dev clones, leave alone.
-        if (is_link($slugDir)) continue;
+        if (is_link($slugDir)) { $keptSlugs[] = $slug; continue; }
         if (!is_dir($slugDir)) continue;
-
-        $label = "plugins/{$slug}";
 
         $rawVerdict = $verdicts[$slug] ?? ['status' => 'unknown'];
         $rawStatus  = (string) ($rawVerdict['status'] ?? 'unknown');
@@ -5859,7 +5920,23 @@ function mg_apply_plugin_policy(string $stageRoot, array $postScan, string $poli
             ];
         }
 
-        if ($effective === 'compatible' || $effective === 'needs_update') continue;
+        if ($effective === 'compatible' || $effective === 'needs_update') {
+            $keptSlugs[] = $slug;
+
+            // Kept, but the upgrade pass never got it to the 2.0 release GPM
+            // knows about (a premium package whose licence didn't come across,
+            // a failed download, gpm unavailable on the host). It stays enabled
+            // — deleting a plugin the user pays for because we couldn't fetch
+            // the newer build would be worse — but the operator gets told.
+            if ($rawStatus === 'needs_update') {
+                $needsManual[] = [
+                    'slug'   => $slug,
+                    'reason' => (string) ($rawVerdict['reason'] ?? 'a newer 2.0-compatible release is available'),
+                ];
+                if ($progress) $progress(['phase' => 'log', 'entry' => "plugins/{$slug}", 'reason' => 'kept, but still below its 2.0 release']);
+            }
+            continue;
+        }
 
         // Never disable or remove a protected/required plugin. The backstop
         // (mg_ensure_protected_upgraded) already tried to bring it to its 2.0
@@ -5867,11 +5944,52 @@ function mg_apply_plugin_policy(string $stageRoot, array $postScan, string $poli
         // the lockout from issue #13. Leave it enabled and flag it so the test
         // and promote steps can warn the operator instead.
         if (in_array($slug, MG_PROTECTED_PLUGINS, true)) {
+            $keptSlugs[] = $slug;
             $needsManual[] = [
                 'slug'   => $slug,
                 'reason' => (string) ($rawVerdict['reason'] ?? 'could not be upgraded to a 2.0-compatible release'),
             ];
-            if ($progress) $progress(['phase' => 'log', 'entry' => $label, 'reason' => 'required plugin left enabled (needs manual update)']);
+            if ($progress) $progress(['phase' => 'log', 'entry' => "plugins/{$slug}", 'reason' => 'required plugin left enabled (needs manual update)']);
+            continue;
+        }
+
+        $condemned[$slug] = $rawVerdict;
+    }
+
+    // ── Pass 2: act, sparing anything the kept set still declares a dep on ──
+    // Rescues resolve to a fixpoint before anything is touched: sparing X pulls
+    // X's own blueprint into the dependency map, and X may in turn need another
+    // slug that was on the condemned list (typhoon → svg-icons → shortcode-core).
+    $rescued = [];
+    do {
+        $dependencyMap = mg_build_dependency_map($stageRoot, $keptSlugs);
+        $added = false;
+        foreach ($condemned as $slug => $rawVerdict) {
+            if (isset($rescued[$slug])) continue;
+            // A superseded slug (admin → admin2) is never rescued: its
+            // replacement is what dependents should be pointing at, and
+            // Phase 4.5 has usually removed the dir already.
+            if (!empty($rawVerdict['replaced_by'])) continue;
+            $neededBy = $dependencyMap[$slug] ?? [];
+            if (!$neededBy) continue;
+
+            $rescued[$slug] = $neededBy;
+            $keptSlugs[]    = $slug;
+            $added          = true;
+        }
+    } while ($added);
+
+    foreach ($condemned as $slug => $rawVerdict) {
+        $label   = "plugins/{$slug}";
+        $slugDir = $pluginDir . '/' . $slug;
+
+        if (isset($rescued[$slug])) {
+            $neededBy = $rescued[$slug];
+            $needsManual[] = [
+                'slug'   => $slug,
+                'reason' => 'reads 1.7-only but is a declared dependency of ' . implode(', ', $neededBy) . ' — left enabled so the staged site still renders',
+            ];
+            if ($progress) $progress(['phase' => 'log', 'entry' => $label, 'reason' => 'kept — required by ' . implode(', ', $neededBy)]);
             continue;
         }
 
@@ -5996,6 +6114,11 @@ function mg_compat_scan_cached(string $webroot, array &$flag): array
     $scan = [
         'at'      => time(),
         'source'  => $remoteCurated !== null ? 'remote' : 'offline',
+        // Tracked separately from the curated registry: the catalog is what
+        // tells us a plugin has shipped a 2.0 release at all, so a scan built
+        // without it understates compatibility badly and must say so rather
+        // than presenting itself as the final word.
+        'gpm_source' => $gpm['plugins'] !== null ? 'remote' : 'offline',
         'gpm'     => $gpm,  // Cached so install paths can prefer GPM URLs over github_repo fallback.
         'curated' => $curated, // Cached so mg_rescan_staged() can re-verdict the post-upgrade staged tree without a second fetch.
         'plugins' => mg_scan_category($webroot . '/user/plugins', 'plugins', $curated, $gpm['plugins']),
@@ -6015,8 +6138,15 @@ function mg_compat_scan_cached(string $webroot, array &$flag): array
     // would filter the catalog with v=1.7.x and miss the 2.0-line upgrades
     // that are the whole point of the migration.
 
-    $flag['compat_scan'] = $scan;
-    save_flag($webroot . '/.migrating', $flag);
+    // A scan taken while the catalog was unreachable is deliberately NOT cached.
+    // Caching it would pin 15 minutes of "everything is 1.7-only" verdicts onto
+    // the run off the back of one transient network blip, and the user would
+    // have no way to shake it loose short of waiting out the TTL. Leaving it
+    // uncached costs a retry on the next page load and gets it right.
+    if ($scan['gpm_source'] === 'remote') {
+        $flag['compat_scan'] = $scan;
+        save_flag($webroot . '/.migrating', $flag);
+    }
     return $scan;
 }
 
@@ -6080,11 +6210,16 @@ function mg_scan_category(string $dir, string $kind, ?array $curated, ?array $gp
         if ($slug === '.' || $slug === '..') continue;
         $path = $dir . '/' . $slug;
         if (!is_dir($path)) continue;
+        // The migration tool itself is 1.x-only by design and has no business
+        // on the 2.0 site. Listing it among the user's "incompatible" plugins
+        // is pure noise — the policy pass still removes/disables the staged dir
+        // exactly as before, it just isn't reported as a compatibility problem.
+        if ($kind === 'plugins' && $slug === 'migrate-grav') continue;
 
         $bp = mg_read_blueprint($path . '/blueprints.yaml');
         $installedVersion = (string) ($bp['version'] ?? '');
 
-        $verdict = mg_resolve_compat($slug, $installedVersion, $bp, $curated[$kind] ?? []);
+        $verdict = mg_resolve_compat($slug, $installedVersion, $bp, $curated[$kind] ?? [], $gpmIndex[$slug] ?? null);
         $verdict['installed_version'] = $installedVersion;
         // Display name from the blueprint — used when matching gpm output back
         // to slug ("Preparing to install Login OAuth2 [v2.2.6]" → login-oauth2).
@@ -6169,14 +6304,24 @@ function mg_fetch_gpm_index(string $kind, string $gravVersion = '', string $phpV
         'php'     => $phpVersion  !== '' ? $phpVersion  : PHP_VERSION,
         'testing' => 1,
     ]);
-    $raw = mg_http_get($url, [
-        'timeout'       => 6,
+    // This fetch decides whether every installed plugin reads as "has a 2.0
+    // release" or "assumed 1.7-only", so it gets the same retry treatment as a
+    // package download rather than a single 6s shot. The catalog is ~1.5 MB
+    // uncompressed; a shared host on a slow link would routinely miss that
+    // deadline, and a miss used to silently condemn the user's entire plugin
+    // set with no indication anything had gone wrong.
+    // 15s × 2 attempts caps the worst case (a black-holed connection that hangs
+    // to the deadline) at roughly half a minute per index, while giving a slow
+    // but working link the room the old 6s single shot denied it. A healthy
+    // fetch lands in well under a second, so the normal case is unaffected.
+    $raw = mg_download_retry($url, [
+        'timeout'       => 15,
         'ignore_errors' => true,
         'header'        => "User-Agent: grav-migrate-wizard/1.0\r\n",
-    ]);
+    ], 1024, 2);
     if ($raw === false) return null;
     $data = json_decode($raw, true);
-    if (!is_array($data)) return null;
+    if (!is_array($data) || $data === []) return null;
 
     // The endpoint returns slug-keyed entries already, but the download URL
     // ships under `zipball_url` — normalize to the `download` field that
@@ -6302,15 +6447,27 @@ function mg_apply_baseline_registry(?array $remote): array
 /**
  * Resolve one plugin/theme's compat against (in priority):
  *   1. Curated registry entry (authoritative)
- *   2. Blueprint `compatibility.grav`
- *   3. Inference from blueprint `dependencies.grav` constraint
- *   4. Default: ['1.7'] only
+ *   2. Installed blueprint `compatibility.grav`, when it names 2.0
+ *   3. The GPM catalog entry's `compatibility.grav` — i.e. what the plugin's
+ *      LATEST release declares, not the 1.x-era copy sitting on disk
+ *   4. Installed blueprint `compatibility.grav`, when it does NOT name 2.0
+ *   5. Inference from blueprint `dependencies.grav` constraint
+ *   6. Default: ['1.7'] only
+ *
+ * Steps 2/3/4 are deliberately interleaved. The blueprint on disk describes the
+ * version the user happens to be running, which during a 1.7 → 2.0 migration is
+ * by definition the pre-2.0 one — so a plugin that has shipped a 2.0-compatible
+ * release for months still reads as "1.7-only" if we only ever look locally.
+ * The GPM catalog is queried with v=<staged 2.0>, so its entry is the
+ * maintainer's own current declaration and outranks the stale local copy.
+ * A local blueprint that already names 2.0 still wins outright (step 2) — that
+ * covers dev clones and one-off plugins GPM has never heard of.
  *
  * Returns: ['status' => 'compatible|incompatible|needs_update|unknown',
- *           'reason' => string, 'source' => 'curated|blueprint|inferred|default',
+ *           'reason' => string, 'source' => 'curated|blueprint|gpm|inferred|default',
  *           'replaced_by' => ?string, 'min_version' => ?string]
  */
-function mg_resolve_compat(string $slug, string $installedVersion, array $bp, array $curatedKind): array
+function mg_resolve_compat(string $slug, string $installedVersion, array $bp, array $curatedKind, ?array $gpmEntry = null): array
 {
     // 1. Curated registry
     if (isset($curatedKind[$slug]) && is_array($curatedKind[$slug])) {
@@ -6346,20 +6503,54 @@ function mg_resolve_compat(string $slug, string $installedVersion, array $bp, ar
         ];
     }
 
-    // 2. Blueprint explicit compatibility
+    // 2. Installed blueprint says 2.0 — believe it and stop.
     $bpCompat = $bp['compatibility']['grav'] ?? null;
-    if (is_array($bpCompat)) {
-        $ok = in_array(MG_COMPAT_TARGET, array_map('strval', $bpCompat), true);
+    if (is_array($bpCompat) && in_array(MG_COMPAT_TARGET, array_map('strval', $bpCompat), true)) {
         return [
-            'status' => $ok ? 'compatible' : 'incompatible',
-            'reason' => $ok ? 'Blueprint declares 2.0 support' : 'Blueprint lists only ' . implode(',', $bpCompat),
+            'status' => 'compatible',
+            'reason' => 'Blueprint declares 2.0 support',
             'source' => 'blueprint',
             'replaced_by' => null,
             'min_version' => null,
         ];
     }
 
-    // 3. Infer from dependencies.grav
+    // 3. The plugin's LATEST release, per the GPM catalog, declares 2.0.
+    // Either the user is already on it (compatible outright) or they're behind
+    // it, in which case this is `needs_update`: the upgrade pass will pull the
+    // 2.0 release in, and the post-upgrade rescan re-verdicts it via step 2.
+    // needs_update survives every mode and is never disabled or deleted by the
+    // policy pass, so a plugin with a real 2.0 release can no longer be dropped
+    // just because the copy on disk predates it.
+    $gpmCompat  = $gpmEntry['compatibility']['grav'] ?? null;
+    $gpmVersion = (string) ($gpmEntry['version'] ?? '');
+    if (is_array($gpmCompat) && in_array(MG_COMPAT_TARGET, array_map('strval', $gpmCompat), true)) {
+        $behind = $gpmVersion !== '' && $installedVersion !== ''
+            && version_compare($installedVersion, $gpmVersion, '<');
+        return [
+            'status' => $behind ? 'needs_update' : 'compatible',
+            'reason' => $behind
+                ? "GPM v{$gpmVersion} declares 2.0 support (installed {$installedVersion})"
+                : 'Latest GPM release declares 2.0 support',
+            'source' => 'gpm',
+            'replaced_by' => null,
+            'min_version' => $behind ? $gpmVersion : null,
+        ];
+    }
+
+    // 4. Installed blueprint has an explicit list and 2.0 isn't on it, and GPM
+    // offered nothing better. Report the blueprint's own words.
+    if (is_array($bpCompat)) {
+        return [
+            'status' => 'incompatible',
+            'reason' => 'Blueprint lists only ' . implode(',', $bpCompat),
+            'source' => 'blueprint',
+            'replaced_by' => null,
+            'min_version' => null,
+        ];
+    }
+
+    // 5. Infer from dependencies.grav
     $inferred = mg_infer_compat_from_deps($bp['dependencies'] ?? []);
     if (in_array(MG_COMPAT_TARGET, $inferred, true)) {
         return [
@@ -6371,7 +6562,7 @@ function mg_resolve_compat(string $slug, string $installedVersion, array $bp, ar
         ];
     }
 
-    // 4. Default
+    // 6. Default
     return [
         'status' => 'incompatible',
         'reason' => 'Assumed 1.7-only (no explicit 2.0 compatibility)',
@@ -7317,6 +7508,16 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
                 echo '<div class="mg-callout mg-callout-warn"><i class="mg-i-info"></i><div>Could not reach the curated compatibility registry. Falling back to blueprint + dependency inference only — verdicts may be less accurate.</div></div>';
             }
 
+            // The catalog is the source of "this plugin has shipped a 2.0
+            // release" for everything that isn't curated. Without it the table
+            // below is close to worthless — say so plainly rather than letting
+            // the user act on a page full of false negatives.
+            if (($scan['gpm_source'] ?? 'remote') === 'offline') {
+                echo '<div class="mg-callout mg-callout-error"><i class="mg-i-warn"></i><div><strong>Could not reach the GPM package catalog at <code>getgrav.org</code>.</strong> '
+                   . 'Compatibility below was worked out from the blueprints on disk alone, so any plugin that has released a 2.0-compatible version since you last updated it will be wrongly listed as incompatible. '
+                   . 'Reload this page to retry before choosing a policy — nothing has been cached.</div></div>';
+            }
+
             // Upgrade preview — counts how many rows have a candidate upgrade
             // resolved via mg_resolve_update() (i.e. GPM, with v=<staged 2.0>,
             // is offering a newer version than what's installed).
@@ -7367,7 +7568,7 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
                . '</label>';
 
             echo '<p style="margin:14px 0 8px;font-size:13.5px;color:#333;font-weight:600">Compatibility mode:</p>';
-            echo '<label class="mg-check mg-check-block"><input type="radio" name="mode" value="strict" data-mode="strict"' . $isChecked('strict', $prevMode) . '> <strong>Strict</strong> <span class="mg-btn-note">(recommended) only carry forward plugins/themes the curated registry or their blueprint explicitly marks as 2.0-compatible</span></label>';
+            echo '<label class="mg-check mg-check-block"><input type="radio" name="mode" value="strict" data-mode="strict"' . $isChecked('strict', $prevMode) . '> <strong>Strict</strong> <span class="mg-btn-note">(recommended) only carry forward plugins/themes explicitly marked 2.0-compatible — by the curated registry, by their own blueprint, or by their latest release on GPM</span></label>';
             echo '<label class="mg-check mg-check-block"><input type="radio" name="mode" value="permissive" data-mode="permissive"' . $isChecked('permissive', $prevMode) . '> <strong>Permissive</strong> <span class="mg-btn-note">also carry forward plugins where compat is just unknown — only items the curated registry explicitly flags 1.x-only stay incompatible</span></label>';
             echo '<label class="mg-check mg-check-block"><input type="radio" name="mode" value="test" data-mode="test"' . $isChecked('test', $prevMode) . '> <strong>Test</strong> <span class="mg-btn-note">(not for production) carry forward and enable EVERYTHING you have — useful for finding what actually breaks under 2.0</span></label>';
 
@@ -7629,6 +7830,23 @@ function mg_render_pt_details(array $pt): void
         echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-warn">force</span> ' . implode(', ', $lines) . '</div></div>';
     }
 
+    // Plugins deliberately left enabled despite an unresolved compat verdict:
+    // required by a kept theme or plugin, protected, or still below the 2.0
+    // release GPM lists. Nothing here is broken by definition — but each one is
+    // something to check on the staged site before promoting.
+    if (!empty($pt['needs_manual'])) {
+        echo '<div class="mg-result-section"><strong>Left enabled — check these before promoting</strong>';
+        foreach ($pt['needs_manual'] as $nm) {
+            $slug   = is_array($nm) ? (string) ($nm['slug'] ?? '') : (string) $nm;
+            $reason = is_array($nm) ? (string) ($nm['reason'] ?? '') : '';
+            if ($slug === '') continue;
+            echo '<div class="mg-result-row"><span class="mg-result-tag mg-tag-warn">verify</span> <code>' . htmlspecialchars($slug) . '</code>'
+               . ($reason !== '' ? ' <span class="mg-result-meta">' . htmlspecialchars($reason) . '</span>' : '')
+               . '</div>';
+        }
+        echo '</div>';
+    }
+
     $stripPrefix = static function (array $list, string $kind): array {
         $out = [];
         foreach ($list as $s) {
@@ -7813,13 +8031,19 @@ function render_compat_breakdown(array $scan): void
         $pending = $pendingInstalls[$k] ?? [];
         if (!$items && !$pending) continue;
 
-        $buckets = ['compatible' => [], 'needs_update' => [], 'will_upgrade' => [], 'incompatible' => []];
+        $buckets = ['compatible' => [], 'needs_update' => [], 'will_upgrade' => [], 'kept' => [], 'incompatible' => []];
         foreach ($items as $slug => $v) {
             $status = $v['status'] ?? 'incompatible';
             if ($status === 'compatible') {
                 $buckets['compatible'][$slug] = $v;
             } elseif ($status === 'needs_update') {
                 $buckets['needs_update'][$slug] = $v;
+            } elseif ($k === 'themes' && $status === 'incompatible' && empty($v['replaced_by']) && empty($v['update'])) {
+                // Themes are never disabled or removed — they ride Grav 2.0's
+                // Twig 3 compatibility layer. Filing them under "Incompatible"
+                // told users their working theme was about to break when
+                // nothing of the sort was going to happen.
+                $buckets['kept'][$slug] = $v;
             } elseif (!empty($v['update']) && empty($v['replaced_by'])) {
                 // Raw verdict is incompatible (no curated/blueprint 2.0 marker
                 // at the installed version), but GPM has a newer release the
@@ -7879,6 +8103,7 @@ function render_compat_breakdown(array $scan): void
             'compatible'   => ['icon' => '✓', 'cls' => 'ok',      'label' => 'Compatible'],
             'needs_update' => ['icon' => '⚠', 'cls' => 'warn',    'label' => 'Needs update'],
             'will_upgrade' => ['icon' => '↑', 'cls' => 'upgrade', 'label' => 'Will be upgraded'],
+            'kept'         => ['icon' => '⚠', 'cls' => 'warn',    'label' => 'Kept as-is'],
             'incompatible' => ['icon' => '✗', 'cls' => 'err',     'label' => 'Incompatible'],
         ];
         foreach ($bucketMeta as $status => $meta) {
@@ -7900,9 +8125,10 @@ function render_compat_breakdown(array $scan): void
                 // Themes without explicit 2.0 markers are the norm (almost no
                 // theme — and certainly no custom theme — declares 2.0
                 // compatibility). They're kept as-is and rely on Grav 2.0's
-                // Twig 3 compat layer. Reframe the row so users don't see a
-                // scary ✗ next to their working theme.
-                $isKeptTheme = ($k === 'themes' && $status === 'incompatible' && !$replBy);
+                // Twig 3 compat layer, and now sit in their own bucket rather
+                // than under an "Incompatible" heading that misdescribed them.
+                // $status here is the bucket key, not the verdict status.
+                $isKeptTheme   = ($status === 'kept');
                 $isWillUpgrade = ($status === 'will_upgrade');
                 $rowIcon   = $isKeptTheme ? '⚠' : $meta['icon'];
                 $rowCls    = $isKeptTheme ? 'warn' : $meta['cls'];
