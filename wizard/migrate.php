@@ -6414,6 +6414,17 @@ function mg_baseline_registry(): array
                 'grav'        => ['2.0'],
                 'github_repo' => 'getgrav/grav-plugin-problems',
             ],
+            // Superseded by a feature rather than by another package, so there
+            // is no `replaced_by` to install — Admin 2.1's Translations
+            // section covers it. The note is what the compatibility screen
+            // shows as the reason, and it has to say the data survives: the
+            // snippets live in user/config/plugins/translation-strings.yaml,
+            // which both the skip and disable policies leave alone, and the
+            // built-in editor offers to import them on the 2.0 site.
+            'translation-strings' => [
+                'grav'  => ['1.7'],
+                'notes' => 'Built into Grav 2.0 (Translations). Your snippets are carried over in user/config and can be imported from the admin.',
+            ],
         ],
         'themes' => [],
     ];
