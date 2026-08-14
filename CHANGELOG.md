@@ -1,5 +1,11 @@
+# v1.0.13
+## 2026-08-14
+
+1. [](#improved)
+    * **The Translation Strings plugin is now reported as superseded rather than simply incompatible.** Grav 2.0 has the same feature built in, so the compatibility screen now says where it went and, importantly, that your snippets come across with the rest of `user/config` and can be imported from the new admin. Both the skip and disable policies already left that file alone; nothing about what the migration does has changed, only what it tells you.
+
 # v1.0.12
-## 08-11-2026
+## 2026-08-11
 
 1. [](#bugfix)
     * **Plugins and themes that already have a Grav 2.0 release are no longer written off as "1.7-only".** Compatibility was judged from the `blueprints.yaml` sitting on disk, which during a 1.7 → 2.0 migration is by definition the pre-2.0 copy — so a plugin whose maintainer shipped 2.0 support months ago was still reported as `Assumed 1.7-only (no explicit 2.0 compatibility)` and, under the recommended Strict mode, disabled or deleted. The scan now also reads the compatibility each package declares for its *latest* release in the GPM catalog, which is where over 150 plugins and a dozen themes currently record their 2.0 support. A plugin behind that release is marked **Needs update** rather than incompatible, so the upgrade pass can bring it forward instead of the policy pass throwing it away. The curated registry still outranks everything, and a local blueprint that already names 2.0 still wins outright, so dev clones and private plugins the catalog has never heard of behave exactly as before.
@@ -13,7 +19,7 @@
     * **Plugins deliberately left enabled despite an unresolved verdict are now reported after the copy step.** Required plugins the upgrade couldn't fix, plugins kept because something else depends on them, and plugins still behind the 2.0 release the catalog lists are all called out under "Left enabled — check these before promoting", so nothing that needs a look is discovered after going live.
 
 # v1.0.11
-## 08-03-2026
+## 2026-08-03
 
 1. [](#improved)
     * **A wizard that dies now says why, instead of handing back a blank page.** `migrate.php` runs standalone, with nothing behind it to catch a PHP error and report it, so on a normal production host (where PHP is told not to print errors) any failure arrived as an empty HTTP 500 — nothing on screen, nothing to paste into a bug report, no way to tell a timeout from a missing extension. The wizard now catches its own fatals and renders the message, the file and line, the PHP version and webserver, and the path to the PHP error log, whether it happens on a normal page or partway through a long streaming step.
@@ -22,7 +28,7 @@
     * **The Caddy rule shown to operators on non-Apache hosts now actually blocks anything.** It was written in nginx's regex style, which Caddy reads as a literal path that never matches, so anyone who pasted it in was told their `user/` folders were covered while they stayed publicly readable. It is now a `path_regexp` matcher that answers 403, with a note that it belongs ahead of the catch-all rewrite. The nginx rule is anchored to the start of the path at the same time, matching Grav's own bundled config.
 
 # v1.0.10
-## 07-27-2026
+## 2026-07-27
 
 1. [](#new)
     * **Pages that use raw `<style>`, `<iframe>` or `<script>` markup keep working after the migration.** Grav 2.0 escapes those tags in Markdown output by default, so a 1.7 page carrying a style block or a video embed would suddenly render the tag as visible text; the content step now scans the migrated pages and turns the filter off when it finds any, listing which tags and pages triggered it.
@@ -35,7 +41,7 @@
     * **Restoring the backup zip now recreates directories with their original permissions instead of 777.** The backup archive never recorded the permissions of the folders and files it packed, so unzipping it by hand rebuilt every directory as world-writable 0777 rather than the 0755 they started as; the backup now stores each entry's real permissions so any unzip tool restores them correctly.
 
 # v1.0.9
-## 07-09-2026
+## 2026-07-09
 
 1. [](#bugfix)
     * **An interrupted promote no longer corrupts the site — the swap is now crash-safe and resumable.** The final promote ran as one blocking request that deleted the whole live install and *then* moved the staged Grav 2.0 tree up in its place. A proxy/PHP-FPM 503/504 (or any hard worker kill) partway through left a half-swapped webroot with no way back: 2.0's `user/` live while `system/`/`vendor/`/`bin/` were missing or stale (Admin 2.0 UI but a 1.7 version string, broken GPM, "failed to load users/logs/reports"), and `assets/`+`backup/` gone. The swap now moves the old install *aside* into a quarantine dir with atomic renames instead of deleting it, writes a journal before the first destructive step, and keeps `migrate.php`/`.migrating` in place until the very end — so nothing is ever unrecoverable, and re-opening the wizard offers a **Finish promoting** button that completes the swap forward from exactly where it stopped (or you can restore the backup zip to roll back). The old install is deleted only after the 2.0 tree is fully in place, and `assets/`+`backup/` are recreated writable so a migrated site never boots to a "not writeable" error. [#17]
@@ -44,7 +50,7 @@
     * **The Step 5 content summary is now a readable list instead of a wall of text.** The post-migration summary — everything the content step enabled, widened, removed, and flagged — was assembled as one long run-on paragraph, so the important NOTEs about unmapped sandbox methods and plugin-provided Twig functions were buried mid-sentence. It now renders as a lead line plus one bullet per action, with config keys/paths set in code and NOTE/WARNING lines given a subtle accent, so what needs your attention stands out at a glance.
 
 # v1.0.7
-## 07-07-2026
+## 2026-07-07
 
 1. [](#bugfix)
     * **Re-running the migration now repairs a `system.yaml` an earlier build had already corrupted.** The 1.0.6 indentation fix stopped *new* corruption, but a site migrated with the buggy build still had the broken `images:` block on disk — and re-running did nothing, because the writer saw a `url_actions:` key already present and bailed as "already on", leaving it mis-indented and the site blank. The writer now derives the block's real indent from its shallowest child (so a stray key can't throw it off), and re-emits `url_actions: true` at the correct indentation whenever the existing key is mis-indented or set to a false value. Re-running the content step over an already-broken staged install now heals it. (Sites already promoted to live with the broken config must fix `system.yaml` by hand or restore the backup and re-migrate on 1.0.7.)
@@ -54,14 +60,14 @@
     * **Surgical `system.yaml` edits are now validated before they're written.** The migrator edits config as raw text (to preserve your comments and formatting rather than flattening everything through a parse/dump), but a mis-computed indent could still emit YAML that Grav then won't load. Every surgical write to `system.yaml` — both the `images.url_actions` toggle and the `security.twig_*` changes — now parses the result first and skips the write with a clear warning if it wouldn't load, so a bad edit can never blank the migrated site.
 
 # v1.0.5
-## 07-04-2026
+## 2026-07-04
 
 1. [](#bugfix)
     * **Migrated accounts keep the admin language they were using before.** Classic admin stored each user's language on their account, but Admin 2.0 reads it from a different place, so the accounts step now copies that preference across instead of letting everyone fall back to the site default. [grav-plugin-admin2#98]
     * **A version-controlled webroot keeps its `.git` repo through the migration.** The promote step deleted every top-level entry except the staged install when swapping Grav 2.0 in, which wiped a `.git` (or `.svn`/`.hg`) directory at the webroot root — so a site deployed via git lost its repository and history, with no way to opt out since VCS folders were never shown in the carry-forward list. Promote now leaves version-control metadata in place (neither backed up nor deleted), so your repo survives and the new 2.0 files simply show up as changes to review and commit; the promote screen also notes when it detects a repo. [#15]
 
 # v1.0.4
-## 07-02-2026
+## 2026-07-02
 
 1. [](#bugfix)
     * **The in-process plugin installer now works on hosts with `allow_url_fopen` disabled.** The 1.0.3 fallback that installs each plugin's 2.0 release when `proc_open()` is blocked still fetched every URL with PHP's stream wrapper, so on restrictive shared hosts that also disable `allow_url_fopen` (a common pairing) the curated registry, the GPM index, the GitHub release lookup, and the plugin/theme zip downloads all silently returned nothing — admin2/api never installed and flex-objects couldn't upgrade, so the promote guard correctly blocked with "missing required plugins" and the migration dead-ended. Every remote fetch in the wizard now falls back to cURL when `allow_url_fopen` is off, mirroring the staging download that already did — the same transport Grav's own GPM uses, so a host with a working admin/GPM can now download here too. [#14]
@@ -69,7 +75,7 @@
     * **The pre-flight check now hard-fails up front when the host truly can't download.** `proc_open` and `allow_url_fopen` each have a working fallback, so neither alone blocks a migration; the one condition that genuinely can't complete is when *both* `allow_url_fopen` is off *and* the PHP `curl` extension is missing — there's then no way out to fetch the Grav 2.0 zip or the required 2.0 plugins. Step 1 now surfaces this as a red, blocking check with the reason and concrete remedies (enable `curl` or `allow_url_fopen`, run `bin/plugin migrate-grav init` from the CLI, or stage the zip and plugins by hand), instead of letting the migration proceed and silently dead-end at promote. [#14]
 
 # v1.0.3
-## 06-26-2026
+## 2026-06-26
 
 1. [](#bugfix)
     * **Plugins now upgrade to their Grav 2.0 versions even when `proc_open()` is disabled.** On shared hosts that block shell access the wizard falls back to an in-process installer that downloads each plugin's 2.0 release directly, instead of skipping the upgrade. [#13]
@@ -78,7 +84,7 @@
     * **Plugin and theme downloads now retry on transient network errors.** A single dropped connection no longer turns into a failed plugin install. [#13]
 
 # v1.0.2
-## 06-25-2026
+## 2026-06-25
 
 1. [](#new)
     * **The image-manipulation chain in page content now keeps working after migration, with the Twig sandbox left enabled.** The content scan that widens `security.twig_sandbox` only looked at function and filter calls, never object **method** calls, so the standard media idiom `{{ page.media['x.jpg'].lightbox().cropResize(…).html()|raw }}` broke after an otherwise-clean migration. The scanner now also captures `obj.method()` tokens; the documented media chain is already allow-listed by Grav 2.0 core on the `Medium` class, so the migrator recognises it as covered and only seeds object methods your content uses that 2.0 defaults don't already permit (writing the complete per-class list so the by-position merge never drops a default). Anything it can't map to a class is flagged in the report. [#11]
@@ -90,7 +96,7 @@
     * **Staging no longer fails with "Failed to open source URL" on shared hosting.** The kickoff downloaded the Grav 2.0 zip with PHP's URL stream wrapper, which fails outright when `allow_url_fopen` is disabled — common on locked-down shared hosting — producing only a generic error. The download now falls back to cURL when `allow_url_fopen` is off, the Migrate Grav admin page checks up front whether the host can fetch the release at all (and disables staging with a clear explanation when it can't), and the failure messages point at the `source_local_zip` escape hatch (download the zip manually, set its path, and the download is skipped entirely). [#12]
 
 # v1.0.1
-## 06-24-2026
+## 2026-06-24
 
 1. [](#bugfix)
     * **An environment-scoped Twig-in-content opt-in is no longer lost, so Twig keeps working after migrating.** The scanner that re-opens Grav 2.0's default-off `security.twig_content` gate only read the top-level `user/config/system.yaml`, so a site that enabled `pages.process.twig` (or `pages.frontmatter.process_twig`) in an environment override at `user/env/<host>/config/system.yaml` migrated with the gate left closed — every `{{ ... }}` and `{% ... %}` in page content stopped rendering, with no clue in `logs/security.log` because content Twig was never even requested. The scanner now reads the top-level config and every environment override, honours the opt-in found in any of them, unions each file's `system.twig.safe_functions`/`safe_filters` allowlist, and strips the now-redundant legacy flag from each file that carried it so the 2.0 gate stays the single source of truth.
@@ -98,13 +104,13 @@
     * **A custom base URL no longer breaks the staged preview with `ERR_TOO_MANY_REDIRECTS`.** When the source site set `system.custom_base_url` (e.g. to pin email links to a trusted host), that value was copied verbatim into the staged install. But the staged install runs under a subpath (`stage_dir`, default `/grav-2/`), and a base URL with no matching path forces Grav's `root_path` to empty — so the home/canonical redirect loops and the preview fails to load. The migration now temporarily blanks `custom_base_url` in the staged `system.yaml` so the preview loads, and restores the original value automatically during promote, once the install is back at the original webroot where the setting is correct again. An operator who deliberately re-sets it during the preview is never overwritten. [#8]
 
 # v1.0.0
-## 06-20-2026
+## 2026-06-20
 
 1. [](#new)
     * Version 1.0 stable release for Grav 2.x
 
 # v1.0.0-rc.7
-## 06-19-2026
+## 2026-06-19
 
 1. [](#bugfix)
     * **A plugin or theme that declares Grav 2.0 support in its own `blueprints.yaml` is now trusted when it isn't in the curated registry.** The compatibility scan already preferred the curated registry and fell back to the blueprint, but the blueprint reader parsed YAML with a narrow hand-rolled regex whenever PHP's `ext-yaml` was absent (the common case), and that regex only matched the inline flow style `grav: ['1.7', '2.0']` — it silently ignored the standard block-list style. A one-off or private plugin that had been tested and marked compatible with the conventional `compatibility:` / `grav:` block list was therefore reported as "Assumed 1.7-only (no explicit 2.0 compatibility)". [#7]
@@ -112,7 +118,7 @@
     * The wizard now reads every YAML file through one parser — Symfony Yaml, loaded from the existing install's `vendor/` that sits right beside `migrate.php` — instead of falling back to `ext-yaml` or a hand-rolled regex. The regex understood only a subset of YAML and produced different results than the real parser; routing everything through the same proven parser gives consistent results regardless of the host's PHP extensions. The existing install's `vendor/` is preferred over the staged 2.0 tree because its location is fixed and known (the staged directory name is configurable) and it is guaranteed present.
 
 # v1.0.0-rc.6
-## 06-16-2026
+## 2026-06-16
 
 1. [](#bugfix)
     * **A truncated Grav 2.0 download can no longer be staged.** PHP's HTTP stream reports end-of-file when the server, a proxy, or a flaky connection drops mid-transfer, so the kickoff's download loop exited cleanly on a partial file, and the only validation afterward was a 1KB minimum-size check — a release zip cut off at any point past that sailed through and got marked as staged. The wizard then failed at the extract step with the unhelpful `Could not open zip (code 35)` (libzip's "truncated zip archive"). The kickoff now cross-checks the bytes received against the response's `Content-Length`, verifies the file actually opens as a zip archive (with at least one entry) before the `.migrating` flag is written, deletes the partial file on any failure, and reports what went wrong — including how many bytes arrived versus how many were expected — along with the remedy (retry, or download the release manually and point `source_local_zip` at it).
@@ -122,7 +128,7 @@
     * Disk-full or quota errors while saving the download are now detected at write time instead of silently truncating the file.
 
 # v1.0.0-rc.5
-## 06-10-2026
+## 2026-06-10
 
 1. [](#new)
     * A customized admin path now carries across the migration. Grav 1.7 stores the admin route in `admin.yaml`, but Admin 2.0 reads its own `admin2.yaml`, so a site that changed `/admin` to e.g. `/backend` as a security measure would otherwise revert to the default after migrating. When the source route differs from the `/admin` default, the migration now writes it into the staged `admin2.yaml` (normalized to Admin 2.0's `/path` form), merging into any existing admin2 config rather than overwriting it. Only the route is carried — it's the one 1.7 admin setting Admin 2.0 has an equivalent for. [#6]
@@ -130,7 +136,7 @@
     * Migration now scans content for URL-based image transforms that bypass Grav's media object (e.g. `image.jpg?cropResize=300,200`) and turns on Grav 2.0's new `system.images.url_actions` toggle in the staged `system.yaml` when it finds any. Grav 1.7 applied these query-string actions with no gate; 2.0 disables them by default because they run with arguments an unauthenticated visitor controls. The normal developer-driven path is unaffected and deliberately left alone: a Twig/Markdown media call like `page.media['x'].cropResize(300,200)`, or a Markdown image whose file is the page's own media (`![](x.jpg?cropResize=300,200)`), is resolved through the media object into a hashed cache URL with no query string and never touches the toggle. Only references Grav can't resolve to page media — absolute/rooted paths, `theme://`/`image://` stream paths, files that aren't co-located, and anything hand-written in a theme template — keep their literal `?action=` URL and need the toggle, so those are what flip it on. External and protocol-relative URLs (`https://cdn.example.com/x.jpg?format=webp`, `//host/x.jpg?…`) are skipped, since they're served by the remote host and a CDN's own query string can't be a Grav image action. The report lists the pages and templates involved, and flags any transform that requests an image above the `system.images.max_pixels` ceiling (still refused even with the toggle on) so you can raise the limit or rework it.
 
 # v1.0.0-rc.4
-## 06-03-2026
+## 2026-06-03
 
 1. [](#new)
     * Migration now scans the source site for Twig-in-content usage (both per-page `process: twig: true` and the site-wide `system.yaml` opt-ins) and turns on Grav 2.0's new `security.twig_content` gate in the migrated install, so those pages keep rendering after promote. If any Twig-enabled page also reads site config inside Twig, the `config` access toggle is enabled too.
@@ -145,7 +151,7 @@
     * **Backup zip created on Windows is now extractable.** `mg_zip_webroot` was passing `SplFileInfo::getPathname()` output straight into `ZipArchive::addFile($abs, $rel)` — on Windows that meant entry names were stored with native `\\` separators instead of the `/` the zip spec requires. Every standards-tolerant extractor (7-Zip, Windows Explorer's in-place viewer, macOS Archive Utility) treated the backslashes as literal filename characters, dumping every file in the zip's root with names like `user\plugins\admin\file.php` and rendering directory entries as a flat breadcrumb list. Now normalized to `/` regardless of OS. A standalone repair script `wizard/mg-repair-backup.php` ships in this release for users whose pre-rc.3 Windows backup zips are still on disk — it rewrites the entry names so the zip extracts correctly with any tool.
 
 # v1.0.0-rc.3
-## 05-13-2026
+## 2026-05-13
 
 1. [](#improved)
     * Pre-promote callout now warns to close any editor, git GUI (Sourcetree, GitHub Desktop, GitKraken), and terminal that has the webroot open — on Windows these processes hold file handles that block the Phase 2 delete pass.
@@ -158,7 +164,7 @@
     * Outbound HTTP from the migration wizard now honors Grav's `system.http.proxy_url` and `system.http.proxy_cert_path` settings (and the standard `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` env vars as fallback). Previously, every HTTP call — the Grav 2.0 zip download, GPM catalog queries, GitHub release lookups, plugin/theme replacement zips, the curated compat registry — built its own stream context with no proxy support and silently failed for sites behind a corporate proxy. Kickoff now forwards the site's proxy config into the `.migrating` flag at staging time, and the standalone wizard reads it via a new `mg_http_context()` helper. [#2]
 
 # v1.0.0-rc.2
-## 05-06-2026
+## 2026-05-06
 
 1. [](#improved)
     * Step 2 compatibility breakdown now has a dedicated **Will be upgraded** bucket for plugins whose installed version reads as 1.7-only but for which GPM has a newer 2.0-compatible release. Previously these were rendered under **Incompatible** even though Phase 4's `gpm update` will land the new version — misleading because the user's skip/disable policy doesn't apply to them.
@@ -167,7 +173,7 @@
     * GPM upgrade detection no longer silently fails: `getgrav.org/downloads` returns the install URL under `zipball_url`, but the wizard was reading `download`. Normalized inside `mg_fetch_gpm_index` so every plugin with a newer 2.0-compatible release on GPM now lands in the **Will be upgraded** bucket and gets installed via GPM during the upgrade pass (instead of silently falling through to the GitHub fallback path).
 
 # v1.0.0-rc.1
-## 05-04-2026
+## 2026-05-04
 
 1. [](#new)
     * Two reset modes — **Restart Wizard** keeps the downloaded Grav 2.0 zip and lets you re-run from step 1, **Reset Migration** wipes everything and starts over.
@@ -187,14 +193,14 @@
     * CLI php detection handles hosts where `PHP_BINARY` points at `php-fpm` or `php-cgi`.
 
 # v1.0.0-beta.5
-## 04-25-2026
+## 2026-04-25
 
 2. [](#bugfix)
     * Use 'latest' URL to always get the latest version of Grav 2.0 beta
     * Allow being run in Grav 1.7.49+
 
 # v1.0.0-beta.4
-## 04-21-2026
+## 2026-04-21
 
 1. [](#improved)
     * Default source URL now points at the released Grav 2.0 beta `grav-update` package (`https://getgrav.org/download/core/grav-update/2.0.0-beta.1?testing`) instead of a local dev zip. The update package ships system/vendor/bin only (no baseline `user/` pages) — this avoids polluting migrated sites with default home/typography pages that the full install package would otherwise drop on top of the source content.
@@ -208,19 +214,19 @@
     * `mg_patch_staged_htaccess` (used by the Test step to set `RewriteBase` for sub-path testing) no longer fails on `grav-update`-based stages — the extract step materializes `.htaccess` from the zip's `webserver-configs/htaccess.txt` template when missing.
 
 # v1.0.0-beta.3
-## 04-20-2026
+## 2026-04-20
 
 1. [](#bugfix)
     * Use beta release URL of Grav 2.0
 
 # v1.0.0-beta.2
-## 04-16-2026
+## 2026-04-16
 
 1. [](#bugfix)
     * Preserve executable bits on `bin/*` during staged zip extract. The raw `fwrite()`-based extractor dropped the mode stored in the zip's central directory, landing `bin/grav`, `bin/gpm`, `bin/plugin`, and `bin/composer.phar` at `0644` post-migration and breaking CLI tooling on the fresh 2.0 install. Extract now honors the zip's unix mode when present, with a safety-net `chmod 0755` for anything directly under `bin/` so test-built zips (which omit mode metadata) also work.
 
 # v1.0.0-beta.1
-## 04-15-2026
+## 2026-04-15
 
 1. [](#new)
    * Initial scaffold: kickoff plugin for staging Grav 2.0 alongside an existing 1.7/1.8 site.
