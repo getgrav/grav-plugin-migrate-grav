@@ -32,6 +32,17 @@ const MG_IMPORT_OPTIONAL = ['plugins', 'themes'];
 // history (issue #15). Top-level only; a `.git` nested inside a plugin is part
 // of that plugin's tree and handled normally.
 const MG_PRESERVE_IN_PLACE = ['.git', '.svn', '.hg'];
+// Version-control metadata that lives at the top of `user/` rather than at the
+// webroot, and so has to be *copied* into the staged tree rather than left in
+// place. git-sync puts its repo here by default (USER_DIR/.git plus a .gitignore
+// it maintains itself), and the plugin gates every operation on that directory
+// existing — drop it and git-sync silently stops committing with no error at
+// all. Anyone hand-managing `user/` in git is in the same boat. Everything else
+// starting with a dot in `user/` is still treated as filesystem cruft.
+const MG_COPY_VCS_IN_USER = [
+    '.git', '.gitignore', '.gitattributes', '.gitmodules',
+    '.svn', '.hg', '.hgignore',
+];
 const MG_COMPAT_URL      = 'https://getgrav.org/gpm/compatibility/v1/_all';
 const MG_COMPAT_TARGET   = '2.0';
 const MG_COMPAT_TTL      = 900;
@@ -5633,8 +5644,10 @@ function mg_gpm_update(string $stageRoot, string $kind, array $excludeSlugs, ?ca
 
 /**
  * Copy the entire source user/ tree into the staged install verbatim.
- * Top-level dotfiles/dotdirs (.git, .DS_Store, editor backups) are skipped
- * as filesystem cruft. Symlinks (top-level and mid-tree) are preserved as
+ * Top-level dotfiles/dotdirs (.DS_Store, editor backups) are skipped as
+ * filesystem cruft, except the version-control metadata in
+ * MG_COPY_VCS_IN_USER — that is real site state (git-sync's repo lives at
+ * user/.git) and is carried forward. Symlinks (top-level and mid-tree) are preserved as
  * symlinks so dev environments with linked plugin/theme clones keep their
  * wiring in the staged tree. Downstream phases
  * mutate the staged tree in place (plugin policy, auto-updates, account
@@ -5648,7 +5661,7 @@ function mg_bulk_copy_user(string $srcUser, string $dstUser, int &$copied, ?call
     foreach (scandir($srcUser) ?: [] as $entry) {
         if ($entry === '.' || $entry === '..') continue;
 
-        if ($entry[0] === '.') {
+        if ($entry[0] === '.' && !in_array($entry, MG_COPY_VCS_IN_USER, true)) {
             $copySkipped[] = "{$entry} (dotfile/dotdir)";
             continue;
         }
@@ -6413,6 +6426,18 @@ function mg_baseline_registry(): array
             'problems' => [
                 'grav'        => ['2.0'],
                 'github_repo' => 'getgrav/grav-plugin-problems',
+            ],
+            // Runs fine on 2.0, but its repo lives at user/.git (or wherever
+            // `local_repository` points) and the plugin silently no-ops when
+            // that directory is missing — no error, sync just stops. The user/
+            // copy carries VCS metadata forward (MG_COPY_VCS_IN_USER), so this
+            // entry exists to say so on the compatibility screen: if a site
+            // ever lands on 2.0 without its repo, this is the first place to
+            // look. See git-sync issue #255.
+            'git-sync' => [
+                'grav'        => ['1.7', '2.0'],
+                'github_repo' => 'trilbymedia/grav-plugin-git-sync',
+                'notes'       => 'Compatible with 2.0. Its git repository (user/.git by default) is carried over — if sync stops silently after migrating, check that directory survived.',
             ],
             // Superseded by a feature rather than by another package, so there
             // is no `replaced_by` to install — Admin 2.1's Translations
