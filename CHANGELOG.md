@@ -1,3 +1,10 @@
+# v1.0.14
+## 2026-08-17
+
+1. [](#bugfix)
+    * **Sites that keep `user/` in git — Git Sync sites in particular — no longer arrive on 2.0 with the repository missing.** The copy step treated everything starting with a dot at the top of `user/` as filesystem cruft, which is right for `.DS_Store` and editor leftovers but wrong for `user/.git` and the `.gitignore` beside it. Git Sync puts its repository there by default and checks for that exact directory before doing anything, so a migrated site came up with sync quietly switched off: no error, no warning, content edits simply stopped producing commits. Version-control metadata at the top of `user/` is now carried into the migrated site along with everything else, matching how a version-controlled webroot has always been handled. The old install and the backup zip both kept their copy, so anyone already affected can restore the directory by hand. [git-sync #255]
+    * **Git Sync is now named on the compatibility screen with a note about where its repository lives**, so if a site ever does land on 2.0 without one, the first place to look is written down rather than deduced.
+
 # v1.0.13
 ## 2026-08-14
 
