@@ -32,6 +32,17 @@ const MG_IMPORT_OPTIONAL = ['plugins', 'themes'];
 // history (issue #15). Top-level only; a `.git` nested inside a plugin is part
 // of that plugin's tree and handled normally.
 const MG_PRESERVE_IN_PLACE = ['.git', '.svn', '.hg'];
+// Top-level runtime dirs left OUT of the Phase-1 rollback backup. These are all
+// regenerable caches / transient scratch (Grav recreates them empty on the next
+// boot) or prior backup archives — none are install state a rollback needs, and
+// on a live 1.x site `cache/` and `images/` alone are routinely tens of
+// thousands of files and hundreds of MB. Folding them into the backup zip is
+// what makes ZipArchive::close() run for minutes with no output, long enough for
+// a shared host's php-fpm request_terminate_timeout or the reverse proxy's read
+// timeout (neither of which set_time_limit(0) can lift) to kill the request
+// mid-write — the reported symptom (issue #20). This mirrors Grav's own default
+// backup profile, which excludes exactly /backup /cache /images /logs /tmp.
+const MG_BACKUP_SKIP_TOP = ['backup', 'cache', 'images', 'logs', 'tmp'];
 // Version-control metadata that lives at the top of `user/` rather than at the
 // webroot, and so has to be *copied* into the staged tree rather than left in
 // place. git-sync puts its repo here by default (USER_DIR/.git plus a .gitignore
@@ -1461,6 +1472,47 @@ function mg_migrate_admin_route(string $stageRoot, ?callable $progress = null): 
 }
 
 /**
+ * Build the admin URL for an install root, honoring a customized admin2 route.
+ *
+ * The wizard's later screens tell the operator to go log into the admin, so the
+ * link has to land where their admin actually lives. A 1.7 install that moved
+ * `/admin` to `/backend` gets that carried into admin2 by
+ * mg_migrate_admin_route(), and a hardcoded `/admin` link would just 404.
+ *
+ * Reads the install's own `admin2.yaml` rather than the `.migrating` flag, so a
+ * hand-edit after the copy step is still respected, and so this works the same
+ * before and after promote.
+ *
+ * Returns null when admin2 isn't installed or is disabled — callers should then
+ * omit the link entirely rather than point at a dead URL.
+ *
+ * @param string $root    Absolute path to the install root (stage dir, or the
+ *                        webroot once promoted).
+ * @param string $baseUrl URL prefix for that root; trailing slash optional.
+ */
+function mg_admin_url(string $root, string $baseUrl): ?string
+{
+    if (!is_dir($root . '/user/plugins/admin2')) return null;
+
+    $route = '/admin';
+    $cfg   = $root . '/user/config/plugins/admin2.yaml';
+    if (is_file($cfg)) {
+        mg_ensure_yaml_available();
+        $data = mg_yaml_parse_file($cfg);
+        if (is_array($data)) {
+            if (($data['enabled'] ?? true) === false) return null;
+            $configured = $data['route'] ?? null;
+            if (is_string($configured) && trim($configured) !== '') {
+                $configured = '/' . trim(trim($configured), '/');
+                if ($configured !== '/') $route = $configured;
+            }
+        }
+    }
+
+    return rtrim($baseUrl, '/') . '/' . ltrim($route, '/');
+}
+
+/**
  * Parse a YAML file with Symfony Yaml — the single parser the wizard uses, so
  * results are consistent everywhere. mg_ensure_yaml_available() loads it from
  * the existing install's vendor/ (always present beside migrate.php). Returns
@@ -2363,6 +2415,17 @@ function mg_zip_webroot(ZipArchive $zip, string $webroot, string $skipTop, int &
                     foreach (MG_PRESERVE_IN_PLACE as $vcs) {
                         if ($path === $webroot . DIRECTORY_SEPARATOR . $vcs
                             || strpos($path, $webroot . DIRECTORY_SEPARATOR . $vcs . DIRECTORY_SEPARATOR) === 0) {
+                            return false;
+                        }
+                    }
+                    // Skip regenerable runtime dirs + prior backups at the webroot
+                    // root only (a plugin's own cache/ under user/plugins/ is left
+                    // alone). Root-anchored to match Grav's /cache-style excludes and
+                    // to keep the backup small enough that close() finishes before a
+                    // shared host's FPM/proxy timeout (issue #20).
+                    foreach (MG_BACKUP_SKIP_TOP as $skip) {
+                        if ($path === $webroot . DIRECTORY_SEPARATOR . $skip
+                            || strpos($path, $webroot . DIRECTORY_SEPARATOR . $skip . DIRECTORY_SEPARATOR) === 0) {
                             return false;
                         }
                     }
@@ -7707,7 +7770,21 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
                 echo '<div class="mg-callout mg-callout-warn"><i class="mg-i-warn"></i><div>Detected <strong>' . htmlspecialchars(ucfirst($serverKind)) . '</strong>. Auto-patching only works for Apache/LiteSpeed. <strong>Apply the manual config below before testing</strong>, or your test traffic will hit the 1.x install.</div></div>';
             }
 
-            echo '<div style="margin-top:12px"><a class="mg-btn mg-btn-primary" href="' . htmlspecialchars($stageUrl) . '" target="_blank" rel="noopener">Open staged install →</a></div>';
+            // Link straight into the staged admin too — at a customized route if
+            // Step 2 carried one over, since that's exactly the case where
+            // guessing /admin gets you a 404.
+            $stageAdminUrl = mg_admin_url($stageDirAbs, $stageUrl);
+
+            echo '<div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">';
+            echo '<a class="mg-btn mg-btn-primary" href="' . htmlspecialchars($stageUrl) . '" target="_blank" rel="noopener">Open staged install →</a>';
+            if ($stageAdminUrl !== null) {
+                echo '<a class="mg-btn mg-btn-secondary" href="' . htmlspecialchars($stageAdminUrl) . '" target="_blank" rel="noopener">Open staged admin →</a>';
+                $carried = $pt['admin_route'] ?? null;
+                if (!empty($carried['migrated'])) {
+                    echo '<span class="mg-btn-note">custom admin route <code>' . htmlspecialchars((string) $carried['route']) . '</code> carried over from 1.7</span>';
+                }
+            }
+            echo '</div>';
 
             // Server-specific manual instructions
             echo '<details class="mg-details" style="margin-top:18px"><summary>Using nginx, Caddy, or another server? Manual config snippets</summary>';
@@ -7835,8 +7912,22 @@ function render_current_step(string $step, array $preflight, bool $preflightOk, 
             break;
 
         case 'promoted':
+            // Post-promote the staged install lives at the webroot, so the admin
+            // hangs off the wizard's own base path.
+            $webroot  = dirname($stageDirAbs);
+            $adminUrl = mg_admin_url($webroot, base_path_from_script());
+
             echo '<div class="mg-card mg-card-active"><h3>Migration complete</h3>';
             echo '<p>Grav 2.0 is live. Log into the admin to verify your content and plugins.</p>';
+            if ($adminUrl !== null) {
+                echo '<div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">';
+                echo '<a class="mg-btn mg-btn-primary" href="' . htmlspecialchars($adminUrl) . '" target="_blank" rel="noopener">Open the admin →</a>';
+                $carried = $flag['plugins_themes']['admin_route'] ?? null;
+                if (!empty($carried['migrated'])) {
+                    echo '<span class="mg-btn-note">custom admin route <code>' . htmlspecialchars((string) $carried['route']) . '</code> carried over from 1.7</span>';
+                }
+                echo '</div>';
+            }
             echo '</div>';
             break;
     }

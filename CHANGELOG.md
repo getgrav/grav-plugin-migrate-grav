@@ -1,3 +1,11 @@
+# v1.0.15
+## 2026-08-21
+
+1. [](#bugfix)
+    * **The safety backup taken just before promoting to 2.0 no longer stalls or vanishes part-way on shared hosting.** It was archiving the whole install, including the regenerable `cache/` and processed-`images/` folders, the logs and temp dirs, and any earlier backup zips — on a busy 1.x site that is tens of thousands of throwaway files and hundreds of megabytes, and zipping them made the final write run silently for minutes, long enough for a shared host to cut the request off (the backup file would freeze or disappear with the wizard stuck). The backup now leaves those folders out, exactly as Grav's own backup does, so it finishes quickly and captures only what a rollback actually needs. [#20]
+1. [](#improved)
+    * **The test and completion screens now link straight into the admin, at whatever route your admin actually lives on.** Both screens told you to go log in and verify, then left you to work out the URL yourself — fine if you're on `/admin`, considerably less fine if you moved it to something else for security, since the wizard already carries that custom route across to Admin 2.0 and nothing on the page said where it had gone. Step 5 gains an "Open staged admin" button beside "Open staged install", the final screen gains one of its own, and when a non-default route was carried over from 1.7 it's named next to the button. The link is read from the install's own `admin2.yaml` rather than from the migration record, so a route you change by hand afterwards is still the one you get, and it's left out entirely when Admin 2.0 isn't installed or is disabled rather than pointing at a URL that isn't there.
+
 # v1.0.14
 ## 2026-08-17
 
