@@ -1,3 +1,9 @@
+# v1.0.16
+## 2026-09-22
+
+1. [](#bugfix)
+    * **Grav 2.0 needs PHP 8.3, and the migration now says so plainly instead of crashing with a parse error.** On older PHP the wizard died with `syntax error, unexpected 'o777'` before it could explain anything. The Migrate Grav admin page now names the PHP version you're on in place of the start button, `bin/plugin migrate-grav init` refuses, and opening `migrate.php` on old PHP shows a full-page error explaining what to upgrade, even when the migration was started from a newer PHP on the command line.
+
 # v1.0.15
 ## 2026-08-21
 

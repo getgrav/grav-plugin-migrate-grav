@@ -202,13 +202,26 @@
             <div class="mg-hero-inner">
                 <div class="mg-hero-icon">{{ rocket_svg|raw }}</div>
                 <div class="mg-hero-text">
+                    {% if migrate_grav_php and not migrate_grav_php.ok %}
+                    <h2>Upgrade PHP before moving to Grav 2.0</h2>
+                    <p>Grav 2.0 requires PHP 8.3 or newer. Migration stays disabled until this site runs on a supported PHP version.</p>
+                    {% else %}
                     <h2>Ready to move to Grav 2.0</h2>
                     <p>Stage a fresh Grav 2.0 install alongside this site and hand off to a standalone migration wizard. Your current site stays untouched until you explicitly promote the new install.</p>
+                    {% endif %}
                 </div>
             </div>
         </div>
 
-        {% if migrate_grav_state %}
+        {% if migrate_grav_php and not migrate_grav_php.ok %}
+            <div class="mg-callout mg-callout-danger">
+                <i class="fa fa-exclamation-triangle"></i>
+                <div class="mg-callout-body">
+                    <strong>This site runs PHP {{ migrate_grav_php.version }}, and Grav 2.0 will not run on it.</strong>
+                    <p style="margin:6px 0 0;">Grav 2.0 requires PHP 8.3 or newer, so there is nothing to migrate to until PHP is upgraded. Switch this site to PHP 8.3+ (usually a setting in your hosting control panel, or the PHP image in Docker), check that it still works, then come back here to start the migration.</p>
+                </div>
+            </div>
+        {% elseif migrate_grav_state %}
             <div class="mg-callout mg-callout-active">
                 <i class="fa fa-refresh fa-spin"></i>
                 <div>

@@ -16,9 +16,9 @@ process that has no relationship to your running 1.x install.
 
 ## Requirements
 
+- **PHP 8.3 or newer.** Grav 2.0 does not run on anything older, so move your 1.7/1.8 site to PHP 8.3+ first and confirm it still works there before migrating. The plugin refuses to start a migration on older PHP.
 - Grav 1.7.50+ or 1.8.x
 - Write access to your webroot and `tmp/` directory
-- PHP 7.3.6+ (for the kickoff itself; the 2.0 wizard requires PHP 8.3+)
 
 ## Installation
 
