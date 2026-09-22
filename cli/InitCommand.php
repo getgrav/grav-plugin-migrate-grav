@@ -64,6 +64,12 @@ class InitCommand extends ConsoleCommand
         $config['proxy_url']       = (string) $grav['config']->get('system.http.proxy_url', '');
         $config['proxy_cert_path'] = (string) $grav['config']->get('system.http.proxy_cert_path', '');
 
+        if (version_compare(PHP_VERSION, '8.3.0', '<')) {
+            $this->output->writeln('<red>Grav 2.0 requires PHP 8.3 or newer and will not run on PHP ' . PHP_VERSION . '.</red>');
+            $this->output->writeln('If your site already uses a newer PHP, run this command with that binary instead.');
+            return 1;
+        }
+
         require_once dirname(__DIR__) . '/classes/Kickoff.php';
 
         $webroot = defined('GRAV_WEBROOT') ? GRAV_WEBROOT : GRAV_ROOT;

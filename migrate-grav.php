@@ -9,6 +9,19 @@ use RuntimeException;
 
 class MigrateGravPlugin extends Plugin
 {
+    /**
+     * Grav 2.0 requires PHP 8.3. The wizard and the Kickoff/HtaccessSecurity
+     * classes use newer syntax, so on older PHP they fatal at parse time
+     * before any friendly check can run. Everything that loads them is gated
+     * on this, and this file itself must stay parseable on PHP 7.3.
+     */
+    public const MIN_PHP = '8.3.0';
+
+    public static function phpSupported(): bool
+    {
+        return version_compare(PHP_VERSION, self::MIN_PHP, '>=');
+    }
+
     public static function getSubscribedEvents(): array
     {
         return [
@@ -48,6 +61,14 @@ class MigrateGravPlugin extends Plugin
     public function onAdminTaskExecute(Event $event): void
     {
         $task = $event['method'] ?? null;
+
+        if (is_string($task) && strpos($task, 'taskMigrateGrav') === 0 && !self::phpSupported()) {
+            $this->grav['admin']->setMessage(
+                'Grav 2.0 requires PHP 8.3 or newer and will not run on PHP ' . PHP_VERSION . '. Upgrade this site\'s PHP before migrating.',
+                'error'
+            );
+            return;
+        }
 
         $controller = $event['controller'] ?? null;
         $authorized = !$controller
@@ -171,6 +192,15 @@ class MigrateGravPlugin extends Plugin
         // the request URI is more reliable than poking admin internals.
         $path = (string) $this->grav['uri']->path();
         if (!str_ends_with(rtrim($path, '/'), '/migrate-grav')) {
+            return;
+        }
+
+        $this->grav['twig']->twig_vars['migrate_grav_php'] = [
+            'ok'       => self::phpSupported(),
+            'version'  => PHP_VERSION,
+            'required' => self::MIN_PHP,
+        ];
+        if (!self::phpSupported()) {
             return;
         }
 

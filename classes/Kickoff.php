@@ -8,13 +8,15 @@ use RuntimeException;
  * standalone wizard at webroot. Performs no Grav-side bootstrap of 2.0;
  * the wizard runs in a fresh PHP process started by the user.
  *
- * The wizard is owned by THIS plugin (wizard/migrate.php) and copied to
+ * The wizard is owned by THIS plugin (wizard/) and copied to
  * webroot — not extracted from the Grav 2.0 zip. That way we can iterate
  * on the migration flow without re-releasing Grav.
  */
 class Kickoff
 {
     private const MIGRATE_FILE = 'migrate.php';
+    // The wizard body; migrate.php is only a PHP-version gate in front of it.
+    private const WIZARD_FILE = 'migrate-wizard.php';
     private const FLAG_FILE = '.migrating';
     private const ZIP_NAME = 'grav-2.0-staged.zip';
 
@@ -442,7 +444,8 @@ class Kickoff
     }
 
     /**
-     * Copy the plugin's canonical wizard (wizard/migrate.php) to webroot.
+     * Copy the plugin's canonical wizard (wizard/migrate.php plus
+     * wizard/migrate-wizard.php) to webroot.
      *
      * The wizard intentionally lives in this plugin rather than in the Grav
      * 2.0 release zip, so the migration flow can be iterated without Grav
@@ -450,16 +453,18 @@ class Kickoff
      */
     private function placeWizard(): void
     {
-        $src = __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'wizard' . DIRECTORY_SEPARATOR . self::MIGRATE_FILE;
-        if (!is_file($src)) {
-            throw new RuntimeException("Plugin wizard source missing: {$src}");
-        }
+        foreach ([self::WIZARD_FILE, self::MIGRATE_FILE] as $file) {
+            $src = __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'wizard' . DIRECTORY_SEPARATOR . $file;
+            if (!is_file($src)) {
+                throw new RuntimeException("Plugin wizard source missing: {$src}");
+            }
 
-        $dest = $this->webroot . DIRECTORY_SEPARATOR . self::MIGRATE_FILE;
-        if (!@copy($src, $dest)) {
-            throw new RuntimeException("Failed to copy wizard to {$dest}");
+            $dest = $this->webroot . DIRECTORY_SEPARATOR . $file;
+            if (!@copy($src, $dest)) {
+                throw new RuntimeException("Failed to copy wizard to {$dest}");
+            }
+            @chmod($dest, 0644);
         }
-        @chmod($dest, 0644);
     }
 
     private function placeStagedZip(string $zipPath): void
@@ -547,6 +552,7 @@ class Kickoff
         $candidates = [
             self::FLAG_FILE,
             self::MIGRATE_FILE,
+            self::WIZARD_FILE,
             'tmp/' . self::ZIP_NAME,
         ];
         foreach ($candidates as $rel) {
