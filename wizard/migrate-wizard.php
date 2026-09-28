@@ -6232,10 +6232,11 @@ function mg_bulk_copy_user(string $srcUser, string $dstUser, int &$copied, ?call
             // Preserve top-level symlinks (e.g. user/plugins itself being a
             // symlink — unusual but possible in shared multi-site setups).
             // copy_tree handles deeper symlinks the same way.
-            $target = @readlink($src);
-            if (is_string($target) && $target !== '' && @symlink($target, $dst)) {
+            $how = mg_preserve_link($src, $dst, static function () use (&$copied) { $copied++; });
+            if ($how !== null) {
                 $copiedEntries[] = $entry;
-                if ($progress) $progress(['phase' => 'done-entry', 'entry' => "user/{$entry}", 'reason' => 'symlink preserved', 'copied' => $copied]);
+                $reason = $how === 'linked' ? 'symlink preserved' : 'symlink copied as files (symlinks unavailable on this host)';
+                if ($progress) $progress(['phase' => 'done-entry', 'entry' => "user/{$entry}", 'reason' => $reason, 'copied' => $copied]);
             } else {
                 $copySkipped[] = "{$entry} (symlink, could not preserve)";
                 if ($progress) $progress(['phase' => 'skip', 'entry' => "user/{$entry}", 'reason' => 'symlink (could not preserve)', 'copied' => $copied]);
@@ -7242,6 +7243,46 @@ function mg_read_blueprint(string $path): array
  * with the relative path under $src. Returns null on success, or an error
  * string on the first failure.
  */
+/**
+ * Recreate the symlink at $src as $dst, or copy what it points to.
+ *
+ * Many shared hosts (RunCloud among them) list symlink() and readlink() in
+ * disable_functions, where calling them is a fatal error that `@` does not
+ * stop (issue #21). There, and wherever creating the link fails, the files the
+ * link points to are copied instead, so the migration still completes. A link
+ * to a folder that holds the source or the destination is skipped rather than
+ * copied forever, as is a broken one.
+ *
+ * @return string|null 'linked', 'copied', or null when nothing was created
+ */
+function mg_preserve_link(string $src, string $dst, callable $onFile, string $rel = ''): ?string
+{
+    if (function_exists('readlink') && function_exists('symlink')) {
+        $target = @readlink($src);
+        if (is_string($target) && $target !== '' && @symlink($target, $dst)) {
+            return 'linked';
+        }
+    }
+
+    if (is_file($src)) {
+        if (!@copy($src, $dst)) return null;
+        $onFile($rel);
+        return 'copied';
+    }
+
+    // Skip a link to a folder holding either end of the copy, which would never finish.
+    $real = realpath($src);
+    $inside = static function (string $path) use ($real): bool {
+        $path = realpath($path);
+        return $path !== false && str_starts_with(rtrim($path, '/') . '/', rtrim((string) $real, '/') . '/');
+    };
+    if ($real === false || !is_dir($real) || $inside(dirname($src)) || $inside(dirname($dst))) {
+        return null;
+    }
+
+    return copy_tree($src, $dst, $onFile, $rel) === null ? 'copied' : null;
+}
+
 function copy_tree(string $src, string $dst, callable $onFile, string $prefix = ''): ?string
 {
     if (!is_dir($dst) && !@mkdir($dst, 0755, true) && !is_dir($dst)) {
@@ -7266,10 +7307,7 @@ function copy_tree(string $src, string $dst, callable $onFile, string $prefix = 
             // update phase detects symlinked slugs and skips updating them
             // (otherwise gpm would unlink the symlink and overwrite with a
             // fresh zip).
-            $target = @readlink($srcPath);
-            if (is_string($target) && $target !== '') {
-                @symlink($target, $dstPath);
-            }
+            mg_preserve_link($srcPath, $dstPath, $onFile, $rel);
             continue;
         }
 
