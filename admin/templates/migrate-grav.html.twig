@@ -171,7 +171,7 @@
                 <div class="mg-callout-body">
                     <strong>Security: the <code>user/data</code>, <code>user/accounts</code>, <code>user/config</code> and <code>user/env</code> folders may be downloadable over the web.</strong>
                     {% if migrate_grav_security.apache %}
-                        <p style="margin:6px 0 0;">On older installs these folders are only protected by file extension, so certificates, keys, tokens and databases stored under <code>user/data</code> can be fetched directly. Grav 2.0 blocks them outright — apply the same fix to this site now.</p>
+                        <p style="margin:6px 0 0;">On older installs these folders are only protected by file extension, so certificates, keys, tokens and databases stored under <code>user/data</code> can be fetched directly. Grav 1.7.53 and 2.0 block them, apart from avatar images and public media uploads. Apply the same rules to this site now.</p>
                         {% if migrate_grav_security.can_autofix %}
                             <form method="post" action="{{ base_url_relative }}/task:migrateGravSecureHtaccess" style="margin-top:10px;">
                                 <input type="hidden" name="admin-nonce" value="{{ admin.getNonce('admin-form') }}" />
