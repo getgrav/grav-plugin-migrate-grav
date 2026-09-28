@@ -1,3 +1,18 @@
+# v1.0.17
+## 2026-09-28
+
+1. [](#bugfix)
+    * The wizard no longer lists Grav's own `.htaccess` rules and comments from earlier releases as your custom rules [#22]
+    * A custom rule inside a module check, such as a `Header` line in `<IfModule mod_headers.c>`, now comes across with its module check instead of on its own
+    * Migrated sites now get Grav 2's own `.htaccess` files under `user/`, so the older copies no longer cause 500 errors on hosts that allow only `AllowOverride FileInfo` or block avatars and uploaded media. Copies you edited are kept and listed in the step summary.
+    * The "Secure these folders now" fix now writes the same rules Grav 1.7.53 and 2.0 use, so avatars and uploaded media keep working, and a 1.7.53 site is no longer flagged as unprotected
+    * The manual rules shown for Apache and nginx servers now allow avatars and uploaded media, as Grav's own server configs do
+    * The migration no longer stops with "Call to undefined function symlink()" on hosts that disable symlinks. Symlinked folders and files under `user/` are copied instead. [#21]
+    * The Twig sandbox settings the wizard writes no longer treat Grav's own functions and filters, such as `date`, `max` and `upper`, as custom ones, and no longer register PHP's `date()` or `max()` in their place
+    * The wizard adds only your content's custom Twig functions, filters and methods to the sandbox, which Grav 2 reads as additions to its defaults, so the migrated site's first upgrade no longer blocks most of the sandbox
+    * A migrated site now records the Grav 2 version it was built on, so its first upgrade no longer reruns fixes meant for sites upgraded from older releases
+    * The staged admin no longer loads as a blank page when `custom_base_url` is set in an environment folder such as `user/env/<host>/config/system.yaml`. The wizard now clears it there for the preview too and puts it back when you promote.
+
 # v1.0.16
 ## 2026-09-22
 
