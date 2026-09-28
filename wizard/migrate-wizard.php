@@ -1044,6 +1044,7 @@ function do_plugins_themes(string $webroot, array $flag, array $options, ?callab
     $copiedEntries = [];
     mg_bulk_copy_user($srcUser, $dstUser, $copied, $progress, $copySkipped, $copiedEntries);
     $userHtaccess = mg_heal_user_htaccess($dstUser);
+    mg_stamp_staged_versions(dirname($dstUser));
 
     // ─── Phase 2: collect symlinked plugin/theme slugs ───────────────────────
     // Excluded from the upgrade pass (gpm would unlink the symlink and
@@ -3757,8 +3758,39 @@ function mg_scan_twig_content(string $webroot, string $dstUser): array
     $result['sandbox_token_pages']       = array_map(static fn($p) => $p[0] ?? null, $contentTokens);
 
     $sandboxComment = '';
-    if ($allowFnAdd || $allowFlAdd || $allowMethAdd) {
-        // Write the FULL union (core defaults first, then additions). The
+    if (($allowFnAdd || $allowFlAdd || $allowMethAdd) && $baseline['additive']) {
+        // The staged core keeps the defaults in code and these keys add to
+        // them, so write the additions only. A full copy of the defaults here
+        // would read as an old replacement list to core's upgrade migration.
+        $sandbox = $current['twig_sandbox'] ?? [];
+        $union = static fn(array $existing, array $add): array => array_values(array_unique(array_merge($existing, $add)));
+        if ($allowFnAdd) {
+            $sandbox['allowed_functions'] = $union((array) ($sandbox['allowed_functions'] ?? []), array_keys($allowFnAdd));
+        }
+        if ($allowFlAdd) {
+            $sandbox['allowed_filters'] = $union((array) ($sandbox['allowed_filters'] ?? []), array_keys($allowFlAdd));
+        }
+        if ($allowMethAdd) {
+            // Rows merge with the defaults by class, so one row per class suffices.
+            $rows = (array) ($sandbox['allowed_methods'] ?? []);
+            foreach ($allowMethAdd as $class => $names) {
+                $rows[] = ['class' => $class, 'methods' => implode(', ', array_map('strtolower', array_map('strval', array_keys($names))))];
+            }
+            $sandbox['allowed_methods'] = $rows;
+        }
+        $current['twig_sandbox'] = $sandbox;
+
+        $sandboxComment =
+            "#\n"
+          . "# Added to the Twig sandbox (security.twig_sandbox) so the custom\n"
+          . "# functions, filters and methods your 1.x content uses keep working.\n"
+          . "# These lists add to Grav's built-in defaults, so they hold only the\n"
+          . "# additions. Raw PHP functions are also added to\n"
+          . "# system.twig.safe_functions so they're callable at all. Durable fix\n"
+          . "# for plugin-provided functions: update the plugin to register them\n"
+          . "# via the onBuildTwigSandboxPolicy event, then delete them from here.\n";
+    } elseif ($allowFnAdd || $allowFlAdd || $allowMethAdd) {
+        // Older staged core: write the FULL union (core defaults first, then additions). The
         // sandbox lists have no blueprint, so Grav merges them BY INDEX — a
         // partial list here would corrupt the core defaults. Keep them whole.
         $sandbox = $current['twig_sandbox'] ?? [];
@@ -4310,22 +4342,48 @@ function mg_twig_sandbox_method_map(): array
  * `class => [method,…]` map (insertion order preserved, methods lowercased to
  * match how the sandbox compares them).
  *
+ * Since 2026-08-12 core keeps these defaults in code
+ * (`Grav\\Common\\Twig\\Sandbox\\SandboxDefaults`) and the `allowed_*` config
+ * keys ADD to them. When the staged core has that class it is read directly and
+ * `additive` is true; the YAML lists are the fallback for an older staged core.
+ *
  * @param string $stageRoot Staged Grav 2.0 root (dirname of the staged user/).
- * @return array{functions:list<string>,filters:list<string>,methods:array<string,list<string>>}
+ * @return array{functions:list<string>,filters:list<string>,methods:array<string,list<string>>,additive:bool}
  */
 function mg_read_sandbox_baseline(string $stageRoot): array
 {
-    $out = ['functions' => [], 'filters' => [], 'methods' => []];
-    $path = $stageRoot . '/system/config/security.yaml';
-    if (!is_file($path)) {
-        return $out;
+    $out = ['functions' => [], 'filters' => [], 'methods' => [], 'additive' => false];
+    $cfg = null;
+    $class = 'Grav\\Common\\Twig\\Sandbox\\SandboxDefaults';
+    $defaultsFile = $stageRoot . '/system/src/Grav/Common/Twig/Sandbox/SandboxDefaults.php';
+    if (is_file($defaultsFile)) {
+        try {
+            if (!class_exists($class, false)) {
+                require_once $defaultsFile;
+            }
+            $all = $class::all();
+            $cfg = ['twig_sandbox' => [
+                'allowed_functions' => $all['functions'] ?? [],
+                'allowed_filters'   => $all['filters'] ?? [],
+                'allowed_methods'   => $all['methods'] ?? [],
+            ]];
+            $out['additive'] = true;
+        } catch (\Throwable) {
+            $cfg = null;
+        }
     }
-    mg_ensure_yaml_available();
-    $yaml = '\\Symfony\\Component\\Yaml\\Yaml';
-    try {
-        $cfg = $yaml::parseFile($path);
-    } catch (\Throwable) {
-        return $out;
+    $path = $stageRoot . '/system/config/security.yaml';
+    if ($cfg === null) {
+        if (!is_file($path)) {
+            return $out;
+        }
+        mg_ensure_yaml_available();
+        $yaml = '\\Symfony\\Component\\Yaml\\Yaml';
+        try {
+            $cfg = $yaml::parseFile($path);
+        } catch (\Throwable) {
+            return $out;
+        }
     }
     if (is_array($cfg)) {
         $out['functions'] = mg_normalize_token_list($cfg['twig_sandbox']['allowed_functions'] ?? []);
@@ -6176,6 +6234,43 @@ function mg_gpm_update(string $stageRoot, string $kind, array $excludeSlugs, ?ca
  * perm mirror). Appends skipped entries to $copySkipped with a reason
  * tag, and appends successfully-copied top-level names to $copiedEntries.
  */
+/**
+ * Record the staged core's version and upgrade level in the staged versions.yaml.
+ *
+ * The copied file still names the 1.x schema, and Grav runs every upgrade
+ * script newer than the recorded schema on the next upgrade. Those scripts
+ * patch files an older Grav wrote on a site upgraded in place; a migrated site
+ * is a fresh 2.x install whose files the wizard has already brought up to date,
+ * and some of them misread what the wizard wrote (the Twig-sandbox migration
+ * reads its additions as a replacement list). So the migrated site starts where
+ * a fresh install of the staged version does: at its newest update script.
+ */
+function mg_stamp_staged_versions(string $stageRoot): void
+{
+    $revisions = array_map(static fn($f) => basename($f, '.php'), glob($stageRoot . '/system/src/Grav/Installer/updates/*.php') ?: []);
+    $defines = (string) @file_get_contents($stageRoot . '/system/defines.php');
+    if ($revisions === [] || !preg_match('/define\(\s*[\'"]GRAV_VERSION[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]/', $defines, $m)) {
+        return;
+    }
+    usort($revisions, 'version_compare');
+
+    mg_ensure_yaml_available();
+    $yaml = '\\Symfony\\Component\\Yaml\\Yaml';
+    $file = $stageRoot . '/user/config/versions.yaml';
+    $data = [];
+    if (is_file($file)) {
+        try {
+            $data = (array) $yaml::parseFile($file);
+        } catch (\Throwable) {
+            $data = [];
+        }
+    }
+    $data['core']['grav']['version'] = $m[1];
+    $data['core']['grav']['schema'] = end($revisions);
+    @mkdir(dirname($file), 0775, true);
+    @file_put_contents($file, $yaml::dump($data, 4, 2));
+}
+
 /**
  * Give the staged user/ tree Grav 2's own .htaccess files.
  *

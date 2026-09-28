@@ -8,6 +8,9 @@
     * The "Secure these folders now" fix now writes the same rules Grav 1.7.53 and 2.0 use, so avatars and uploaded media keep working, and a 1.7.53 site is no longer flagged as unprotected
     * The manual rules shown for Apache and nginx servers now allow avatars and uploaded media, as Grav's own server configs do
     * The migration no longer stops with "Call to undefined function symlink()" on hosts that disable symlinks. Symlinked folders and files under `user/` are copied instead. [#21]
+    * The Twig sandbox settings the wizard writes no longer treat Grav's own functions and filters, such as `date`, `max` and `upper`, as custom ones, and no longer register PHP's `date()` or `max()` in their place
+    * The wizard adds only your content's custom Twig functions, filters and methods to the sandbox, which Grav 2 reads as additions to its defaults, so the migrated site's first upgrade no longer blocks most of the sandbox
+    * A migrated site now records the Grav 2 version it was built on, so its first upgrade no longer reruns fixes meant for sites upgraded from older releases
 
 # v1.0.16
 ## 2026-09-22
