@@ -2458,6 +2458,13 @@ function do_promote(string $webroot, array $flag, ?callable $progress = null): a
             $cbRestore = $cbResult['restored'] ?? (string) $flag['custom_base_url_stash'];
         }
     }
+    foreach ((array) ($flag['custom_base_url_env_stash'] ?? []) as $rel => $stash) {
+        $cbResult = [];
+        if (mg_restore_custom_base_url($stagePath . '/user/' . $rel, (string) $stash, $cbResult)) {
+            $restored = ($cbResult['restored'] ?? (string) $stash) . ' in user/' . $rel;
+            $cbRestore = $cbRestore === null ? $restored : $cbRestore . ', ' . $restored;
+        }
+    }
 
     // Version comes from the CURRENT install's defines.php (the one we're
     // about to back up — not the staged one).
@@ -3258,6 +3265,21 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
         $flag['custom_base_url_stash'] = $cbResult['stash'];
     }
 
+    // An environment system.yaml outranks user/config, so a custom_base_url
+    // there breaks the preview just the same: admin2 builds its asset URLs
+    // from the site root, so they lose the stage folder and 404 (forum t9437).
+    $cbEnv = [];
+    foreach (mg_env_system_yamls($dstUser) as $rel) {
+        $r = [];
+        mg_neutralize_custom_base_url($dstUser . '/' . $rel, $r);
+        if (!empty($r['stash'])) {
+            $flag['custom_base_url_env_stash'][$rel] = $r['stash'];
+            $cbEnv[$rel] = $r['was'];
+        } elseif (!empty($r['warning'])) {
+            $cbResult['warning'] = "user/{$rel}: " . $r['warning'];
+        }
+    }
+
     $flag['step']    = 'content_done';
     $flag['content'] = [
         'at'                => time(),
@@ -3405,6 +3427,11 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
     if (!empty($cbResult['stash'])) {
         $parts[] = 'Temporarily cleared system.custom_base_url (' . $cbResult['was']
               . ') so the staged preview at /' . $stageDir . '/ loads without a redirect loop;'
+              . ' it will be restored automatically when you promote to the live webroot.';
+    }
+    foreach ($cbEnv as $rel => $was) {
+        $parts[] = 'Temporarily cleared custom_base_url (' . $was . ') in user/' . $rel
+              . ' so the staged preview at /' . $stageDir . '/ loads;'
               . ' it will be restored automatically when you promote to the live webroot.';
     }
     if (!empty($cbResult['warning'])) {
@@ -3987,6 +4014,23 @@ function mg_match_custom_base_url(string $raw): ?array
         return [$m[0][0], $m[1][0], $m[2][0], $m[3][0], $m[0][1]];
     }
     return null;
+}
+
+/**
+ * Environment system.yaml files under a user/ folder, relative to it. Mirrors
+ * Grav's lookup: `env/<host>/config/` when user/env exists, otherwise the
+ * Grav 1.6 layout `<host>/config/`.
+ *
+ * @return list<string>
+ */
+function mg_env_system_yamls(string $userDir): array
+{
+    $pattern = is_dir($userDir . '/env') ? 'env/*/config/system.yaml' : '*/config/system.yaml';
+    $found = [];
+    foreach (glob($userDir . '/' . $pattern) ?: [] as $file) {
+        $found[] = substr($file, strlen($userDir) + 1);
+    }
+    return $found;
 }
 
 /**

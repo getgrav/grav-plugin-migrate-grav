@@ -11,6 +11,7 @@
     * The Twig sandbox settings the wizard writes no longer treat Grav's own functions and filters, such as `date`, `max` and `upper`, as custom ones, and no longer register PHP's `date()` or `max()` in their place
     * The wizard adds only your content's custom Twig functions, filters and methods to the sandbox, which Grav 2 reads as additions to its defaults, so the migrated site's first upgrade no longer blocks most of the sandbox
     * A migrated site now records the Grav 2 version it was built on, so its first upgrade no longer reruns fixes meant for sites upgraded from older releases
+    * The staged admin no longer loads as a blank page when `custom_base_url` is set in an environment folder such as `user/env/<host>/config/system.yaml`. The wizard now clears it there for the preview too and puts it back when you promote.
 
 # v1.0.16
 ## 2026-09-22
