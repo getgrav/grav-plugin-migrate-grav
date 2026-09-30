@@ -1,3 +1,9 @@
+# v1.0.18
+## 09/30/2026
+
+1. [](#bugfix)
+    * Multisite installs that keep each site in `user/env/<host>/` no longer have their themes, plugins and media blocked after migrating, because the wizard replaces a Grav-written deny-all `user/env/.htaccess` with Grav's env-aware one, and its "Secure these folders now" fix uses Grav's updated server rules [getgrav/grav#4335](https://github.com/getgrav/grav/issues/4335)
+
 # v1.0.17
 ## 2026-09-28
 
