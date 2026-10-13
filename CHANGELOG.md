@@ -1,3 +1,9 @@
+# v1.0.19
+## 2026-10-13
+
+1. [](#bugfix)
+    * The wizard works on hosts that disable `getmypid()` (a common PHP-FPM hardening). It named the temporary file for each `system.yaml` and config write after the process id, which is a fatal error there; the names now end in a random string
+
 # v1.0.18
 ## 2026-10-01
 
