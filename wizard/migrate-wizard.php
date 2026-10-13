@@ -4011,7 +4011,7 @@ function mg_strip_system_pages_process_twig(string $systemYaml, array &$result):
 
     // Atomic write: temp file + rename, so an interruption mid-write can't
     // truncate the staged system.yaml.
-    $tmp = $systemYaml . '.tmp.' . getmypid();
+    $tmp = $systemYaml . '.tmp.' . bin2hex(random_bytes(6));
     if (@file_put_contents($tmp, $modified) === false) {
         $result['system_process_twig_warning'] = 'failed to write temp file for system.yaml strip';
         return false;
@@ -4103,7 +4103,7 @@ function mg_neutralize_custom_base_url(string $systemYaml, array &$result): bool
     $replacement = $key . "''" . $comment;
     $modified = substr($raw, 0, $offset) . $replacement . substr($raw, $offset + strlen($full));
 
-    $tmp = $systemYaml . '.tmp.' . getmypid();
+    $tmp = $systemYaml . '.tmp.' . bin2hex(random_bytes(6));
     if (@file_put_contents($tmp, $modified) === false) {
         $result['warning'] = 'failed to write temp file for custom_base_url neutralize';
         return false;
@@ -4158,7 +4158,7 @@ function mg_restore_custom_base_url(string $systemYaml, string $stash, array &$r
     $replacement = $key . $stash . $comment;
     $modified = substr($raw, 0, $offset) . $replacement . substr($raw, $offset + strlen($full));
 
-    $tmp = $systemYaml . '.tmp.' . getmypid();
+    $tmp = $systemYaml . '.tmp.' . bin2hex(random_bytes(6));
     if (@file_put_contents($tmp, $modified) === false) {
         $result['warning'] = 'failed to write temp file for custom_base_url restore — set it by hand';
         return false;
@@ -4694,7 +4694,7 @@ function mg_rewrite_system_twig_keys(string $systemYaml, array $stripKeys, array
     }
 
     // Atomic write: temp file + rename.
-    $tmp = $systemYaml . '.tmp.' . getmypid();
+    $tmp = $systemYaml . '.tmp.' . bin2hex(random_bytes(6));
     if (@file_put_contents($tmp, $modified) === false) {
         $result['system_twig_warning'] = 'failed to write temp file for system.yaml twig rewrite';
         return [];
@@ -5526,7 +5526,7 @@ function mg_yaml_text_is_valid(string $text): bool
  */
 function mg_atomic_write(string $path, string $contents, array &$result): bool
 {
-    $tmp = $path . '.tmp.' . getmypid();
+    $tmp = $path . '.tmp.' . bin2hex(random_bytes(6));
     if (@file_put_contents($tmp, $contents) === false) {
         $result['warning'] = 'failed to write temp file for system.yaml images rewrite';
         return false;
