@@ -1,3 +1,9 @@
+# v1.0.21
+## 2026-10-31
+
+1. [](#bugfix)
+    * The IIS rule the wizard suggests for protecting `user/config`, `user/accounts` and `user/data` now matches those folders however the request path is written, as Grav's own `webserver-configs/web.config` does
+
 # v1.0.20
 ## 2026-10-31
 
