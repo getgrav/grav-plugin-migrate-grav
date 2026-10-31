@@ -276,7 +276,7 @@ HTACCESS;
         }
         if (str_contains($s, 'iis') || str_contains($s, 'microsoft')) {
             return '<rule name="user_sensitive_folders" stopProcessing="true">' . "\n"
-                . '    <match url="^user/(env/[^/]+/)?(accounts|config|data)/(.*)" ignoreCase="false" />' . "\n"
+                . '    <match url="^user/(env/[^/]+/)?(accounts|config|data)/(.*)" ignoreCase="true" />' . "\n"
                 . '    <action type="Redirect" url="error" redirectType="Permanent" />' . "\n"
                 . '</rule>';
         }
@@ -291,7 +291,7 @@ HTACCESS;
                 . "respond @grav_user_sensitive 403";
         }
         if (str_contains($s, 'lighttpd')) {
-            return '$HTTP["url"] =~ "^/user/(env/[^/]+/)?(accounts|config|data)/(.*)" { url.access-deny = ("") }';
+            return '$HTTP["url"] =~ "(?i)^/user/(env/[^/]+/)?(accounts|config|data)/(.*)" { url.access-deny = ("") }';
         }
         return self::ROOT_RULES;
     }

@@ -1,3 +1,9 @@
+# v1.0.20
+## 2026-10-31
+
+1. [](#bugfix)
+    * The IIS and lighttpd rules the wizard suggests for protecting `user/config`, `user/accounts` and `user/data` now match those folders whatever the capitalisation of the request, as Grav's own `webserver-configs/` samples do
+
 # v1.0.19
 ## 2026-10-13
 
