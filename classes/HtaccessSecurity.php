@@ -275,8 +275,10 @@ HTACCESS;
                 . "location ~* ^/user/(env/[^/]+/)?data/.*$ { return 403; }";
         }
         if (str_contains($s, 'iis') || str_contains($s, 'microsoft')) {
+            // As Grav's webserver-configs/web.config: Windows serves the same file for
+            // a path with doubled slashes, so the pattern accepts them too.
             return '<rule name="user_sensitive_folders" stopProcessing="true">' . "\n"
-                . '    <match url="^user/(env/[^/]+/)?(accounts|config|data)/(.*)" ignoreCase="true" />' . "\n"
+                . '    <match url="^/*user/+(env/+[^/]+/+)?(accounts|config|data)/" ignoreCase="true" />' . "\n"
                 . '    <action type="Redirect" url="error" redirectType="Permanent" />' . "\n"
                 . '</rule>';
         }
