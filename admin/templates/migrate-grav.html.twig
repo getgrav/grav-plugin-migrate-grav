@@ -173,7 +173,8 @@
                     {% if migrate_grav_security.apache %}
                         <p style="margin:6px 0 0;">On older installs these folders are only protected by file extension, so certificates, keys, tokens and databases stored under <code>user/data</code> can be fetched directly. Grav 1.7.53 and 2.0 block them, apart from avatar images and public media uploads. Apply the same rules to this site now.</p>
                         {% if migrate_grav_security.can_autofix %}
-                            <form method="post" action="{{ base_url_relative }}/task:migrateGravSecureHtaccess" style="margin-top:10px;">
+                            <form method="post" action="{{ base_url_relative }}/migrate-grav" style="margin-top:10px;">
+                                <input type="hidden" name="task" value="migrateGravSecureHtaccess" />
                                 <input type="hidden" name="admin-nonce" value="{{ admin.getNonce('admin-form') }}" />
                                 <button type="submit" class="mg-btn mg-btn-danger">
                                     <i class="fa fa-lock"></i> Secure these folders now
@@ -237,13 +238,15 @@
                     <a class="mg-btn mg-btn-primary" href="{{ base_url_simple }}{{ migrate_grav_state.wizard_url }}" target="_blank" rel="noopener">
                         <i class="fa fa-arrow-right"></i> Continue migration
                     </a>
-                    <form method="post" action="{{ base_url_relative }}/task:migrateGravRestart" style="margin:0" onsubmit="return confirm('Restart the wizard? This clears the staged Grav 2.0 directory and any wizard progress, but keeps the downloaded release zip and the migration token so you can re-run from step 1 without re-downloading. Your original site is untouched.');">
+                    <form method="post" action="{{ base_url_relative }}/migrate-grav" style="margin:0" onsubmit="return confirm('Restart the wizard? This clears the staged Grav 2.0 directory and any wizard progress, but keeps the downloaded release zip and the migration token so you can re-run from step 1 without re-downloading. Your original site is untouched.');">
+                    <input type="hidden" name="task" value="migrateGravRestart" />
                         <input type="hidden" name="admin-nonce" value="{{ admin.getNonce('admin-form') }}" />
                         <button type="submit" class="mg-btn mg-btn-secondary">
                             <i class="fa fa-undo"></i> Restart Wizard
                         </button>
                     </form>
-                    <form method="post" action="{{ base_url_relative }}/task:migrateGravReset" style="margin:0" onsubmit="return confirm('Reset the migration completely? This deletes .migrating, migrate.php, the staged zip, and the staged Grav 2.0 directory. Your original site is untouched. The next start will re-download Grav 2.0.');">
+                    <form method="post" action="{{ base_url_relative }}/migrate-grav" style="margin:0" onsubmit="return confirm('Reset the migration completely? This deletes .migrating, migrate.php, the staged zip, and the staged Grav 2.0 directory. Your original site is untouched. The next start will re-download Grav 2.0.');">
+                    <input type="hidden" name="task" value="migrateGravReset" />
                         <input type="hidden" name="admin-nonce" value="{{ admin.getNonce('admin-form') }}" />
                         <button type="submit" class="mg-btn mg-btn-danger">
                             <i class="fa fa-trash"></i> Reset Migration
@@ -278,7 +281,8 @@
                         <span style="display:block;margin-top:4px;color:#5a4a1f;"><code>allow_url_fopen</code> is off; the download will use cURL.</span>
                     {% endif %}
                 </div>
-                <form method="post" action="{{ base_url_relative }}/task:migrateGravInit" style="margin:0">
+                <form method="post" action="{{ base_url_relative }}/migrate-grav" style="margin:0">
+                    <input type="hidden" name="task" value="migrateGravInit" />
                     <input type="hidden" name="admin-nonce" value="{{ admin.getNonce('admin-form') }}" />
                     <button type="submit" class="mg-btn mg-btn-primary"{% if migrate_grav_readiness and not migrate_grav_readiness.ready %} disabled style="opacity:.55;cursor:not-allowed;"{% endif %}>
                         <i class="fa fa-play"></i> Stage &amp; start wizard
