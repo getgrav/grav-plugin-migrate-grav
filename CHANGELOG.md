@@ -1,3 +1,9 @@
+# v1.0.22
+## 2026-11-04
+
+1. [](#bugfix)
+    * The **Stage & start wizard**, **Restart**, **Reset** and **Secure** buttons no longer return a 404 on sites that set `system.param_sep` to `;` (the setting Grav recommends for Apache on Windows). The forms now send the task in the request body instead of as a `task:` URL parameter [#23](https://github.com/getgrav/grav-plugin-migrate-grav/issues/23)
+
 # v1.0.21
 ## 2026-10-31
 
