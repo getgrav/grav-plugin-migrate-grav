@@ -616,7 +616,7 @@ if ($method === 'POST') {
             // dir and restore .htaccess. Send the user back to the wizard
             // landing so they can re-run from step 1.
             wizard_restart($webroot, $flagPath, $flagForAuth);
-            redirect_self($token, ['flash' => 'restarted', 'msg' => 'Wizard restarted. The staged Grav 2.0 directory was cleared — re-run from step 1.']);
+            redirect_self($webroot, $token, 'restarted', 'Wizard restarted. The staged Grav 2.0 directory was cleared — re-run from step 1.');
 
         case 'extract':
             // Long-running. Stream progress instead of blocking then redirecting.
@@ -650,7 +650,7 @@ if ($method === 'POST') {
             // No long work — just advance state. Reload the step view.
             $flagForAuth['step'] = 'test_done';
             save_flag($flagPath, $flagForAuth);
-            redirect_self($token, ['flash' => 'test_done', 'msg' => 'Ready to promote.']);
+            redirect_self($webroot, $token, 'test_done', 'Ready to promote.');
 
         case 'promote':
             // Operator-selected root files/folders to carry forward (issue #9).
@@ -698,7 +698,7 @@ if ($method === 'POST') {
             }
             mg_rewind_to($webroot, $flagForAuth, $target);
             $msg = 'Rewound to "' . $target . '". Adjust options and re-run.';
-            redirect_self($token, ['flash' => 'rewound', 'msg' => $msg]);
+            redirect_self($webroot, $token, 'rewound', $msg);
 
         default:
             http_response_code(400);
@@ -727,9 +727,13 @@ $step      = (string) ($flag['step'] ?? 'staged');
 $stageDir  = (string) ($flag['stage_dir'] ?? 'grav-2');
 $stagedZip = (string) ($flag['staged_zip'] ?? 'tmp/grav-2.0-staged.zip');
 
+// Only the flash key travels in the URL; its text was stored in .migrating by
+// mg_flash_url() and is shown while the URL still names it, so a reload keeps it.
 $flash = null;
 if (isset($_GET['flash'])) {
-    $flash = ['type' => (string) $_GET['flash'], 'msg' => (string) ($_GET['msg'] ?? '')];
+    $type   = (string) $_GET['flash'];
+    $stored = is_array($flag['flash'] ?? null) ? $flag['flash'] : [];
+    $flash  = ['type' => $type, 'msg' => ($stored['type'] ?? '') === $type ? (string) ($stored['msg'] ?? '') : ''];
 }
 
 // A promote journal on disk means a previous promote committed to the swap but
@@ -769,11 +773,31 @@ function base_path_from_script(): string
     return $base === '/' || $base === '\\' ? '/' : rtrim($base, '/') . '/';
 }
 
-function redirect_self(string $token, array $extra): void
+/**
+ * The wizard URL to land on after an action, showing $msg as its flash.
+ *
+ * Only the flash key goes in the query string. The text is kept in .migrating
+ * and read back when the page renders. Step summaries can quote raw HTML tag
+ * names (the tagfilter note lists `<script>`) and run to several KB, and Grav's
+ * own .htaccess exploit rules refuse a query string carrying `<script>`, as do
+ * WAFs such as mod_security, so a redirect with the text in it ended on the
+ * live site's 403/404 page instead of the wizard (#24).
+ */
+function mg_flash_url(string $webroot, string $token, string $key, string $msg = ''): string
 {
-    $qs = http_build_query(['token' => $token] + $extra);
+    $flagPath = $webroot . '/.migrating';
+    $flag = load_flag($flagPath);
+    if ($flag !== null) {
+        $flag['flash'] = ['type' => $key, 'msg' => $msg];
+        save_flag($flagPath, $flag);
+    }
     $self = basename($_SERVER['SCRIPT_NAME'] ?? 'migrate.php');
-    header('Location: ' . base_path_from_script() . $self . '?' . $qs, true, 302);
+    return base_path_from_script() . $self . '?' . http_build_query(['token' => $token, 'flash' => $key]);
+}
+
+function redirect_self(string $webroot, string $token, string $key, string $msg = ''): void
+{
+    header('Location: ' . mg_flash_url($webroot, $token, $key, $msg), true, 302);
     exit(0);
 }
 
@@ -950,9 +974,7 @@ function stream_extract_page(string $webroot, array $flag, string $token): void
     $result = do_extract($webroot, $flag, $progress);
 
     if ($result['ok']) {
-        $self = basename($_SERVER['SCRIPT_NAME'] ?? 'migrate.php');
-        $qs   = http_build_query(['token' => $token, 'flash' => 'extracted', 'msg' => $result['msg']]);
-        $url  = base_path_from_script() . $self . '?' . $qs;
+        $url = mg_flash_url($webroot, $token, 'extracted', $result['msg']);
 
         // The full (formatted) summary renders on the redirect target; here we
         // only flash a brief confirmation before the immediate redirect.
@@ -3322,8 +3344,8 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
     // Build the summary as discrete segments (one statement each) rather than
     // one long paragraph, so the wizard can render them as a readable list
     // instead of a wall of text. The first segment is the lead line; the rest
-    // are individual notes. Segments are newline-joined for transport (the flash
-    // round-trips through a URL) and split back out at render time — see
+    // are individual notes. Segments are newline-joined (the flash is stored in
+    // .migrating by mg_flash_url()) and split back out at render time — see
     // mg_render_msg_segments().
     $parts = [];
     $parts[] = 'Content already migrated in Step 2 — ' . count($entries) . ' top-level entries under staged user/.';
@@ -7582,12 +7604,10 @@ function mg_stream_progress_cb(): callable
     };
 }
 
-function mg_stream_finish(array $result, string $token, string $flashKey): void
+function mg_stream_finish(string $webroot, array $result, string $token, string $flashKey): void
 {
     if ($result['ok']) {
-        $self = basename($_SERVER['SCRIPT_NAME'] ?? 'migrate.php');
-        $qs   = http_build_query(['token' => $token, 'flash' => $flashKey, 'msg' => $result['msg']]);
-        $url  = base_path_from_script() . $self . '?' . $qs;
+        $url = mg_flash_url($webroot, $token, $flashKey, $result['msg']);
         // The full (formatted) summary renders on the redirect target; here we
         // only flash a brief confirmation before the immediate redirect.
         echo '<div class="mg-callout mg-callout-ok"><i class="mg-i-info"></i><div><strong>Done.</strong> Redirecting…</div></div>';
@@ -7604,21 +7624,21 @@ function stream_plugins_themes_page(string $webroot, array $flag, string $token,
 {
     mg_stream_setup('Migrating user/ …', 'Bulk-copying your entire <code>user/</code> directory (pages, data, config, languages, accounts, plugins, themes, and any custom folders) from your live site into the staged Grav 2.0, then applying plugin transforms: incompatible plugins follow your chosen policy, 2.0-compatible plugins are updated to latest, and replacements (admin2, api, etc.) are installed. Themes are kept as-is — Grav 2.0\'s default Twig 3 compatibility mode aims to keep existing themes rendering.');
     $result = do_plugins_themes($webroot, $flag, $options, mg_stream_progress_cb());
-    mg_stream_finish($result, $token, 'plugins_done');
+    mg_stream_finish($webroot, $result, $token, 'plugins_done');
 }
 
 function stream_accounts_page(string $webroot, array $flag, string $token, array $options): void
 {
     mg_stream_setup('Processing accounts…', 'Account yamls were copied during Step 2' . (empty($options['migrate_perms']) ? '; confirming accounts step and moving on.' : '. Translating <code>admin.*</code> permissions into the <code>api.*</code> set Admin 2.0 enforces — in your account yamls and in <code>user/config/groups.yaml</code> — so the same users keep working. Anything without a 2.0 equivalent is reported rather than dropped silently.'));
     $result = do_accounts($webroot, $flag, $options, mg_stream_progress_cb());
-    mg_stream_finish($result, $token, 'accounts_done');
+    mg_stream_finish($webroot, $result, $token, 'accounts_done');
 }
 
 function stream_content_page(string $webroot, array $flag, string $token): void
 {
     mg_stream_setup('Content confirmation…', 'All <code>user/</code> content (pages, data, config, languages, custom folders) was bulk-copied during Step 2. Marking content complete and advancing to testing.');
     $result = do_content($webroot, $flag, mg_stream_progress_cb());
-    mg_stream_finish($result, $token, 'content_done');
+    mg_stream_finish($webroot, $result, $token, 'content_done');
 }
 
 function stream_promote_page(string $webroot, array $flag, string $token): void
