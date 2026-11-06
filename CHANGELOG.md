@@ -1,5 +1,5 @@
 # v1.0.23
-## 2026-11-06
+## 2026-11-05
 
 1. [](#bugfix)
     * The wizard no longer lands on a 404 or 403 page after a step whose summary mentions `<script>`, because only a short message key goes in the URL now and the summary is kept with the wizard's state [#24](https://github.com/getgrav/grav-plugin-migrate-grav/issues/24)
