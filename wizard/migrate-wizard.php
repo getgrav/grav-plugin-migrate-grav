@@ -3302,6 +3302,11 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
     // after migration; turn the filter off where the source content used them.
     $rawHtmlScan = mg_scan_raw_html_tags($webroot, $dstUser);
 
+    // Grav 1.7's `strict_mode.twig_compat` is `twig2_compat` on 2.0. Rename it
+    // so a site that ran with Twig auto-escaping off keeps it off, and list the
+    // theme templates that depend on it.
+    $twigCompat = mg_carry_twig_compat($dstUser);
+
     // A non-empty system.custom_base_url breaks the staged preview. The staged
     // install runs under a subpath (stage_dir, default /grav-2/), but a custom
     // base url like `https://site.test` forces Grav's root_path to '' (Uri.php
@@ -3337,6 +3342,7 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
         'twig_scan'         => $twigScan,
         'media_url_actions' => $mediaScan,
         'raw_html_tags'     => $rawHtmlScan,
+        'twig_compat'       => $twigCompat,
         'custom_base_url'   => $cbResult,
     ];
     save_flag($webroot . '/.migrating', $flag);
@@ -3471,6 +3477,26 @@ function do_content(string $webroot, array $flag, ?callable $progress = null): a
     }
     if (!empty($rawHtmlScan['warning'])) {
         $parts[] = 'WARNING (system.yaml markdown): ' . $rawHtmlScan['warning'] . '.';
+    }
+
+    // Twig auto-escaping (strict_mode.twig_compat → twig2_compat).
+    if ($twigCompat['renamed']) {
+        $parts[] = 'Replaced the 1.x key `strict_mode.twig_compat` with its Grav 2.0 name, `strict_mode.twig2_compat`, in '
+              . implode(', ', $twigCompat['renamed']) . '.';
+    }
+    if ($twigCompat['escaping_off']) {
+        $parts[] = 'Kept Twig auto-escaping off, as on your 1.x site (`twig.autoescape: false` with `strict_mode.twig2_compat: true`).';
+        if ($twigCompat['template_hits']) {
+            $shown = array_slice($twigCompat['template_hits'], 0, 10);
+            $more  = count($twigCompat['template_hits']) - count($shown);
+            $parts[] = 'NOTE: ' . count($twigCompat['template_hits']) . ' line(s) in your themes print HTML without `|raw` and only work'
+                  . ' while escaping is off (' . implode(', ', $shown) . ($more > 0 ? ", and {$more} more" : '') . '). Add `|raw` to'
+                  . ' those, e.g. `{{ assets.css()|raw }}` and `{{ content|raw }}`, then turn `strict_mode.twig2_compat` off so'
+                  . ' Twig escapes output again.';
+        }
+    }
+    foreach ($twigCompat['warnings'] as $w) {
+        $parts[] = 'WARNING (system.yaml strict_mode): ' . $w . '.';
     }
 
     // Custom base URL handling for the staged preview.
@@ -5170,6 +5196,139 @@ function mg_set_system_images_url_actions(string $systemYaml, array &$result): v
     if (mg_atomic_write($systemYaml, $out, $result)) {
         $result['enabled'] = true;
     }
+}
+
+/**
+ * Carry Grav 1.7's Twig compatibility switch over to its Grav 2.0 name.
+ *
+ * Grav 1.7 called the switch `strict_mode.twig_compat`. Grav 1.8 and 2.0 read
+ * `strict_mode.twig2_compat`, and only core's 1.8.0 upgrade script renames it.
+ * A migrated site never runs that script (mg_stamp_staged_versions() starts it
+ * past every core update), so the old key arrives verbatim and does nothing:
+ * Twig.php forces auto-escaping on, and a 1.7 site that ran with
+ * `twig.autoescape: false` comes up with every `{{ assets.css() }}` and
+ * `{{ content }}` its theme prints without `|raw` rendered as visible markup
+ * (getgrav/grav-plugin-migrate-grav#25).
+ *
+ * Renames the key in the staged user/config/system.yaml and in each environment
+ * system.yaml. When escaping ends up off, lists the theme template lines that
+ * rely on it, so the operator can add `|raw` and turn escaping back on.
+ *
+ * @return array{renamed:list<string>, escaping_off:bool, template_hits:list<string>, warnings:list<string>}
+ */
+function mg_carry_twig_compat(string $dstUser): array
+{
+    $result = ['renamed' => [], 'escaping_off' => false, 'template_hits' => [], 'warnings' => []];
+
+    $envFiles = mg_env_system_yamls($dstUser);
+    foreach (array_merge(['config/system.yaml'], $envFiles) as $rel) {
+        $path = $dstUser . '/' . $rel;
+        if (!is_file($path)) continue;
+        $warning = '';
+        if (mg_rename_strict_mode_twig_compat($path, $warning)) {
+            $result['renamed'][] = 'user/' . $rel;
+        } elseif ($warning !== '') {
+            $result['warnings'][] = 'user/' . $rel . ': ' . $warning;
+        }
+    }
+
+    // Escaping is off when twig2_compat is on and autoescape is off, in the base
+    // config or once an environment's overrides are merged over it.
+    $base = mg_yaml_parse_file($dstUser . '/config/system.yaml') ?? [];
+    $configs = [$base];
+    foreach ($envFiles as $rel) {
+        $configs[] = array_replace_recursive($base, mg_yaml_parse_file($dstUser . '/' . $rel) ?? []);
+    }
+    foreach ($configs as $sys) {
+        $compat = $sys['strict_mode']['twig2_compat'] ?? false;
+        $escape = $sys['twig']['autoescape'] ?? true;
+        if (mg_perm_is_positive($compat) && in_array($escape, [false, 0, '0'], true)) {
+            $result['escaping_off'] = true;
+            break;
+        }
+    }
+
+    if ($result['escaping_off']) {
+        $result['template_hits'] = mg_scan_unescaped_theme_output($dstUser);
+    }
+
+    return $result;
+}
+
+/**
+ * Rename `twig_compat:` to `twig2_compat:` inside the top-level `strict_mode:`
+ * block of one system.yaml, on raw text so comments and formatting survive.
+ * When the file already sets `twig2_compat`, that key was written for 2.0 and
+ * wins, so the dead 1.x line is dropped instead. Returns true when the file
+ * was rewritten; on a skipped edit sets $warning.
+ */
+function mg_rename_strict_mode_twig_compat(string $systemYaml, string &$warning): bool
+{
+    $raw = @file_get_contents($systemYaml);
+    if ($raw === false || !str_contains($raw, 'twig_compat')) return false;
+
+    $eol = str_contains($raw, "\r\n") ? "\r\n" : "\n";
+    $lines = preg_split('/\r?\n/', $raw) ?: [];
+
+    $block = mg_yaml_find_block($lines, 0, count($lines), 'strict_mode');
+    if ($block['flow']) {
+        $warning = 'flow-style `strict_mode: { … }`; rename `twig_compat` to `twig2_compat` by hand';
+        return false;
+    }
+    if ($block['idx'] < 0) return false;
+
+    $old = mg_yaml_find_block($lines, $block['idx'] + 1, $block['end'], 'twig_compat');
+    if ($old['idx'] < 0) return false;
+    $new = mg_yaml_find_block($lines, $block['idx'] + 1, $block['end'], 'twig2_compat');
+
+    if ($new['idx'] >= 0) {
+        array_splice($lines, $old['idx'], 1);
+    } else {
+        $lines[$old['idx']] = (string) preg_replace('/^([ \t]*)twig_compat:/', '$1twig2_compat:', $lines[$old['idx']], 1);
+    }
+
+    $text = implode($eol, $lines);
+    if (!mg_yaml_text_is_valid($text)) {
+        $warning = 'result would not parse as YAML; rename `twig_compat` to `twig2_compat` by hand';
+        return false;
+    }
+    $r = [];
+    if (!mg_atomic_write($systemYaml, $text, $r)) {
+        $warning = (string) ($r['warning'] ?? 'could not write the file');
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Theme template lines that print HTML without `|raw`: the asset groups
+ * (`{{ assets.css() }}`, `{{ assets.js('bottom') }}`) and rendered page content
+ * (`{{ content }}`, `{{ page.content }}`, `{{ module.content }}`). With
+ * auto-escaping on, each one renders its markup as visible text.
+ *
+ * @return list<string> `themes/<slug>/templates/<file>:<line>`, naturally sorted
+ */
+function mg_scan_unescaped_theme_output(string $dstUser): array
+{
+    // An attribute value (`content="{{ meta.content }}"`) is meant to be escaped.
+    $re = '/(?<!=["\'])\{\{-?\s*(?:assets\.(?:css|js)\([^)]*\)|(?:[A-Za-z_]\w*\.)?content)\s*-?\}\}/';
+    $hits = [];
+    foreach (glob($dstUser . '/themes/*/templates', GLOB_ONLYDIR) ?: [] as $dir) {
+        $rii = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS));
+        foreach ($rii as $file) {
+            /** @var \SplFileInfo $file */
+            if (!$file->isFile() || !str_ends_with($file->getFilename(), '.twig')) continue;
+            $lines = @file($file->getPathname(), FILE_IGNORE_NEW_LINES);
+            if (!$lines) continue;
+            foreach ($lines as $n => $line) {
+                if (str_contains($line, '{{') && preg_match($re, $line)) {
+                    $hits[] = substr($file->getPathname(), strlen($dstUser) + 1) . ':' . ($n + 1);
+                }
+            }
+        }
+    }
+    sort($hits, SORT_NATURAL);
+    return $hits;
 }
 
 /**

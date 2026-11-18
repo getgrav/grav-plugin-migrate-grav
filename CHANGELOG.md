@@ -1,3 +1,9 @@
+# v1.0.24
+## 2026-11-18
+
+1. [](#bugfix)
+    * A 1.7 site that ran with Twig auto-escaping off keeps it off on Grav 2.0. The wizard now renames `strict_mode.twig_compat` to its 2.0 name, `strict_mode.twig2_compat`, so themes that print `{{ assets.css() }}` or `{{ content }}` without `|raw` no longer show their HTML as text, and the summary lists those template lines so they can be fixed [#25](https://github.com/getgrav/grav-plugin-migrate-grav/issues/25)
+
 # v1.0.23
 ## 2026-11-05
 
