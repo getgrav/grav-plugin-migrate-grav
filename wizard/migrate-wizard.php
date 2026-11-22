@@ -2568,6 +2568,7 @@ function do_promote(string $webroot, array $flag, ?callable $progress = null): a
                 }
             } elseif (is_file($src)) {
                 if (@copy($src, $dst)) {
+                    mg_keep_mtime($src, $dst);
                     $rootCopied[] = $name;
                 }
             }
@@ -6622,7 +6623,7 @@ function mg_bulk_copy_user(string $srcUser, string $dstUser, int &$copied, ?call
             $copiedEntries[] = $entry;
         } elseif (is_file($src)) {
             ensure_dir(dirname($dst));
-            @copy($src, $dst);
+            if (@copy($src, $dst)) mg_keep_mtime($src, $dst);
             $copied++;
             $copiedEntries[] = $entry;
         }
@@ -7632,6 +7633,7 @@ function mg_preserve_link(string $src, string $dst, callable $onFile, string $re
 
     if (is_file($src)) {
         if (!@copy($src, $dst)) return null;
+        mg_keep_mtime($src, $dst);
         $onFile($rel);
         return 'copied';
     }
@@ -7685,11 +7687,29 @@ function copy_tree(string $src, string $dst, callable $onFile, string $prefix = 
                 closedir($dh);
                 return "Could not copy {$rel}";
             }
+            mg_keep_mtime($srcPath, $dstPath);
             $onFile($rel);
         }
     }
     closedir($dh);
+    // Last, once nothing more is written into it: adding entries bumps a folder's time.
+    mg_keep_mtime($src, $dst);
     return null;
+}
+
+/**
+ * Give $dst the modification time of $src. copy() stamps every copy with the
+ * time of the copy, and Grav dates a page without a `date:` in its
+ * frontmatter by the newest file in its folder (and Flex pages by the folder
+ * itself), so without this every migrated page shares one date and
+ * date-ordered collections come out in the wrong order (issue #26).
+ */
+function mg_keep_mtime(string $src, string $dst): void
+{
+    $mtime = @filemtime($src);
+    if ($mtime === false) return;
+    $atime = @fileatime($src);
+    @touch($dst, $mtime, $atime === false ? $mtime : $atime);
 }
 
 function ensure_dir(string $path): void

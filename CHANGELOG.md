@@ -1,3 +1,9 @@
+# v1.0.25
+## 2026-11-22
+
+1. [](#bugfix)
+    * Migrated pages keep their original file dates. The copy into the staged Grav 2.0 site stamped every file and folder with the time of the copy, so pages without a `date:` in their frontmatter all shared one date and blog and news listings came out in the wrong order [#26](https://github.com/getgrav/grav-plugin-migrate-grav/issues/26)
+
 # v1.0.24
 ## 2026-11-18
 
