@@ -1,3 +1,9 @@
+# v1.0.26
+## 2026-11-24
+
+1. [](#improved)
+    * The **Secure these folders now** fix, and the rules the wizard shows for Apache, now also turn off Apache's type-map handler for uploaded files, matching the new block in Grav's own `.htaccess`. Nginx, IIS, Caddy and lighttpd have no such handler, so their rules are unchanged
+
 # v1.0.25
 ## 2026-11-22
 
